@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GuardedOps</title>
+    <link rel="stylesheet" href="/ui/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <h1>GuardedOps</h1>
+        <p>Phase 1 只读运维入口</p>
+      </header>
+
+      <form id="chat-form" class="query-form">
+        <label for="raw-user-input">自然语言请求</label>
+        <div class="input-row">
+          <input
+            id="raw-user-input"
+            name="raw_user_input"
+            type="text"
+            autocomplete="off"
+            placeholder="例如：帮我查看当前磁盘使用情况"
+            required
+          />
+          <button id="send-button" type="submit">发送</button>
+        </div>
+      </form>
+
+      <section class="status-line" aria-live="polite">
+        <span id="request-status">等待输入</span>
+      </section>
+
+      <section id="result-panel" class="result-panel" hidden>
+        <div class="summary-grid">
+          <article>
+            <h2>风险等级</h2>
+            <p id="risk-level">-</p>
+            <p id="risk-reasons" class="muted">-</p>
+          </article>
+          <article>
+            <h2>环境摘要</h2>
+            <p id="environment-summary">-</p>
+          </article>
+          <article>
+            <h2>执行状态</h2>
+            <p id="execution-status">-</p>
+          </article>
+        </div>
+
+        <article class="explanation">
+          <h2>中文解释</h2>
+          <p id="explanation-text">-</p>
+        </article>
+
+        <article class="raw-result">
+          <h2>执行结果</h2>
+          <pre id="result-json">-</pre>
+        </article>
+      </section>
+    </main>
+
+    <script src="/ui/app.js"></script>
+  </body>
+</html>
