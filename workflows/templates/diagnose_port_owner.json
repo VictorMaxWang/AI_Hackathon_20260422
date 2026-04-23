@@ -1,0 +1,64 @@
+{
+  "workflow_id": "diagnose_port_owner",
+  "name": "Diagnose Port Owner",
+  "description": "Read-only port ownership diagnosis by querying a port and then its owning process when present.",
+  "risk_level": "S0",
+  "allowed_tools": [
+    "port_query_tool",
+    "process_query_tool"
+  ],
+  "forbidden_actions": [
+    "kill process",
+    "restart service",
+    "change firewall"
+  ],
+  "requires_confirmation": false,
+  "steps": [
+    {
+      "step_id": "query_port",
+      "tool_name": "port_query_tool",
+      "intent": "check port listener",
+      "description": "Inspect whether the requested port has a listener.",
+      "depends_on": [],
+      "condition": "port is provided and within valid port range",
+      "risk_level": "S0",
+      "constraints": {
+        "port": {
+          "required": true,
+          "minimum": 0,
+          "maximum": 65535
+        }
+      },
+      "requires_policy": true,
+      "requires_confirmation": false
+    },
+    {
+      "step_id": "query_owner_process",
+      "tool_name": "process_query_tool",
+      "intent": "inspect owner process",
+      "description": "Inspect the process only when the port query returns a listener with a process id.",
+      "depends_on": [
+        "query_port"
+      ],
+      "condition": "query_port.listener_found and query_port.pid is present",
+      "risk_level": "S0",
+      "constraints": {
+        "mode": "pid",
+        "pid_source": "query_port"
+      },
+      "requires_policy": true,
+      "requires_confirmation": false
+    }
+  ],
+  "post_checks": [
+    "Report listener and process facts only.",
+    "Do not stop, restart, or reconfigure any service."
+  ],
+  "tags": [
+    "evo-lite",
+    "safe-workflow",
+    "port",
+    "process",
+    "readonly"
+  ]
+}

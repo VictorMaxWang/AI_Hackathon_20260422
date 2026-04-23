@@ -165,3 +165,44 @@
   - 自然语言泛化初期有限。
 - 后续动作：
   - Phase 3 预留 LLM JSON parser stub。
+
+---
+
+## DEC-P35-01：新增 Evo-Lite 阶段，采用不改权重的经验沉淀路线
+
+- 日期：2026-04-23
+- 决策人：项目总控
+- 当前 Phase：Phase 3.5
+- 关联 Task：P3.5-T00
+- 决策内容：
+  - 在 Phase 3 后插入 Phase 3.5：Evo-Lite 安全经验沉淀与自评估闭环；
+  - 不改模型权重，不接在线训练，不自动修改代码；
+  - 将真实执行结果转化为可审计的评估、反思、经验记录和安全 workflow 模板；
+  - workflow 和经验只能建议 planner，最终执行仍必须经过 policy engine、confirmation policy、validators 和白名单工具。
+- 决策原因：
+  - GuardedOps 已具备安全执行闭环后，需要把真实执行结果沉淀为可复用经验；
+  - 经验沉淀有助于提升 planner 的稳定性和解释质量；
+  - 采用不改权重路线可以避免训练、自动自修改和安全边界漂移风险。
+- 替代方案：
+  - LoRA / SFT / DPO；
+  - 在线 RL 或自动强化学习；
+  - 让系统根据 reflection 自动修改 policy、executor 或 workflow 执行逻辑。
+- 为什么不选替代方案：
+  - LoRA / SFT / DPO 需要训练数据、评估闭环和额外依赖，不适合当前 hackathon 安全演示节奏；
+  - 在线 RL 会引入不可控探索和边界漂移，不符合“安全、可审计、可演示”的目标；
+  - 自动修改 policy 或 executor 会破坏已锁定的安全边界，增加 raw shell 或绕过确认的风险。
+- 影响范围：
+  - 新增 Phase 3.5 任务链；
+  - 更新 task_board、current_status、architecture_constraints、parallel_workstreams、validation_matrix 和 project_context；
+  - 后续 planner 可读取经验和 workflow 建议，但执行层能力不扩大。
+- 风险：
+  - 经验或 workflow 被误用为最终安全决策来源；
+  - 后续实现任务可能越界生成脚本或修改 policy/executor。
+- 后续动作：
+  - P3.5-T01：Execution Evaluator；
+  - P3.5-T02：Experience Store；
+  - P3.5-T03：Reflection Generator；
+  - P3.5-T04：Safe Workflow Templates；
+  - P3.5-T05：Workflow Retrieval in Planner；
+  - P3.5-T06：Evo-Lite Orchestrator Hook；
+  - P3.5-T07：Safety Regression Benchmark。

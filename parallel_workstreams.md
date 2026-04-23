@@ -34,6 +34,14 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 | G3-PLAN | Phase 3 | 多步计划 |
 | G3-ORCH | Phase 3 | 连续任务编排 |
 | G3-DOC | Phase 3 | LLM Stub 与 Prompt 文档 |
+| G3.5-CONTROL | Phase 3.5 | Evo-Lite 总控文件 |
+| G3.5-EVAL | Phase 3.5 | 执行结果评估 |
+| G3.5-STORE | Phase 3.5 | 经验存储 |
+| G3.5-REFLECT | Phase 3.5 | 安全反思 |
+| G3.5-WORKFLOW | Phase 3.5 | 安全 workflow 模板 |
+| G3.5-PLAN | Phase 3.5 | Planner 检索建议 |
+| G3.5-ORCH | Phase 3.5 | Orchestrator 挂接 |
+| G3.5-QA | Phase 3.5 | 安全回归 |
 | G4-AUDIT | Phase 4 | 审计 |
 | G4-DEMO | Phase 4 | 演示场景 |
 | G4-DOC | Phase 4 | 验证矩阵 |
@@ -70,6 +78,21 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 - 两者都可能涉及 PolicyDecision；
 - 不得擅自更改风险等级字段；
 - UI 不得绕过确认状态机。
+
+### Phase 3.5
+
+在 P3.5-T00 总控更新完成后，可以并行：
+
+- P3.5-T01 Execution Evaluator；
+- P3.5-T02 Experience Store；
+- P3.5-T04 Safe Workflow Templates。
+
+注意：
+
+- 三者都不得修改模型权重、policy、executor 或工具白名单；
+- P3.5-T01 只定义评估输入输出与结果判定，不触发新执行能力；
+- P3.5-T02 只存储可审计经验，不作为 allow / deny 来源；
+- P3.5-T04 只沉淀白名单工具 workflow，不生成可执行脚本。
 
 ### Phase 5
 
@@ -140,10 +163,22 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 6. P3-T01 → P3-T02 → P3-T03  
    原因：连续任务依赖上下文和计划能力。
 
-7. P4-T01 → P4-T02  
+7. P3.5-T01 → P3.5-T03  
+   原因：Reflection Generator 依赖 Execution Evaluator 的评估结果。
+
+8. P3.5-T04 → P3.5-T05  
+   原因：Planner 检索建议依赖 Safe Workflow Templates。
+
+9. P3.5-T01/P3.5-T02/P3.5-T03/P3.5-T05 → P3.5-T06  
+   原因：Evo-Lite Orchestrator Hook 必须在评估、经验、反思和 workflow 建议边界明确后再接入。
+
+10. P3.5-T06 → P3.5-T07  
+   原因：Safety Regression Benchmark 必须最后验证 hook 不绕过 policy、确认和白名单工具。
+
+11. P4-T01 → P4-T02  
    原因：审计查询依赖审计存储结构。
 
-8. P5-T04 → P5-T05 → P5-T06  
+12. P5-T04 → P5-T05 → P5-T06  
    原因：最终脚本、安全审查、冻结发布必须顺序进行。
 
 ---
@@ -155,6 +190,10 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 | P2-T01 和 P2-T02 | 风控规则未稳定前不能实现用户删除 |
 | P2-T03 和 P2-T05 | UI 不能先于确认状态机定义确认逻辑 |
 | P3-T02 和 P3-T03 | Orchestrator 依赖 Planner 输出结构 |
+| P3.5-T03 和 P3.5-T06 | reflection 未稳定前不得接入 orchestrator |
+| P3.5-T05 和 P3.5-T06 | workflow retrieval 未稳定前不得接入 orchestrator |
+| P3.5-T06 和 P3.5-T07 | hook 未完成前不能执行最终安全回归 |
+| 任一 P3.5 任务和 policy/executor 边界修改 | Evo-Lite 只能沉淀经验，不得修改安全边界或执行能力 |
 | P4-T01 和 P4-T02 | 查询 UI 依赖审计存储结构 |
 | P5-T05 和 P5-T06 | 未完成安全审查不能冻结 |
 

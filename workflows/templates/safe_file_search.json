@@ -1,0 +1,56 @@
+{
+  "workflow_id": "safe_file_search",
+  "name": "Safe File Search",
+  "description": "Bounded read-only file search with explicit path, depth, and result limits.",
+  "risk_level": "S0",
+  "allowed_tools": [
+    "file_search_tool"
+  ],
+  "forbidden_actions": [
+    "full filesystem search",
+    "deep search under virtual system paths",
+    "unbounded recursion",
+    "write or modify files"
+  ],
+  "requires_confirmation": false,
+  "steps": [
+    {
+      "step_id": "bounded_file_search",
+      "tool_name": "file_search_tool",
+      "intent": "search files within a bounded scope",
+      "description": "Search only within an explicit base path and enforce result and depth limits.",
+      "depends_on": [],
+      "condition": "base_path is provided and is narrower than root",
+      "risk_level": "S0",
+      "constraints": {
+        "base_path": {
+          "required": true,
+          "description": "Caller must provide a narrowed base path; root and virtual system paths are not valid defaults."
+        },
+        "max_results": {
+          "required": true,
+          "default": 20,
+          "maximum": 50
+        },
+        "max_depth": {
+          "required": true,
+          "default": 4,
+          "maximum": 8
+        }
+      },
+      "requires_policy": true,
+      "requires_confirmation": false
+    }
+  ],
+  "post_checks": [
+    "Return whether results were truncated.",
+    "Keep output limited to the bounded search scope."
+  ],
+  "tags": [
+    "evo-lite",
+    "safe-workflow",
+    "file-search",
+    "readonly",
+    "bounded"
+  ]
+}

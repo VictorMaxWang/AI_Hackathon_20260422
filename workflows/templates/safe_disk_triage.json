@@ -1,0 +1,58 @@
+{
+  "workflow_id": "safe_disk_triage",
+  "name": "Safe Disk Triage",
+  "description": "Read-only disk triage using environment context and bounded disk usage inspection.",
+  "risk_level": "S0",
+  "allowed_tools": [
+    "env_probe_tool",
+    "disk_usage_tool"
+  ],
+  "forbidden_actions": [
+    "delete files",
+    "clean disk",
+    "modify system configuration"
+  ],
+  "requires_confirmation": false,
+  "steps": [
+    {
+      "step_id": "probe_environment",
+      "tool_name": "env_probe_tool",
+      "intent": "collect environment context",
+      "description": "Collect read-only environment facts before disk triage.",
+      "depends_on": [],
+      "condition": null,
+      "risk_level": "S0",
+      "constraints": {
+        "readonly": true
+      },
+      "requires_policy": true,
+      "requires_confirmation": false
+    },
+    {
+      "step_id": "inspect_disk_usage",
+      "tool_name": "disk_usage_tool",
+      "intent": "inspect disk usage",
+      "description": "Collect disk usage facts without cleanup or file changes.",
+      "depends_on": [
+        "probe_environment"
+      ],
+      "condition": null,
+      "risk_level": "S0",
+      "constraints": {
+        "readonly": true
+      },
+      "requires_policy": true,
+      "requires_confirmation": false
+    }
+  ],
+  "post_checks": [
+    "Report disk usage facts only.",
+    "Do not claim cleanup or remediation was performed."
+  ],
+  "tags": [
+    "evo-lite",
+    "safe-workflow",
+    "disk",
+    "readonly"
+  ]
+}

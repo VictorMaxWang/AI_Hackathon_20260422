@@ -380,7 +380,28 @@ CLI 不得提供 raw shell mode。
 
 ---
 
-## 17. 待确认项
+## 17. Evo-Lite 约束
+
+Phase 3.5 的 Evo-Lite 只用于安全经验沉淀与自评估闭环，不改变 GuardedOps 的执行边界。
+
+必须遵守：
+
+- 不改模型权重；
+- 不训练 LoRA / SFT / DPO / RL；
+- 不接在线训练或自动强化学习；
+- 不自动修改 policy；
+- 不自动修改 executor；
+- 不自动生成可执行脚本；
+- 不创建 `run_shell_tool`、`execute_command_tool`、`bash_tool` 或其他通用执行工具；
+- 经验和 workflow 只能建议 planner，不得绕过 policy engine、confirmation policy 或 validators；
+- workflow 只能调用白名单工具；
+- reflection 只能写入经验，不得更改系统边界；
+- Evo-Lite 输出必须可审计、可禁用、可回溯来源；
+- 最终 allow / deny 仍由既有 policy engine 决定。
+
+---
+
+## 18. 待确认项
 
 - 是否统一使用 sudo wrapper；
 - SSH 密钥路径配置格式；
