@@ -4,7 +4,7 @@ GuardedOps 是一个安全对话式 Linux/SSH 运维代理项目。
 
 本项目用于 AI Hackathon 2026《操作系统智能代理》赛题，目标是在真实 Linux/SSH 运维场景中探索可运行、可验证、可审计的安全代理形态。
 
-当前 README 仍是阶段性说明，不是最终提交版。当前仓库已覆盖 Phase 1 只读基础能力，以及 Phase 2 受限用户写操作的风控、确认和拒绝闭环测试。
+当前 README 仍是阶段性说明，不是最终提交版。当前仓库已覆盖 Phase 1 只读基础能力、Phase 2 受限用户写操作的风控/确认/拒绝闭环测试，以及 Phase 3 多轮上下文与连续任务的核心测试。
 
 核心安全边界：
 
@@ -122,15 +122,36 @@ pytest tests/test_policy.py tests/test_validators.py tests/test_user_tools.py te
 - 高风险拒绝闭环：S3 请求不进入确认，不执行 env_probe 或任何工具。
 - Web/API 展示：`/api/chat` 返回 pending confirmation、risk、plan、execution、result、safe_alternative，静态页面包含确认与拒绝展示区域。
 
+## Phase 3 测试与连续任务验证
+
+运行全量测试：
+
+```bash
+pytest
+```
+
+只运行 Phase 3 相关测试：
+
+```bash
+pytest tests/test_session_memory.py tests/test_multistep_planner.py tests/test_continuous_tasks.py tests/test_llm_parser_stub.py
+```
+
+当前 Phase 3 测试覆盖：
+
+- Session Memory：记录最近用户名、路径、端口和风险等级；支持“刚才那个用户”等上下文解析；无上下文时拒绝猜测并跳过执行。
+- 多步 Planner：生成结构化 `ExecutionPlan` / `PlanStep`，覆盖环境探测后创建普通用户、端口查询后查询对应进程、上下文删除用户和不支持复杂任务的拒绝。
+- 连续任务 Orchestrator：覆盖暂停等待确认、确认后恢复、确认语不匹配保持 pending、取消 pending、前置失败中止后续步骤，以及创建/删除后的验证 timeline。
+- timeline 输出：每个连续任务节点包含 `step_id`、`intent`、`risk`、`status` 和 `result_summary`，用于演示与审计材料。
+- LLM parser stub：`app.agent.llm_parser` 当前保持禁用态，测试确认不会发起真实网络请求或依赖外部模型 API。
+
 环境说明：本仓库当前可用的 `pytest` 命令使用已安装依赖的 Python 3.11 环境；如果 `python -m pytest` 指向缺少依赖的其他 Python，需要切换解释器或安装项目依赖后再运行。
 
 当前仍未覆盖或未实现：
 
-- Session Memory 仅覆盖一个待确认动作，尚未实现连续上下文记忆。
-- 多步 Planner 与连续任务编排尚未实现。
-- 真实 LLM 接入尚未实现。
+- 真实 LLM 接入尚未实现；当前只有禁用态 parser stub。
 - 真实远程 SSH 环境集成测试。
 - 持久化审计存储，如 SQLite / JSONL 查询闭环。
+- 审计导出、最终交付文档、自测报告和演示材料整理。
 
 后续开发将遵循 `agent.md` 与 `architecture_constraints.md` 中定义的任务边界、安全约束和状态更新规则。
 

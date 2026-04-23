@@ -30,3 +30,40 @@ class ParsedIntent(BaseModel):
     requires_write: bool = False
     raw_user_input: str | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class PlanStep(BaseModel):
+    """One controlled step in a multi-step plan.
+
+    This model describes intent and dependencies only. It is not an executable
+    tool call and must still pass through policy and confirmation later.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    intent: str
+    target: dict[str, Any] = Field(default_factory=dict)
+    depends_on: list[str] = Field(default_factory=list)
+    condition: str | None = None
+    description: str
+    requires_policy: bool = True
+    requires_confirmation: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+
+class ExecutionPlan(BaseModel):
+    """Structured multi-step plan produced from one natural-language request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw_user_input: str
+    status: str = "unsupported"
+    supported: bool = False
+    steps: list[PlanStep] = Field(default_factory=list)
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
