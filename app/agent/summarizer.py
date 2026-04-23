@@ -41,6 +41,44 @@ class ReadonlySummarizer:
 
         return "当前只支持只读基础能力，未识别到可总结的结果。"
 
+    def summarize_continuous(
+        self,
+        *,
+        status: str,
+        timeline: list[dict[str, Any]],
+        reason: str | None = None,
+        confirmation_text: str | None = None,
+        pending_intent: str | None = None,
+    ) -> str:
+        delete_reason = ""
+        if pending_intent == "delete_user" or any(
+            item.get("intent") == "delete_user" for item in timeline
+        ):
+            delete_reason = (
+                "删除比创建更敏感，因为它会影响账号访问、文件归属和可恢复性。"
+            )
+
+        if status == "pending_confirmation":
+            confirm_part = f"请输入精确确认语：{confirmation_text}。" if confirmation_text else ""
+            return f"连续任务已暂停等待确认。{delete_reason}{confirm_part}"
+
+        if status == "success":
+            return f"连续任务已完成，共记录 {len(timeline)} 个 timeline 节点。{delete_reason}"
+
+        if status == "skipped":
+            return f"连续任务已按条件跳过部分步骤：{reason or '条件未满足'}。{delete_reason}"
+
+        if status == "aborted":
+            return f"连续任务已中止：{reason or '前置步骤未成功'}。{delete_reason}"
+
+        if status == "refused":
+            return f"连续任务被策略拒绝：{reason or 'policy denied this request'}。{delete_reason}"
+
+        if status == "failed":
+            return f"连续任务执行失败：{reason or '工具调用失败'}。{delete_reason}"
+
+        return f"连续任务状态：{status}。{delete_reason}"
+
 
 def summarize_readonly_result(
     parsed_intent: ParsedIntent,

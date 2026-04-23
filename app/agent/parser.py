@@ -11,20 +11,30 @@ FILE_INTENT = "search_files"
 PROCESS_INTENT = "query_process"
 PORT_INTENT = "query_port"
 UNKNOWN_INTENT = "unknown"
+CREATE_USER_INTENT = "create_user"
+DELETE_USER_INTENT = "delete_user"
 DELETE_PATH_INTENT = "delete_path"
 MODIFY_SUDOERS_INTENT = "modify_sudoers"
 GRANT_SUDO_INTENT = "grant_sudo"
 MODIFY_SSHD_CONFIG_INTENT = "modify_sshd_config"
 BULK_PERMISSION_INTENT = "bulk_permission_change"
 
+USER_CONTEXT_REFS = ("刚才那个用户", "上一个用户", "刚刚创建的用户")
+PORT_CONTEXT_REFS = ("刚才那个端口", "上一个端口")
+PATH_CONTEXT_REFS = ("刚才那个目录", "上一个目录")
+
 
 class ReadonlyParser:
     """Rule-based parser for Phase 1 read-only Chinese operations requests."""
 
-    def parse(self, raw_user_input: str) -> ParsedIntent:
+    def parse(self, raw_user_input: str, memory: Any | None = None) -> ParsedIntent:
         text = _clean_text(raw_user_input)
         if not text:
             return _unknown(raw_user_input, "empty input")
+
+        contextual_intent = _parse_contextual_reference(text, raw_user_input, memory)
+        if contextual_intent is not None:
+            return contextual_intent
 
         dangerous_intent = _parse_dangerous_intent(text, raw_user_input)
         if dangerous_intent is not None:
@@ -133,8 +143,8 @@ class ReadonlyParser:
         )
 
 
-def parse_readonly_intent(raw_user_input: str) -> ParsedIntent:
-    return ReadonlyParser().parse(raw_user_input)
+def parse_readonly_intent(raw_user_input: str, memory: Any | None = None) -> ParsedIntent:
+    return ReadonlyParser().parse(raw_user_input, memory=memory)
 
 
 def _clean_text(value: str) -> str:
@@ -148,6 +158,156 @@ def _unknown(raw_user_input: str, reason: str) -> ParsedIntent:
         constraints={"unsupported_reason": reason},
         raw_user_input=raw_user_input,
         confidence=0.2,
+    )
+
+
+def _parse_contextual_reference(
+    text: str,
+    raw_user_input: str,
+    memory: Any | None,
+) -> ParsedIntent | None:
+    user_ref = _find_context_ref(text, USER_CONTEXT_REFS)
+    if user_ref is not None:
+        username = _resolve_memory(memory, "username")
+        if not username:
+            return _unresolved_context_ref(raw_user_input, user_ref, "username", text)
+        if _looks_like_privilege_escalation(text):
+            return ParsedIntent(
+                intent=GRANT_SUDO_INTENT,
+                target=IntentTarget(username=username),
+                constraints={
+                    "danger_category": "privilege_escalation",
+                    "groups": ["sudo"],
+                    "privilege": "sudo",
+                    "resolved_from_memory": True,
+                },
+                context_refs=[user_ref],
+                requires_write=True,
+                raw_user_input=raw_user_input,
+                confidence=0.9,
+            )
+        if _contains_any(text, ["删除", "删掉", "移除", "remove", "delete"]):
+            return ParsedIntent(
+                intent=DELETE_USER_INTENT,
+                target=IntentTarget(username=username),
+                constraints={"remove_home": False, "resolved_from_memory": True},
+                context_refs=[user_ref],
+                requires_write=True,
+                raw_user_input=raw_user_input,
+                confidence=0.9,
+            )
+        return ParsedIntent(
+            intent=UNKNOWN_INTENT,
+            target=IntentTarget(username=username),
+            constraints={
+                "unsupported_reason": "当前不支持该用户引用操作",
+                "resolved_from_memory": True,
+            },
+            context_refs=[user_ref],
+            raw_user_input=raw_user_input,
+            confidence=0.4,
+        )
+
+    port_ref = _find_context_ref(text, PORT_CONTEXT_REFS)
+    if port_ref is not None:
+        port = _resolve_memory(memory, "port")
+        if port is None:
+            return _unresolved_context_ref(raw_user_input, port_ref, "port", text)
+        if _detect_write_like_request(text):
+            return ParsedIntent(
+                intent=UNKNOWN_INTENT,
+                target=IntentTarget(port=port),
+                constraints={
+                    "unsupported_reason": "当前不支持该端口引用写操作",
+                    "resolved_from_memory": True,
+                },
+                context_refs=[port_ref],
+                requires_write=True,
+                raw_user_input=raw_user_input,
+                confidence=0.4,
+            )
+        return ParsedIntent(
+            intent=PORT_INTENT,
+            target=IntentTarget(port=port),
+            constraints={"resolved_from_memory": True},
+            context_refs=[port_ref],
+            raw_user_input=raw_user_input,
+            confidence=0.9,
+        )
+
+    path_ref = _find_context_ref(text, PATH_CONTEXT_REFS)
+    if path_ref is not None:
+        path = _resolve_memory(memory, "path")
+        if not path:
+            return _unresolved_context_ref(raw_user_input, path_ref, "path", text)
+        if _contains_any(text, ["删除", "删掉", "移除", "清理", "清空", "rm", "wipe", "purge"]):
+            return ParsedIntent(
+                intent=DELETE_PATH_INTENT,
+                target=IntentTarget(path=path, base_paths=[path]),
+                constraints={
+                    "danger_category": "path_destruction",
+                    "resolved_from_memory": True,
+                },
+                context_refs=[path_ref],
+                requires_write=True,
+                raw_user_input=raw_user_input,
+                confidence=0.85,
+            )
+        return ParsedIntent(
+            intent=FILE_INTENT,
+            target=IntentTarget(
+                path=path,
+                keyword=_extract_file_keyword(text),
+                base_paths=[path],
+            ),
+            constraints={
+                "modified_within_days": _extract_modified_days(text),
+                "max_results": _extract_max_results(text, default=20),
+                "max_depth": _extract_max_depth(text, default=4),
+                "resolved_from_memory": True,
+            },
+            context_refs=[path_ref],
+            raw_user_input=raw_user_input,
+            confidence=0.86,
+        )
+
+    return None
+
+
+def _find_context_ref(text: str, refs: tuple[str, ...]) -> str | None:
+    for ref in refs:
+        if ref in text:
+            return ref
+    return None
+
+
+def _resolve_memory(memory: Any | None, slot: str) -> Any:
+    if memory is None:
+        return None
+    resolver = getattr(memory, "resolve", None)
+    if callable(resolver):
+        return resolver(slot)
+    return getattr(memory, f"last_{slot}", None)
+
+
+def _unresolved_context_ref(
+    raw_user_input: str,
+    ref_text: str,
+    ref_type: str,
+    text: str,
+) -> ParsedIntent:
+    return ParsedIntent(
+        intent=UNKNOWN_INTENT,
+        target=IntentTarget(),
+        constraints={
+            "unresolved_context_ref": ref_type,
+            "context_ref_text": ref_text,
+            "unsupported_reason": f"无法解析该引用：{ref_text}",
+        },
+        context_refs=[ref_text],
+        requires_write=_detect_write_like_request(text) is not None,
+        raw_user_input=raw_user_input,
+        confidence=0.0,
     )
 
 
