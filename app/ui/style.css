@@ -87,6 +87,28 @@ button:disabled {
   gap: 16px;
 }
 
+.result-panel[data-state="pending_confirmation"] .state-card,
+.confirmation-panel {
+  border-color: #d99a22;
+  background: #fff8e8;
+}
+
+.result-panel[data-state="refused"] .state-card,
+.refusal-panel {
+  border-color: #c0392b;
+  background: #fff0ee;
+}
+
+.result-panel[data-state="success"] .state-card {
+  border-color: #2e7d32;
+  background: #eef8ef;
+}
+
+.result-panel[data-state="failed"] .state-card {
+  border-color: #8e2f2f;
+  background: #fff3f3;
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -110,10 +132,54 @@ p {
   line-height: 1.6;
 }
 
+.request-card p,
+#risk-level,
+#plan-status,
+#execution-status {
+  overflow-wrap: anywhere;
+}
+
+#risk-level,
+#plan-status,
+#execution-status {
+  font-size: 22px;
+  font-weight: 700;
+}
+
 .muted {
   margin-top: 6px;
   color: #64727f;
   font-size: 14px;
+}
+
+.confirmation-panel p,
+.refusal-panel p {
+  margin-bottom: 10px;
+}
+
+code {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d99a22;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #17202a;
+  font-size: 16px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.plan-steps {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.plan-steps li {
+  margin: 6px 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 pre {

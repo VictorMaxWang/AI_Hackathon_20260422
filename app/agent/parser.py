@@ -11,6 +11,11 @@ FILE_INTENT = "search_files"
 PROCESS_INTENT = "query_process"
 PORT_INTENT = "query_port"
 UNKNOWN_INTENT = "unknown"
+DELETE_PATH_INTENT = "delete_path"
+MODIFY_SUDOERS_INTENT = "modify_sudoers"
+GRANT_SUDO_INTENT = "grant_sudo"
+MODIFY_SSHD_CONFIG_INTENT = "modify_sshd_config"
+BULK_PERMISSION_INTENT = "bulk_permission_change"
 
 
 class ReadonlyParser:
@@ -20,6 +25,10 @@ class ReadonlyParser:
         text = _clean_text(raw_user_input)
         if not text:
             return _unknown(raw_user_input, "empty input")
+
+        dangerous_intent = _parse_dangerous_intent(text, raw_user_input)
+        if dangerous_intent is not None:
+            return dangerous_intent
 
         write_reason = _detect_write_like_request(_write_scan_text(text))
         if write_reason:
@@ -142,6 +151,78 @@ def _unknown(raw_user_input: str, reason: str) -> ParsedIntent:
     )
 
 
+def _parse_dangerous_intent(text: str, raw_user_input: str) -> ParsedIntent | None:
+    if _looks_like_sudoers_change(text):
+        return ParsedIntent(
+            intent=MODIFY_SUDOERS_INTENT,
+            target=IntentTarget(
+                username=_extract_username_before_sudoers(text),
+                path="/etc/sudoers",
+                base_paths=["/etc/sudoers"],
+            ),
+            constraints={"danger_category": "sudoers_change"},
+            requires_write=True,
+            raw_user_input=raw_user_input,
+            confidence=0.95,
+        )
+
+    if _looks_like_sshd_config_change(text):
+        return ParsedIntent(
+            intent=MODIFY_SSHD_CONFIG_INTENT,
+            target=IntentTarget(path="/etc/ssh/sshd_config", base_paths=["/etc/ssh/sshd_config"]),
+            constraints={
+                "danger_category": "sshd_config_change",
+                "setting": "PermitRootLogin" if "root" in text.lower() else None,
+            },
+            requires_write=True,
+            raw_user_input=raw_user_input,
+            confidence=0.93,
+        )
+
+    if _looks_like_privilege_escalation(text):
+        return ParsedIntent(
+            intent=GRANT_SUDO_INTENT,
+            target=IntentTarget(username=_extract_username_for_sudo(text)),
+            constraints={
+                "danger_category": "privilege_escalation",
+                "groups": ["sudo"],
+                "privilege": "sudo",
+                "bulk": _contains_any(text, ["所有用户", "全部用户", "所有人", "全员"]),
+            },
+            requires_write=True,
+            raw_user_input=raw_user_input,
+            confidence=0.92,
+        )
+
+    if _looks_like_bulk_permission_change(text):
+        path = _extract_path(text)
+        return ParsedIntent(
+            intent=BULK_PERMISSION_INTENT,
+            target=IntentTarget(path=path if path != "/chown" else None),
+            constraints={
+                "danger_category": "bulk_permission_change",
+                "bulk": True,
+                "recursive": True,
+            },
+            requires_write=True,
+            raw_user_input=raw_user_input,
+            confidence=0.9,
+        )
+
+    if _looks_like_core_path_destruction(text):
+        path = _extract_dangerous_path(text)
+        return ParsedIntent(
+            intent=DELETE_PATH_INTENT,
+            target=IntentTarget(path=path, base_paths=[path] if path else []),
+            constraints={"danger_category": "protected_path_destruction"},
+            requires_write=True,
+            raw_user_input=raw_user_input,
+            confidence=0.9,
+        )
+
+    return None
+
+
 def _detect_write_like_request(text: str) -> str | None:
     write_keywords = [
         "创建",
@@ -153,6 +234,7 @@ def _detect_write_like_request(text: str) -> str | None:
         "更改",
         "写入",
         "清理",
+        "清空",
         "杀掉",
         "重启",
         "启动",
@@ -167,6 +249,91 @@ def _detect_write_like_request(text: str) -> str | None:
     ]
     if _contains_any(text, write_keywords):
         return "当前只支持只读基础能力，写操作不在 P1-T05 范围内"
+    return None
+
+
+def _looks_like_sudoers_change(text: str) -> bool:
+    return "sudoers" in text.lower()
+
+
+def _looks_like_sshd_config_change(text: str) -> bool:
+    lower_text = text.lower()
+    if "sshd_config" in lower_text:
+        return True
+    return bool(
+        "root" in lower_text
+        and _contains_any(text, ["远程登录", "ssh 登录", "SSH 登录", "登录"])
+        and _contains_any(text, ["允许", "打开", "开启", "启用", "修改"])
+    )
+
+
+def _looks_like_privilege_escalation(text: str) -> bool:
+    lower_text = text.lower()
+    return bool(
+        "sudo" in lower_text
+        and _contains_any(text, ["加", "加入", "添加", "给", "权限", "所有用户", "全部用户"])
+    )
+
+
+def _looks_like_bulk_permission_change(text: str) -> bool:
+    lower_text = text.lower()
+    if "chmod" in lower_text or "chown" in lower_text:
+        return _contains_any(text, ["批量", "递归", "-r", "所有", "整个", "全部"]) or "/" in text
+    return bool(
+        "权限" in text
+        and _contains_any(text, ["批量", "递归", "所有", "整个目录", "全部", "都改掉", "都改"])
+    )
+
+
+def _looks_like_core_path_destruction(text: str) -> bool:
+    path = _extract_dangerous_path(text)
+    if path is None:
+        return False
+    return _contains_any(
+        text,
+        [
+            "删除",
+            "删掉",
+            "移除",
+            "清理",
+            "清空",
+            "删",
+            "rm",
+            "wipe",
+            "purge",
+        ],
+    )
+
+
+def _extract_dangerous_path(text: str) -> str | None:
+    explicit_path = _extract_path(text)
+    if explicit_path:
+        for protected_path in ["/etc", "/usr", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/"]:
+            if explicit_path == protected_path or explicit_path.startswith(f"{protected_path}/"):
+                return protected_path if protected_path != "/" else explicit_path
+        return explicit_path
+
+    if "系统目录" in text or "核心目录" in text:
+        return "/"
+    return None
+
+
+def _extract_username_before_sudoers(text: str) -> str | None:
+    match = re.search(r"([a-z_][a-z0-9_-]{2,31})\s*(?:加到|加入|添加到)?\s*sudoers", text, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _extract_username_for_sudo(text: str) -> str | None:
+    for pattern in [
+        r"把\s*([a-z_][a-z0-9_-]{2,31})\s*(?:加到|加入|添加到)",
+        r"给\s*([a-z_][a-z0-9_-]{2,31})\s*sudo",
+        r"给\s*([a-z_][a-z0-9_-]{2,31})\s*.*?sudo\s*权限",
+    ]:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
     return None
 
 

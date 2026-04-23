@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.models import ParsedIntent, ToolResult
+from app.models import ParsedIntent, PolicyDecision, RiskLevel, ToolResult
 
 from app.agent.parser import DISK_INTENT, FILE_INTENT, PORT_INTENT, PROCESS_INTENT
 
@@ -17,7 +17,10 @@ class ReadonlySummarizer:
         status: str,
         tool_result: ToolResult | None = None,
         reason: str | None = None,
+        risk: PolicyDecision | None = None,
     ) -> str:
+        if status == "refused" and risk is not None and risk.risk_level == RiskLevel.S3:
+            return _summarize_s3_refusal(parsed_intent, risk, reason)
         if status in {"unsupported", "refused", "skipped"}:
             return f"{reason or '当前只支持只读基础能力'}，未执行任何命令。"
         if status == "failed":
@@ -45,13 +48,75 @@ def summarize_readonly_result(
     status: str,
     tool_result: ToolResult | None = None,
     reason: str | None = None,
+    risk: PolicyDecision | None = None,
 ) -> str:
     return ReadonlySummarizer().summarize(
         parsed_intent,
         status=status,
         tool_result=tool_result,
         reason=reason,
+        risk=risk,
     )
+
+
+def _summarize_s3_refusal(
+    parsed_intent: ParsedIntent,
+    risk: PolicyDecision,
+    reason: str | None,
+) -> str:
+    del parsed_intent
+
+    reasons = risk.reasons or ([reason] if reason else ["策略引擎拒绝该请求"])
+    reason_text = "；".join(_translate_policy_reason(item) for item in reasons if item)
+    alternative = _translate_safe_alternative(risk.safe_alternative)
+    return (
+        "拒绝执行：该请求被策略引擎判定为禁止执行的高风险操作。"
+        f"风险等级：{risk.risk_level.value}。"
+        f"具体原因：{reason_text}。"
+        f"安全替代方案：{alternative}"
+        "未执行任何工具。"
+    )
+
+
+def _translate_policy_reason(reason: str) -> str:
+    lower_reason = reason.lower()
+    if "sudoers" in lower_reason:
+        return "请求涉及修改 sudoers，可能授予不受控的管理员权限"
+    if "sshd_config" in lower_reason or "ssh daemon" in lower_reason:
+        return "请求涉及修改 sshd_config，可能削弱或中断远程登录安全"
+    if "sudo, wheel, admin, or root" in lower_reason or "non-privileged" in lower_reason:
+        return "请求会授予 sudo、wheel、admin 或 root 等特权，超出普通用户操作范围"
+    if "bulk chmod/chown" in lower_reason or "permission changes" in lower_reason:
+        return "请求涉及批量或递归 chmod/chown，可能影响大量文件权限"
+    if "/etc" in lower_reason:
+        return "请求会删除或破坏 /etc 下的核心系统配置"
+    if "protected system path" in lower_reason or "core directories" in lower_reason:
+        return "请求目标是受保护的系统核心目录"
+    if "unknown or unsupported write operation" in lower_reason or "unknown writes" in lower_reason:
+        return "当前只支持只读基础能力，未知写操作默认拒绝"
+    return reason
+
+
+def _translate_safe_alternative(safe_alternative: str | None) -> str:
+    if not safe_alternative:
+        return "改为只读盘点或收窄范围后查看候选对象，不执行修改。"
+
+    lower_alternative = safe_alternative.lower()
+    if "sudo-related" in lower_alternative:
+        return "只读查看 sudo 相关配置或用户组现状，整理变更清单交由管理员人工审核。"
+    if "ssh configuration" in lower_alternative:
+        return "只读查看 SSH 配置和当前登录策略，形成手工审查计划，不自动修改配置。"
+    if "non-privileged user" in lower_alternative:
+        return "只读查看用户和组成员关系；如需新增用户，仅创建普通非特权用户，不加入 sudo/wheel/admin。"
+    if "permission" in lower_alternative:
+        return "先在小范围目录内只读列出权限现状和候选文件，不执行 chmod/chown。"
+    if "non-core application path" in lower_alternative:
+        return "收窄到非核心业务目录，先只读列出候选文件并盘点影响范围，不执行删除或修改。"
+    if "base_path" in lower_alternative or "specific non-virtual directory" in lower_alternative:
+        return "提供更窄的只读搜索路径，并限制 max_depth 和 max_results。"
+    if "read-only" in lower_alternative or "whitelisted" in lower_alternative:
+        return "改为受支持的只读查询，或明确收窄为只读盘点。"
+    return "改为只读盘点或收窄范围后查看候选对象，不执行修改。"
 
 
 def _summarize_disk(data: Any) -> str:
