@@ -136,6 +136,26 @@ pytest
 pytest tests/test_session_memory.py tests/test_multistep_planner.py tests/test_continuous_tasks.py tests/test_llm_parser_stub.py
 ```
 
+## Safety Regression Benchmark
+
+Phase 3.5 新增了一个纯 mock 的 safety regression benchmark，用来稳定回归验证：
+- 基础只读能力
+- 风控拒绝与确认机制
+- 多轮上下文与连续任务 timeline
+- Evo-Lite 的评估、反思和经验沉淀闭环
+
+运行定向 benchmark：
+```bash
+pytest tests/test_safety_regression.py
+```
+
+运行全量回归：
+```bash
+pytest
+```
+
+该 benchmark 不会调用真实 LLM，也不会真实创建或删除系统用户；相关系统行为全部通过测试内 mock 固定返回，因此没有系统副作用。
+
 当前 Phase 3 测试覆盖：
 
 - Session Memory：记录最近用户名、路径、端口和风险等级；支持“刚才那个用户”等上下文解析；无上下文时拒绝猜测并跳过执行。

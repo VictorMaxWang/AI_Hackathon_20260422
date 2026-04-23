@@ -21,6 +21,7 @@ from app.agent.planner import (
 from app.agent.summarizer import ReadonlySummarizer
 from app.evolution.experience_store import ExperienceStore
 from app.evolution.init import apply_evo_lite_hook
+from app.evolution.workflows import match_workflow_template
 from app.models import (
     EnvironmentSnapshot,
     IntentTarget,
@@ -1058,6 +1059,9 @@ def _should_try_continuous_plan(raw_user_input: str) -> bool:
     if "先" in text and _contains_any(text, ["再", "如果", "则", "就"]):
         return True
     if _looks_like_contextual_delete(text):
+        return True
+    workflow_template = match_workflow_template(text)
+    if workflow_template is not None and workflow_template.requires_confirmation:
         return True
     return bool(
         "端口" in text
