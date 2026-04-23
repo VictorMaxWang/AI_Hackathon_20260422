@@ -19,17 +19,24 @@
 
 | 能力 | 对应任务 | 验证方式 | Demo 场景 | 审计证据 | 状态 |
 |---|---|---|---|---|---|
-| 环境探测 | P1-T03 | 运行 env_probe，返回 distro/user/sudo/commands | 场景 6 第一轮 | environment_snapshot | NOT_STARTED |
-| 磁盘查询 | P1-T04 | 查询 df 并解析挂载点 | 场景 1 | tool_calls + command_results | NOT_STARTED |
-| 文件检索 | P1-T04 | 在 /var/log 搜索 nginx，限制数量 | 场景 2 | scope_limit + result_count | NOT_STARTED |
-| 进程查询 | P1-T04 | 查询 CPU Top N 或关键词 | 场景 3 扩展 | tool_calls | NOT_STARTED |
-| 端口查询 | P1-T04 | 查询 8080 端口占用 | 场景 3 | command_results | NOT_STARTED |
-| 创建普通用户 | P2-T02 | 创建 demo_guest 并 getent 验证 | 场景 4 | confirmation + post_check | NOT_STARTED |
-| 删除普通用户 | P2-T02 | 删除 demo_temp 并 getent 验证 | 场景 6 | confirmation + post_check | NOT_STARTED |
-| 高风险拒绝 | P2-T04 | 拒绝删除 /etc 请求 | 场景 5 | risk_decision | NOT_STARTED |
-| 二次确认 | P2-T03 | S1/S2 操作要求确认语 | 场景 4/6 | confirmation_status | NOT_STARTED |
-| 多轮上下文 | P3-T01 | 解析“刚才那个用户” | 场景 6 | session_memory | NOT_STARTED |
-| 连续任务闭环 | P3-T03 | 环境→创建→验证→删除→验证 | 场景 6 | timeline | NOT_STARTED |
+| 环境探测 | P1-T03 | 运行 env_probe，返回 distro/user/sudo/commands | 场景 6 第一轮 | environment_snapshot | DONE |
+| 磁盘查询 | P1-T04 | 查询 df 并解析挂载点 | 场景 1 | tool_calls + command_results | DONE |
+| 文件检索 | P1-T04 | 在 /var/log 搜索 nginx，限制数量 | 场景 2 | scope_limit + result_count | DONE |
+| 进程查询 | P1-T04 | 查询 CPU Top N 或关键词 | 场景 3 扩展 | tool_calls | DONE |
+| 端口查询 | P1-T04 | 查询 8080 端口占用 | 场景 3 | command_results | DONE |
+| 创建普通用户 | P2-T02 | 创建 demo_guest 并 getent 验证 | 场景 4 | confirmation + post_check | DONE |
+| 删除普通用户 | P2-T02 | 删除 demo_temp 并 getent 验证 | 场景 6 | confirmation + post_check | DONE |
+| 高风险拒绝 | P2-T04 | 拒绝删除 /etc 请求 | 场景 5 | risk_decision | DONE |
+| 二次确认 | P2-T03 | S1/S2 操作要求确认语 | 场景 4/6 | confirmation_status | DONE |
+| 多轮上下文 | P3-T01 | 解析“刚才那个用户” | 场景 6 | session_memory | DONE |
+| 连续任务闭环 | P3-T03 | 环境→创建→验证→删除→验证 | 场景 6 | timeline | DONE |
+| 执行结果评估 | P3.5-T01 | 基于真实执行结果生成 success/risk/post_check 评估记录 | Evo-Lite 自评估 | evaluation_record | NOT_STARTED |
+| 安全经验存储 | P3.5-T02 | 存储带来源、风险等级和适用范围的经验记录 | Evo-Lite 自评估 | experience_record | NOT_STARTED |
+| 安全反思生成 | P3.5-T03 | 从评估记录生成 reflection，且只写入经验 | Evo-Lite 自评估 | reflection_record | NOT_STARTED |
+| 安全 workflow 模板 | P3.5-T04 | 模板只包含白名单工具和受控步骤，不含可执行脚本 | Evo-Lite 自评估 | workflow_template | NOT_STARTED |
+| Planner workflow 检索 | P3.5-T05 | planner 可读取 workflow 建议但不绕过 policy | Evo-Lite 自评估 | retrieval_trace | NOT_STARTED |
+| Evo-Lite Hook | P3.5-T06 | hook 不绕过 confirmation、policy、executor 或 audit | Evo-Lite 自评估 | hook_trace | NOT_STARTED |
+| 安全回归基准 | P3.5-T07 | 覆盖禁止训练、禁止 raw shell、禁止绕过 policy 的回归用例 | Evo-Lite 自评估 | regression_report | NOT_STARTED |
 | 审计日志 | P4-T01 | SQLite/JSONL 有完整记录 | 所有场景 | audit_log | NOT_STARTED |
 | 审计导出 | P4-T02 | 可导出最近操作 | 提交材料 | exported_report | NOT_STARTED |
 
@@ -51,6 +58,7 @@
 | 单轮闭环 | 磁盘、端口查询 | Demo 1/3 |
 | 风险场景闭环 | 拒绝 + 替代方案 | Demo 5 |
 | 连续任务闭环稳定性 | multi-step orchestrator | Demo 6 |
+| 自评估与经验沉淀 | Execution Evaluator + Experience Store + Reflection + Safe Workflow Templates | Phase 3.5 自评估记录与回归报告 |
 | 稳定性一致性 | pytest + smoke tests | Test report |
 | 工程质量 | 清晰分层 + 白名单工具 + 审计 | Architecture docs |
 | 创新性 | 去命令行化安全运维入口 | Web demo |
@@ -68,7 +76,7 @@
   - 显示挂载点；
   - 指出最高使用率；
   - 写审计日志。
-- 状态：NOT_STARTED
+- 状态：能力已完成；P4 演示材料暂缓
 
 ### Demo 2：文件检索
 
@@ -79,7 +87,7 @@
   - max_depth 生效；
   - max_results 生效；
   - 输出是否截断。
-- 状态：NOT_STARTED
+- 状态：能力已完成；P4 演示材料暂缓
 
 ### Demo 3：端口查询
 
@@ -89,7 +97,7 @@
   - 风险等级 S0；
   - 输出监听状态；
   - 若未监听则明确说明。
-- 状态：NOT_STARTED
+- 状态：能力已完成；P4 演示材料暂缓
 
 ### Demo 4：创建普通用户
 
@@ -100,7 +108,7 @@
   - 要求确认；
   - 确认后执行；
   - getent 验证存在。
-- 状态：NOT_STARTED
+- 状态：能力已完成；P4 演示材料暂缓
 
 ### Demo 5：高风险拒绝
 
@@ -111,7 +119,7 @@
   - 拒绝执行；
   - 解释原因；
   - 给出安全替代方案。
-- 状态：NOT_STARTED
+- 状态：能力已完成；P4 演示材料暂缓
 
 ### Demo 6：多轮连续任务
 
@@ -127,4 +135,4 @@
   - 删除前强确认；
   - 删除后验证；
   - 解释删除风险。
-- 状态：NOT_STARTED
+- 状态：能力已完成；P4 演示材料暂缓

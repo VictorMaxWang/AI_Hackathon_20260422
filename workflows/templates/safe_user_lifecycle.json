@@ -1,0 +1,90 @@
+{
+  "workflow_id": "safe_user_lifecycle",
+  "name": "Safe User Lifecycle",
+  "description": "Policy-gated normal user creation or deletion with confirmation and post-checks.",
+  "risk_level": "S2",
+  "allowed_tools": [
+    "env_probe_tool",
+    "create_user_tool",
+    "delete_user_tool"
+  ],
+  "forbidden_actions": [
+    "create privileged users",
+    "grant sudo or admin access",
+    "delete system users",
+    "delete current login user",
+    "delete home directory by default",
+    "bypass policy or confirmation"
+  ],
+  "requires_confirmation": true,
+  "steps": [
+    {
+      "step_id": "probe_environment",
+      "tool_name": "env_probe_tool",
+      "intent": "collect environment context",
+      "description": "Collect read-only environment facts before any user lifecycle change.",
+      "depends_on": [],
+      "condition": null,
+      "risk_level": "S0",
+      "constraints": {
+        "readonly": true
+      },
+      "requires_policy": true,
+      "requires_confirmation": false
+    },
+    {
+      "step_id": "create_normal_user",
+      "tool_name": "create_user_tool",
+      "intent": "create normal user",
+      "description": "Create one normal non-privileged user only after policy allows it and the user confirms.",
+      "depends_on": [
+        "probe_environment"
+      ],
+      "condition": "policy_allows_create_user and confirmation_received",
+      "risk_level": "S1",
+      "constraints": {
+        "username": {
+          "required": true,
+          "must_be_normal_user": true
+        },
+        "create_home_default": true,
+        "no_sudo": true
+      },
+      "requires_policy": true,
+      "requires_confirmation": true
+    },
+    {
+      "step_id": "delete_normal_user",
+      "tool_name": "delete_user_tool",
+      "intent": "delete normal user",
+      "description": "Delete one normal user only after policy allows it and strong confirmation is received.",
+      "depends_on": [
+        "probe_environment"
+      ],
+      "condition": "policy_allows_delete_user and strong_confirmation_received and target_user_uid >= 1000",
+      "risk_level": "S2",
+      "constraints": {
+        "username": {
+          "required": true,
+          "must_be_normal_user": true
+        },
+        "remove_home_default": false,
+        "must_not_delete_current_user": true
+      },
+      "requires_policy": true,
+      "requires_confirmation": true
+    }
+  ],
+  "post_checks": [
+    "Verify created user exists after create_user_tool.",
+    "Verify deleted user is absent after delete_user_tool.",
+    "Report whether the home directory was preserved."
+  ],
+  "tags": [
+    "evo-lite",
+    "safe-workflow",
+    "user",
+    "confirmation",
+    "policy-gated"
+  ]
+}

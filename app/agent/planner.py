@@ -4,7 +4,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.evolution.workflows import match_workflow_template
 from app.models import ParsedIntent
+from app.models.evolution import WorkflowStep, WorkflowTemplate
 from app.models.intent import ExecutionPlan, PlanStep
 
 from app.agent.parser import DISK_INTENT, FILE_INTENT, PORT_INTENT, PROCESS_INTENT
@@ -13,6 +15,16 @@ from app.agent.parser import DISK_INTENT, FILE_INTENT, PORT_INTENT, PROCESS_INTE
 ENV_PROBE_INTENT = "env_probe"
 CREATE_USER_INTENT = "create_user"
 DELETE_USER_INTENT = "delete_user"
+WORKFLOW_TEMPLATE_SOURCE = "workflow_template"
+WORKFLOW_TOOL_INTENTS = {
+    "create_user_tool": CREATE_USER_INTENT,
+    "delete_user_tool": DELETE_USER_INTENT,
+    "disk_usage_tool": DISK_INTENT,
+    "env_probe_tool": ENV_PROBE_INTENT,
+    "file_search_tool": FILE_INTENT,
+    "port_query_tool": PORT_INTENT,
+    "process_query_tool": PROCESS_INTENT,
+}
 
 
 @dataclass(frozen=True)
@@ -136,6 +148,11 @@ class MultistepPlanner:
 
         if _has_unsupported_action(text):
             return _unsupported(raw_user_input, "unsupported or unsafe multi-step request")
+
+        workflow_template = match_workflow_template(text)
+        if workflow_template is not None:
+            return _workflow_plan(raw_user_input, text, workflow_template)
+
         if _has_multiple_write_actions(text):
             return _unsupported(raw_user_input, "multiple write steps are not supported")
 
@@ -274,6 +291,206 @@ def _unsupported(raw_user_input: str, reason: str) -> ExecutionPlan:
         steps=[],
         reason=reason,
     )
+
+
+def _workflow_plan(
+    raw_user_input: str,
+    text: str,
+    template: WorkflowTemplate,
+) -> ExecutionPlan:
+    workflow_steps = _workflow_steps_for_request(text, template)
+    step_id_map = {
+        workflow_step.step_id: f"step_{index}"
+        for index, workflow_step in enumerate(workflow_steps, start=1)
+    }
+    return _supported(
+        raw_user_input,
+        [
+            _workflow_plan_step(index, text, template, workflow_step, step_id_map)
+            for index, workflow_step in enumerate(workflow_steps, start=1)
+        ],
+    )
+
+
+def _workflow_steps_for_request(
+    text: str,
+    template: WorkflowTemplate,
+) -> list[WorkflowStep]:
+    if template.workflow_id != "safe_user_lifecycle":
+        return list(template.steps)
+
+    has_create = _looks_like_create_user(text)
+    has_delete = _looks_like_delete_user(text)
+    if not has_create and not has_delete:
+        return list(template.steps)
+
+    selected_steps: list[WorkflowStep] = []
+    for workflow_step in template.steps:
+        intent = _workflow_intent(workflow_step)
+        if intent == ENV_PROBE_INTENT:
+            selected_steps.append(workflow_step)
+        elif intent == CREATE_USER_INTENT and has_create:
+            selected_steps.append(workflow_step)
+        elif intent == DELETE_USER_INTENT and has_delete:
+            selected_steps.append(workflow_step)
+
+    return selected_steps or list(template.steps)
+
+
+def _workflow_plan_step(
+    number: int,
+    text: str,
+    template: WorkflowTemplate,
+    workflow_step: WorkflowStep,
+    step_id_map: dict[str, str],
+) -> PlanStep:
+    intent = _workflow_intent(workflow_step)
+    return PlanStep(
+        step_id=f"step_{number}",
+        intent=intent,
+        target=_workflow_step_target(text, template, workflow_step, intent, step_id_map),
+        depends_on=[
+            step_id_map[dependency]
+            for dependency in workflow_step.depends_on
+            if dependency in step_id_map
+        ],
+        condition=_workflow_condition(workflow_step, intent, step_id_map),
+        description=workflow_step.description,
+        requires_policy=workflow_step.requires_policy,
+        requires_confirmation=workflow_step.requires_confirmation,
+    )
+
+
+def _workflow_intent(workflow_step: WorkflowStep) -> str:
+    return WORKFLOW_TOOL_INTENTS.get(workflow_step.tool_name, workflow_step.intent)
+
+
+def _workflow_step_target(
+    text: str,
+    template: WorkflowTemplate,
+    workflow_step: WorkflowStep,
+    intent: str,
+    step_id_map: dict[str, str],
+) -> dict[str, Any]:
+    target: dict[str, Any] = {
+        "source": WORKFLOW_TEMPLATE_SOURCE,
+        "workflow_id": template.workflow_id,
+        "workflow_step_id": workflow_step.step_id,
+        "risk_level": workflow_step.risk_level.value,
+        "tool_name": workflow_step.tool_name,
+        "constraints": dict(workflow_step.constraints),
+    }
+    if workflow_step.condition is not None:
+        target["workflow_condition"] = workflow_step.condition
+
+    if intent == PORT_INTENT:
+        port = _extract_port(text)
+        if port is not None:
+            target["port"] = port
+        return target
+
+    if intent == PROCESS_INTENT:
+        port = _extract_port(text)
+        if port is not None:
+            target["port"] = port
+        source_step = _first_mapped_dependency(workflow_step, step_id_map)
+        if source_step is not None:
+            target["from_step"] = source_step
+            target["pid_from"] = f"{source_step}.listeners[0].pid"
+        return target
+
+    if intent == FILE_INTENT:
+        base_path = _extract_path(text) or _default_file_search_base_path(text)
+        if base_path is not None:
+            target["base_path"] = base_path
+            target["path"] = base_path
+        keyword = _extract_file_search_keyword(text)
+        if keyword is not None:
+            target["keyword"] = keyword
+            target["name_contains"] = keyword
+        target["max_results"] = _constraint_default(
+            workflow_step.constraints,
+            "max_results",
+            20,
+        )
+        target["max_depth"] = _constraint_default(
+            workflow_step.constraints,
+            "max_depth",
+            4,
+        )
+        return target
+
+    if intent == CREATE_USER_INTENT:
+        username = _extract_username(text)
+        if username is not None:
+            target["username"] = username
+        target["create_home"] = bool(
+            workflow_step.constraints.get("create_home_default", True)
+        )
+        target["no_sudo"] = bool(workflow_step.constraints.get("no_sudo", True))
+        return target
+
+    if intent == DELETE_USER_INTENT:
+        username = _extract_username(text)
+        if username is not None:
+            target["username"] = username
+        target["remove_home"] = bool(
+            workflow_step.constraints.get("remove_home_default", False)
+        )
+        return target
+
+    return target
+
+
+def _workflow_condition(
+    workflow_step: WorkflowStep,
+    intent: str,
+    step_id_map: dict[str, str],
+) -> str | None:
+    if intent == PROCESS_INTENT:
+        source_step = _first_mapped_dependency(workflow_step, step_id_map)
+        if source_step is not None:
+            return f"{source_step}.listener_found"
+    return _map_workflow_condition(workflow_step.condition, step_id_map)
+
+
+def _map_workflow_condition(
+    condition: str | None,
+    step_id_map: dict[str, str],
+) -> str | None:
+    if condition is None:
+        return None
+    mapped_condition = condition
+    for workflow_step_id in sorted(step_id_map, key=len, reverse=True):
+        mapped_condition = mapped_condition.replace(
+            workflow_step_id,
+            step_id_map[workflow_step_id],
+        )
+    return mapped_condition
+
+
+def _first_mapped_dependency(
+    workflow_step: WorkflowStep,
+    step_id_map: dict[str, str],
+) -> str | None:
+    for dependency in workflow_step.depends_on:
+        mapped = step_id_map.get(dependency)
+        if mapped is not None:
+            return mapped
+    return None
+
+
+def _constraint_default(
+    constraints: dict[str, Any],
+    key: str,
+    fallback: Any,
+) -> Any:
+    value = constraints.get(key)
+    if isinstance(value, dict) and "default" in value:
+        return value["default"]
+    if value is not None:
+        return value
+    return fallback
 
 
 def _step(
@@ -452,12 +669,41 @@ def _has_user_context_ref(text: str) -> bool:
 def _extract_username(text: str) -> str | None:
     patterns = [
         r"普通用户\s*([a-z_][a-z0-9_-]{2,31})",
+        r"测试用户\s*([a-z_][a-z0-9_-]{2,31})",
         r"用户\s*([a-z_][a-z0-9_-]{2,31})",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return match.group(1)
+    return None
+
+
+def _extract_path(text: str) -> str | None:
+    match = re.search(r"(/[^\s，,。；;、]+)", text)
+    if not match:
+        return None
+    return match.group(1).rstrip("，,。；;、")
+
+
+def _default_file_search_base_path(text: str) -> str | None:
+    if _contains_any(text, ["日志", "log", "logs"]):
+        return "/var/log"
+    return None
+
+
+def _extract_file_search_keyword(text: str) -> str | None:
+    if re.search(r"\bnginx\b", text, flags=re.IGNORECASE):
+        return "nginx"
+
+    explicit = re.search(r"文件名(?:包含|包括|带有)\s*([^\s，,。；;、的]+)", text)
+    if explicit:
+        return explicit.group(1).strip()
+
+    log_match = re.search(r"找\s*([A-Za-z0-9_.-]+)\s*日志", text, flags=re.IGNORECASE)
+    if log_match:
+        return log_match.group(1)
+
     return None
 
 

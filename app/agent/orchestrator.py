@@ -19,6 +19,8 @@ from app.agent.planner import (
     ReadonlyPlanner,
 )
 from app.agent.summarizer import ReadonlySummarizer
+from app.evolution.experience_store import ExperienceStore
+from app.evolution.init import apply_evo_lite_hook
 from app.models import (
     EnvironmentSnapshot,
     IntentTarget,
@@ -74,6 +76,8 @@ class ReadonlyOrchestrator:
         port_query_tool_fn: ToolCallable = port_query_tool,
         create_user_tool_fn: ToolCallable = create_user_tool,
         delete_user_tool_fn: ToolCallable = delete_user_tool,
+        evo_lite_enabled: bool = True,
+        experience_store: ExperienceStore | None = None,
     ) -> None:
         self.executor = executor
         self.parser = parser or ReadonlyParser()
@@ -82,6 +86,8 @@ class ReadonlyOrchestrator:
         self.summarizer = summarizer or ReadonlySummarizer()
         self.memory = memory or AgentMemory()
         self.env_probe = env_probe
+        self.evo_lite_enabled = evo_lite_enabled
+        self.experience_store = experience_store
         self.tools: dict[str, ToolCallable] = {
             "disk_usage_tool": disk_tool,
             "file_search_tool": file_search_tool_fn,
@@ -106,13 +112,13 @@ class ReadonlyOrchestrator:
 
         if _should_try_continuous_plan(raw_user_input):
             continuous_plan = self.multistep_planner.plan(raw_user_input, memory=self.memory)
-            if not continuous_plan.supported and _looks_like_contextual_delete(raw_user_input):
-                continuous_plan = self.multistep_planner.plan(
+            if _looks_like_contextual_delete(raw_user_input):
+                contextual_plan = self.multistep_planner.plan(
                     _strip_delete_sensitivity_phrase(raw_user_input),
                     memory=self.memory,
                 )
-                if continuous_plan.supported:
-                    continuous_plan = continuous_plan.model_copy(
+                if _should_prefer_contextual_delete_plan(continuous_plan, contextual_plan):
+                    continuous_plan = contextual_plan.model_copy(
                         update={"raw_user_input": raw_user_input}
                     )
             if continuous_plan.supported:
@@ -781,7 +787,7 @@ class ReadonlyOrchestrator:
                 raw_user_input=plan.raw_user_input,
                 confidence=1.0,
             )
-        return {
+        envelope = {
             "intent": parsed_intent.model_dump(mode="json"),
             "environment": environment,
             "risk": risk.model_dump(mode="json"),
@@ -791,6 +797,12 @@ class ReadonlyOrchestrator:
             "explanation": explanation,
             "timeline": timeline,
         }
+        return apply_evo_lite_hook(
+            envelope,
+            memory=self.memory,
+            experience_store=self.experience_store,
+            enabled=self.evo_lite_enabled,
+        )
 
     def _envelope(
         self,
@@ -803,7 +815,7 @@ class ReadonlyOrchestrator:
         result: dict[str, Any],
         explanation: str,
     ) -> dict[str, Any]:
-        return {
+        envelope = {
             "intent": parsed_intent.model_dump(mode="json"),
             "environment": environment,
             "risk": risk.model_dump(mode="json"),
@@ -812,6 +824,12 @@ class ReadonlyOrchestrator:
             "result": result,
             "explanation": explanation,
         }
+        return apply_evo_lite_hook(
+            envelope,
+            memory=self.memory,
+            experience_store=self.experience_store,
+            enabled=self.evo_lite_enabled,
+        )
 
     def _unresolved_context_response(self, parsed_intent: ParsedIntent) -> dict[str, Any]:
         reason = _unresolved_context_reason(parsed_intent)
@@ -1054,6 +1072,21 @@ def _looks_like_contextual_delete(raw_user_input: str) -> bool:
         _contains_any(text, ["删除", "删掉", "移除", "remove", "delete"])
         and _contains_any(text, ["刚才那个用户", "上一个用户", "刚刚创建的用户", "刚才创建的用户"])
     )
+
+
+def _should_prefer_contextual_delete_plan(
+    current_plan: ExecutionPlan,
+    candidate_plan: ExecutionPlan,
+) -> bool:
+    if not candidate_plan.supported:
+        return False
+    candidate_intents = [step.intent for step in candidate_plan.steps]
+    if DELETE_USER_INTENT not in candidate_intents or CREATE_USER_INTENT in candidate_intents:
+        return False
+    if not current_plan.supported:
+        return True
+    current_intents = [step.intent for step in current_plan.steps]
+    return CREATE_USER_INTENT in current_intents or len(candidate_plan.steps) < len(current_plan.steps)
 
 
 def _strip_delete_sensitivity_phrase(raw_user_input: str) -> str:
