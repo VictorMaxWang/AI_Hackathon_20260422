@@ -10,7 +10,7 @@
     <main class="shell">
       <header class="header">
         <h1>GuardedOps</h1>
-        <p>Phase 1 只读运维入口</p>
+        <p>Phase 2 风险预览与确认闭环</p>
       </header>
 
       <form id="chat-form" class="query-form">
@@ -21,7 +21,7 @@
             name="raw_user_input"
             type="text"
             autocomplete="off"
-            placeholder="例如：帮我查看当前磁盘使用情况"
+            placeholder="例如：请创建普通用户 demo_guest"
             required
           />
           <button id="send-button" type="submit">发送</button>
@@ -33,15 +33,21 @@
       </section>
 
       <section id="result-panel" class="result-panel" hidden>
+        <article class="request-card">
+          <h2>用户输入</h2>
+          <p id="user-input-text">-</p>
+        </article>
+
         <div class="summary-grid">
-          <article>
+          <article id="risk-card" class="state-card">
             <h2>风险等级</h2>
             <p id="risk-level">-</p>
             <p id="risk-reasons" class="muted">-</p>
           </article>
           <article>
-            <h2>环境摘要</h2>
-            <p id="environment-summary">-</p>
+            <h2>计划状态</h2>
+            <p id="plan-status">-</p>
+            <p id="plan-reason" class="muted">-</p>
           </article>
           <article>
             <h2>执行状态</h2>
@@ -49,9 +55,31 @@
           </article>
         </div>
 
+        <article id="confirmation-panel" class="confirmation-panel" hidden>
+          <h2>待确认</h2>
+          <p>请在上方输入框提交精确确认语。</p>
+          <code id="confirmation-text">-</code>
+        </article>
+
+        <article id="refusal-panel" class="refusal-panel" hidden>
+          <h2>拒绝原因与安全替代方案</h2>
+          <p id="refusal-reason">-</p>
+          <p id="safe-alternative" class="muted">-</p>
+        </article>
+
+        <article class="plan-card">
+          <h2>执行计划</h2>
+          <ul id="plan-steps" class="plan-steps"></ul>
+        </article>
+
         <article class="explanation">
-          <h2>中文解释</h2>
+          <h2>解释</h2>
           <p id="explanation-text">-</p>
+        </article>
+
+        <article class="result-summary-card">
+          <h2>结果摘要</h2>
+          <p id="result-summary">-</p>
         </article>
 
         <article class="raw-result">

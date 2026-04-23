@@ -4,7 +4,7 @@ GuardedOps 是一个安全对话式 Linux/SSH 运维代理项目。
 
 本项目用于 AI Hackathon 2026《操作系统智能代理》赛题，目标是在真实 Linux/SSH 运维场景中探索可运行、可验证、可审计的安全代理形态。
 
-当前阶段处于仓库初始化阶段，仅建立基础目录、工程配置和后续开发入口，不代表核心能力已经完成。
+当前 README 仍是阶段性说明，不是最终提交版。当前仓库已覆盖 Phase 1 只读基础能力，以及 Phase 2 受限用户写操作的风控、确认和拒绝闭环测试。
 
 核心安全边界：
 
@@ -43,7 +43,7 @@ http://127.0.0.1:8000/
 
 ## `/api/chat`
 
-当前提供最小只读入口：
+当前提供统一对话入口：
 
 ```http
 POST /api/chat
@@ -60,7 +60,7 @@ Content-Type: application/json
 
 响应直接来自只读 orchestrator 的统一结构，包含 `intent`、`environment`、`risk`、`plan`、`execution`、`result` 和 `explanation`。
 
-当前阶段只支持 Phase 1 只读基础能力，包括磁盘、文件检索、进程和端口查询。不支持任意命令执行，不支持 raw command mode，不支持写操作。
+当前接口支持 Phase 1 只读基础能力，以及 Phase 2 普通用户创建/删除的确认闭环。高风险写操作会被策略拒绝。不支持任意命令执行，不支持 raw command mode。
 
 ## Phase 1 测试与最小验证
 
@@ -99,10 +99,36 @@ curl -X POST http://127.0.0.1:8000/api/chat \
 - CLI 调试入口的文本输出、JSON 输出和写操作拒绝。
 - Web/API `/api/chat` 的 TestClient 只读入口和静态页面资源。
 
+## Phase 2 测试与确认闭环验证
+
+运行全量测试：
+
+```bash
+pytest
+```
+
+只运行 Phase 2 相关测试：
+
+```bash
+pytest tests/test_policy.py tests/test_validators.py tests/test_user_tools.py tests/test_confirmation.py tests/test_high_risk_refusal.py tests/test_api_confirmation.py
+```
+
+当前 Phase 2 测试覆盖：
+
+- 风控引擎：S1/S2 确认、S3 高风险拒绝、受保护路径、sudoers、sshd_config、批量权限变更。
+- 用户名校验：保留系统用户、注入字符、空白、通配符、非 ASCII 和长度边界。
+- 用户管理工具：全 mock 验证创建/删除用户流程，不在真实系统创建或删除用户。
+- 确认状态机：正确确认语执行，错误确认语不执行，取消确认清理 pending action。
+- 高风险拒绝闭环：S3 请求不进入确认，不执行 env_probe 或任何工具。
+- Web/API 展示：`/api/chat` 返回 pending confirmation、risk、plan、execution、result、safe_alternative，静态页面包含确认与拒绝展示区域。
+
+环境说明：本仓库当前可用的 `pytest` 命令使用已安装依赖的 Python 3.11 环境；如果 `python -m pytest` 指向缺少依赖的其他 Python，需要切换解释器或安装项目依赖后再运行。
+
 当前仍未覆盖或未实现：
 
-- 写操作能力，如创建用户、删除用户、修改系统配置。
-- policy engine、确认机制、Session Memory 和真实 LLM 接入。
+- Session Memory 仅覆盖一个待确认动作，尚未实现连续上下文记忆。
+- 多步 Planner 与连续任务编排尚未实现。
+- 真实 LLM 接入尚未实现。
 - 真实远程 SSH 环境集成测试。
 - 持久化审计存储，如 SQLite / JSONL 查询闭环。
 
