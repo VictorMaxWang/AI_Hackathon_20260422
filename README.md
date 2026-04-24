@@ -162,13 +162,57 @@ pytest
 - 多步 Planner：生成结构化 `ExecutionPlan` / `PlanStep`，覆盖环境探测后创建普通用户、端口查询后查询对应进程、上下文删除用户和不支持复杂任务的拒绝。
 - 连续任务 Orchestrator：覆盖暂停等待确认、确认后恢复、确认语不匹配保持 pending、取消 pending、前置失败中止后续步骤，以及创建/删除后的验证 timeline。
 - timeline 输出：每个连续任务节点包含 `step_id`、`intent`、`risk`、`status` 和 `result_summary`，用于演示与审计材料。
-- LLM parser stub：`app.agent.llm_parser` 当前保持禁用态，测试确认不会发起真实网络请求或依赖外部模型 API。
+- LLM parser：`app.agent.llm_parser` 默认保持禁用态，默认测试确认不会发起真实网络请求或依赖外部模型 API。
+
+## Optional Qwen3.6-Plus Provider
+
+GuardedOps can optionally use Alibaba Cloud Bailian / DashScope Qwen3.6-Plus through the OpenAI-compatible API. This is disabled by default and only acts as a fallback intent-candidate parser after the rule-based parser returns `unknown`.
+
+```bash
+export GUARDEDOPS_LLM_ENABLE=true
+export GUARDEDOPS_LLM_PROVIDER=aliyun_bailian
+export GUARDEDOPS_LLM_MODEL=qwen3.6-plus
+export GUARDEDOPS_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export DASHSCOPE_API_KEY=your_api_key_here
+```
+
+Regional base URLs:
+
+```bash
+# Beijing
+export GUARDEDOPS_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# Singapore
+export GUARDEDOPS_LLM_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+# US Virginia
+export GUARDEDOPS_LLM_BASE_URL=https://dashscope-us.aliyuncs.com/compatible-mode/v1
+```
+
+Security notes:
+
+- API keys are read only from `DASHSCOPE_API_KEY`.
+- Do not hardcode API keys or write them to logs, audit records, frontend responses, or config files.
+- LLM output is only an intent candidate and must pass JSON, schema, policy, and whitelist validation.
+- The policy engine still decides allow/deny.
+- Confirmation, planning, executor, whitelist tools, evidence, and recovery remain code-controlled.
+- If LLM is disabled, no API key is configured, the provider fails, or validation fails, GuardedOps falls back to the existing rule-based parser.
+
+Mock-only tests:
+
+```bash
+pytest tests/test_llm_config.py
+pytest tests/test_qwen_provider.py
+pytest tests/test_llm_parser_integration.py
+```
+
+More details: `docs/llm_provider_qwen.md`.
 
 环境说明：本仓库当前可用的 `pytest` 命令使用已安装依赖的 Python 3.11 环境；如果 `python -m pytest` 指向缺少依赖的其他 Python，需要切换解释器或安装项目依赖后再运行。
 
 当前仍未覆盖或未实现：
 
-- 真实 LLM 接入尚未实现；当前只有禁用态 parser stub。
+- 真实 LLM 自动化集成测试尚未实现；默认测试只使用 mock provider，不调用外部模型 API。
 - 真实远程 SSH 环境集成测试。
 - 持久化审计存储，如 SQLite / JSONL 查询闭环。
 - 审计导出、最终交付文档、自测报告和演示材料整理。
