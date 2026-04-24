@@ -35,8 +35,9 @@ class ParsedIntent(BaseModel):
 class PlanStep(BaseModel):
     """One controlled step in a multi-step plan.
 
-    This model describes intent and dependencies only. It is not an executable
-    tool call and must still pass through policy and confirmation later.
+    This model describes intent, dependencies, and step-level execution
+    contracts only. It is not an executable tool call and must still pass
+    through policy and confirmation later.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -47,6 +48,13 @@ class PlanStep(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     condition: str | None = None
     description: str
+    preconditions: list[str] = Field(default_factory=list)
+    expected_observation: str = ""
+    postconditions: list[str] = Field(default_factory=list)
+    freshness_keys: list[str] = Field(default_factory=list)
+    fingerprint_keys: list[str] = Field(default_factory=list)
+    checkpointable: bool = False
+    write_step: bool = False
     requires_policy: bool = True
     requires_confirmation: bool = False
 

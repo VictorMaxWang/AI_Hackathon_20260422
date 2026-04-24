@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
-from app.models import ParsedIntent, PolicyDecision, RiskLevel, ToolResult
+from pydantic import BaseModel
 
 from app.agent.parser import DISK_INTENT, FILE_INTENT, PORT_INTENT, PROCESS_INTENT
+from app.models import ParsedIntent, PolicyDecision, RiskLevel, ToolResult
+from app.models.evidence import (
+    EvidenceChain,
+    EvidenceStage,
+    ExplanationCard,
+    ExplanationSection,
+)
 
 
 class ReadonlySummarizer:
-    """Chinese summaries for Phase 1 read-only tool results."""
+    """Summaries and explanation-card rendering for GuardedOps orchestrator outputs."""
 
     def summarize(
         self,
@@ -54,9 +62,7 @@ class ReadonlySummarizer:
         if pending_intent == "delete_user" or any(
             item.get("intent") == "delete_user" for item in timeline
         ):
-            delete_reason = (
-                "删除比创建更敏感，因为它会影响账号访问、文件归属和可恢复性。"
-            )
+            delete_reason = "删除比创建更敏感，因为它会影响账号访问、文件归属和可恢复性。"
 
         if status == "pending_confirmation":
             confirm_part = f"请输入精确确认语：{confirmation_text}。" if confirmation_text else ""
@@ -79,6 +85,148 @@ class ReadonlySummarizer:
 
         return f"连续任务状态：{status}。{delete_reason}"
 
+    def build_explanation_card(
+        self,
+        *,
+        parsed_intent: ParsedIntent | Mapping[str, Any],
+        environment: Mapping[str, Any] | BaseModel | None,
+        risk: PolicyDecision | Mapping[str, Any],
+        plan: Mapping[str, Any] | BaseModel,
+        execution: Mapping[str, Any] | BaseModel,
+        result: Mapping[str, Any] | BaseModel,
+        evidence_chain: EvidenceChain | Mapping[str, Any],
+        recovery: Mapping[str, Any] | None = None,
+        legacy_explanation: str | None = None,
+        timeline: list[dict[str, Any]] | None = None,
+    ) -> ExplanationCard:
+        parsed = _as_dict(parsed_intent)
+        risk_data = _as_dict(risk)
+        plan_data = _as_dict(plan)
+        execution_data = _as_dict(execution)
+        result_data = _as_dict(result)
+        environment_data = _as_dict(environment)
+        evidence = _as_evidence_chain(evidence_chain)
+        recovery_data = _as_dict(recovery)
+        timeline = [item for item in (timeline or []) if isinstance(item, dict)]
+
+        parse_refs = _event_ids(evidence, EvidenceStage.PARSE)
+        plan_refs = _event_ids(evidence, EvidenceStage.PLAN)
+        policy_refs = _event_ids(evidence, EvidenceStage.POLICY)
+        confirmation_refs = _event_ids(evidence, EvidenceStage.CONFIRMATION)
+        tool_refs = _event_ids(evidence, EvidenceStage.TOOL_CALL)
+        post_check_refs = _event_ids(evidence, EvidenceStage.POST_CHECK)
+        recovery_refs = _event_ids(evidence, EvidenceStage.RECOVERY)
+        result_refs = _event_ids(evidence, EvidenceStage.RESULT)
+
+        confirmation_assertion = _assertion_by_name(evidence, "confirmation_state")
+        blocked_assertion = _assertion_by_name(evidence, "blocked_request_tool_suppression")
+        post_check_assertion = _assertion_by_name(evidence, "post_check_state")
+        outcome_assertion = _assertion_by_name(evidence, "final_outcome")
+
+        card = ExplanationCard(
+            intent_normalized=ExplanationSection(
+                summary=_intent_section_summary(parsed),
+                evidence_refs=parse_refs,
+            ),
+            plan_summary=ExplanationSection(
+                summary=_plan_section_summary(plan_data),
+                evidence_refs=plan_refs,
+            ),
+            risk_hits=ExplanationSection(
+                summary=_risk_section_summary(risk_data),
+                evidence_refs=policy_refs,
+            ),
+            scope_preview=ExplanationSection(
+                summary=_scope_section_summary(parsed, plan_data),
+                evidence_refs=plan_refs,
+            ),
+            confirmation_basis=ExplanationSection(
+                summary=_confirmation_section_summary(
+                    risk_data=risk_data,
+                    plan_data=plan_data,
+                    execution_data=execution_data,
+                    result_data=result_data,
+                    timeline=timeline,
+                    confirmation_assertion=confirmation_assertion,
+                ),
+                evidence_refs=_merge_refs(
+                    confirmation_refs,
+                    _assertion_refs(confirmation_assertion),
+                ),
+            ),
+            execution_evidence=ExplanationSection(
+                summary=_execution_section_summary(
+                    legacy_explanation=legacy_explanation,
+                    execution_data=execution_data,
+                    blocked_assertion=blocked_assertion,
+                ),
+                evidence_refs=_merge_refs(
+                    tool_refs,
+                    post_check_refs,
+                    _assertion_refs(blocked_assertion),
+                    confirmation_refs,
+                    plan_refs,
+                ),
+            ),
+            result_assertion=ExplanationSection(
+                summary=_result_section_summary(
+                    result_data=result_data,
+                    outcome_assertion=outcome_assertion,
+                    post_check_assertion=post_check_assertion,
+                ),
+                evidence_refs=_merge_refs(
+                    result_refs,
+                    _assertion_refs(outcome_assertion),
+                    _assertion_refs(post_check_assertion),
+                ),
+            ),
+            residual_risks_or_next_step=ExplanationSection(
+                summary=_residual_section_summary(
+                    risk_data=risk_data,
+                    result_data=result_data,
+                    plan_data=plan_data,
+                    recovery_data=recovery_data,
+                ),
+                evidence_refs=_merge_refs(policy_refs, result_refs, recovery_refs),
+            ),
+        )
+        return card
+
+    def render_explanation_card(
+        self,
+        card: ExplanationCard | Mapping[str, Any],
+        *,
+        fallback: str | None = None,
+    ) -> str:
+        payload = _as_dict(card)
+        sections = [
+            _as_dict(payload.get("intent_normalized")),
+            _as_dict(payload.get("plan_summary")),
+            _as_dict(payload.get("risk_hits")),
+            _as_dict(payload.get("scope_preview")),
+            _as_dict(payload.get("confirmation_basis")),
+            _as_dict(payload.get("execution_evidence")),
+            _as_dict(payload.get("result_assertion")),
+            _as_dict(payload.get("residual_risks_or_next_step")),
+        ]
+        evidence_refs = _merge_refs(*[section.get("evidence_refs") for section in sections])
+        if fallback:
+            if not evidence_refs:
+                return fallback
+            return f"{fallback} [evidence: {', '.join(evidence_refs)}]"
+
+        parts: list[str] = []
+        for section in sections:
+            summary = str(section.get("summary") or "").strip()
+            refs = _merge_refs(section.get("evidence_refs"))
+            if not summary:
+                continue
+            if refs:
+                parts.append(f"{summary} [evidence: {', '.join(refs)}]")
+            else:
+                parts.append(summary)
+        return "\n".join(parts)
+
 
 def summarize_readonly_result(
     parsed_intent: ParsedIntent,
@@ -95,6 +243,268 @@ def summarize_readonly_result(
         reason=reason,
         risk=risk,
     )
+
+
+def _intent_section_summary(parsed: dict[str, Any]) -> str:
+    intent_name = str(parsed.get("intent") or "unknown")
+    target = _as_dict(parsed.get("target"))
+    target_parts: list[str] = []
+    for key in ("username", "path", "port", "pid", "keyword"):
+        value = target.get(key)
+        if value not in (None, "", []):
+            target_parts.append(f"{key}={value}")
+    base_paths = target.get("base_paths")
+    if isinstance(base_paths, list) and base_paths:
+        target_parts.append(f"base_paths={base_paths}")
+    requires_write = bool(parsed.get("requires_write", False))
+    target_text = "；目标：" + "，".join(target_parts) if target_parts else ""
+    return f"归一化意图：{intent_name}{target_text}；requires_write={requires_write}。"
+
+
+def _plan_section_summary(plan_data: dict[str, Any]) -> str:
+    status = str(plan_data.get("status") or "unknown")
+    steps = _step_labels(plan_data)
+    if steps:
+        return f"计划状态：{status}；步骤预览：{' -> '.join(steps)}。"
+    reason = plan_data.get("reason")
+    if reason:
+        return f"计划状态：{status}；原因：{reason}。"
+    return f"计划状态：{status}。"
+
+
+def _risk_section_summary(risk_data: dict[str, Any]) -> str:
+    level = str(risk_data.get("risk_level") or "unknown")
+    reasons = [str(item) for item in _as_list(risk_data.get("reasons")) if str(item).strip()]
+    base = f"风险等级：{level}。"
+    if reasons:
+        return f"{base} 命中原因：{'；'.join(reasons)}。"
+    if risk_data.get("allow") is True:
+        return f"{base} 当前未命中额外阻断规则。"
+    return f"{base} 当前请求未通过策略。"
+
+
+def _scope_section_summary(parsed: dict[str, Any], plan_data: dict[str, Any]) -> str:
+    steps = _step_labels(plan_data)
+    if steps:
+        scope = f"执行范围：{' -> '.join(steps)}。"
+    else:
+        scope = "执行范围：当前没有可执行步骤。"
+
+    target = _as_dict(parsed.get("target"))
+    path = target.get("path")
+    port = target.get("port")
+    username = target.get("username")
+    extra: list[str] = []
+    if isinstance(path, str) and path:
+        extra.append(f"path={path}")
+    if port is not None:
+        extra.append(f"port={port}")
+    if isinstance(username, str) and username:
+        extra.append(f"username={username}")
+    if extra:
+        scope = f"{scope} 边界参数：{'，'.join(extra)}。"
+    return scope
+
+
+def _confirmation_section_summary(
+    *,
+    risk_data: dict[str, Any],
+    plan_data: dict[str, Any],
+    execution_data: dict[str, Any],
+    result_data: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    confirmation_assertion: dict[str, Any] | None,
+) -> str:
+    confirmation_status = _confirmation_status(
+        risk_data=risk_data,
+        plan_data=plan_data,
+        execution_data=execution_data,
+        result_data=result_data,
+        timeline=timeline,
+    )
+    confirmation_text = result_data.get("confirmation_text") or risk_data.get("confirmation_text")
+    risk_level = str(risk_data.get("risk_level") or "S0")
+
+    if confirmation_status == "pending":
+        return (
+            f"确认依据：该请求为 {risk_level}，当前仍待确认。"
+            f"{_confirmation_text_suffix(confirmation_text)}"
+        )
+    if confirmation_status == "confirmed":
+        return f"确认依据：所需确认已满足，执行闭环可以继续。"
+    if confirmation_status == "mismatch":
+        return (
+            "确认依据：确认语不匹配，系统继续保持待确认状态。"
+            f"{_confirmation_text_suffix(confirmation_text)}"
+        )
+    if confirmation_status == "cancelled":
+        return "确认依据：待确认操作已被用户取消。"
+
+    if confirmation_assertion is not None:
+        return str(confirmation_assertion.get("summary") or "确认依据：当前请求无需二次确认。")
+    return "确认依据：当前请求无需二次确认。"
+
+
+def _execution_section_summary(
+    *,
+    legacy_explanation: str | None,
+    execution_data: dict[str, Any],
+    blocked_assertion: dict[str, Any] | None,
+) -> str:
+    results = [item for item in _as_list(execution_data.get("results")) if isinstance(item, dict)]
+    if results:
+        successes = sum(1 for item in results if item.get("success") is True)
+        tool_names = [str(item.get("tool_name") or "unknown") for item in results]
+        prefix = (
+            f"执行证据：共记录 {len(results)} 次白名单工具调用，成功 {successes} 次；"
+            f"工具链路：{' -> '.join(tool_names)}。"
+        )
+        if legacy_explanation:
+            return f"{prefix} 摘要：{legacy_explanation}"
+        return prefix
+
+    if blocked_assertion is not None:
+        return f"执行证据：{blocked_assertion.get('summary')}"
+
+    if legacy_explanation:
+        return f"执行证据：{legacy_explanation}"
+    return "执行证据：当前没有工具调用记录。"
+
+
+def _result_section_summary(
+    *,
+    result_data: dict[str, Any],
+    outcome_assertion: dict[str, Any] | None,
+    post_check_assertion: dict[str, Any] | None,
+) -> str:
+    parts: list[str] = []
+    if outcome_assertion is not None:
+        parts.append(str(outcome_assertion.get("summary") or "").strip())
+    else:
+        parts.append(f"最终状态：{result_data.get('status') or 'unknown'}。")
+
+    if post_check_assertion is not None:
+        parts.append(str(post_check_assertion.get("summary") or "").strip())
+    return " ".join(part for part in parts if part)
+
+
+def _residual_section_summary(
+    *,
+    risk_data: dict[str, Any],
+    result_data: dict[str, Any],
+    plan_data: dict[str, Any],
+    recovery_data: dict[str, Any],
+) -> str:
+    if recovery_data:
+        failure_type = str(recovery_data.get("failure_type") or "unknown")
+        why = str(recovery_data.get("why_it_failed") or "").strip()
+        safe_next_steps = [
+            str(item).strip()
+            for item in _as_list(recovery_data.get("safe_next_steps"))
+            if isinstance(item, str) and item.strip()
+        ]
+        readonly_diagnostics = [
+            str(item).strip()
+            for item in _as_list(recovery_data.get("suggested_readonly_diagnostics"))
+            if isinstance(item, str) and item.strip()
+        ]
+        parts = [f"Recovery: {failure_type}."]
+        if why:
+            parts.append(f"Why: {why}")
+        if safe_next_steps:
+            parts.append(f"Next: {' '.join(safe_next_steps[:2])}")
+        if readonly_diagnostics:
+            parts.append(f"Read-only diagnostics: {' '.join(readonly_diagnostics[:2])}")
+        return " ".join(parts)
+
+    status = str(result_data.get("status") or plan_data.get("status") or "unknown")
+    confirmation_text = result_data.get("confirmation_text") or risk_data.get("confirmation_text")
+    safe_alternative = risk_data.get("safe_alternative")
+    error = result_data.get("error")
+
+    if status == "pending_confirmation":
+        return f"下一步：输入精确确认语继续。{_confirmation_text_suffix(confirmation_text)}"
+    if status == "refused":
+        if safe_alternative:
+            return f"残余风险/下一步：建议改为安全替代方案：{_translate_safe_alternative(str(safe_alternative))}"
+        return "残余风险/下一步：当前请求已被拒绝，建议收敛到只读或更小范围。"
+    if status in {"failed", "aborted"}:
+        if error:
+            return f"残余风险/下一步：需排查失败原因：{error}"
+        return "残余风险/下一步：需检查失败步骤并重新验证。"
+    if status == "cancelled":
+        return "下一步：待确认操作已取消，如需继续请重新发起请求。"
+    return "残余风险/下一步：当前请求已完成，可直接使用 evidence_chain 做审计、回放或回归比对。"
+
+
+def _confirmation_text_suffix(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        return f" 精确确认语：{value.strip()}。"
+    return ""
+
+
+def _step_labels(plan_data: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    for step in _as_list(plan_data.get("steps")):
+        item = _as_dict(step)
+        label = item.get("tool_name") or item.get("intent") or item.get("step_id")
+        if label:
+            labels.append(str(label))
+    return labels
+
+
+def _confirmation_status(
+    *,
+    risk_data: dict[str, Any],
+    plan_data: dict[str, Any],
+    execution_data: dict[str, Any],
+    result_data: dict[str, Any],
+    timeline: list[dict[str, Any]],
+) -> str:
+    plan_status = str(plan_data.get("status") or "").lower()
+    result_status = str(result_data.get("status") or "").lower()
+    result_error = str(result_data.get("error") or "").lower()
+    execution_results = _as_list(execution_data.get("results"))
+
+    if result_error == "confirmation_text_mismatch":
+        return "mismatch"
+    if result_status == "cancelled" or plan_status == "cancelled":
+        return "cancelled"
+    if result_status == "pending_confirmation" or plan_status == "pending_confirmation":
+        return "pending"
+    if plan_status == "confirmed":
+        return "confirmed"
+    if any(str(item.get("status") or "").lower() == "pending_confirmation" for item in timeline):
+        return "pending"
+    if bool(risk_data.get("requires_confirmation")) and execution_results:
+        return "confirmed"
+    return "not_required"
+
+
+def _event_ids(evidence: EvidenceChain, stage: EvidenceStage) -> list[str]:
+    return [event.event_id for event in evidence.events if event.stage == stage]
+
+
+def _assertion_by_name(evidence: EvidenceChain, name: str) -> dict[str, Any] | None:
+    for assertion in evidence.state_assertions:
+        if assertion.name == name:
+            return assertion.model_dump(mode="json")
+    return None
+
+
+def _assertion_refs(assertion: dict[str, Any] | None) -> list[str]:
+    if assertion is None:
+        return []
+    assertion_id = assertion.get("assertion_id")
+    return [str(assertion_id)] if isinstance(assertion_id, str) and assertion_id else []
+
+
+def _as_evidence_chain(value: EvidenceChain | Mapping[str, Any]) -> EvidenceChain:
+    if isinstance(value, EvidenceChain):
+        return value
+    if isinstance(value, Mapping):
+        return EvidenceChain.model_validate(value)
+    return EvidenceChain()
 
 
 def _summarize_s3_refusal(
@@ -164,7 +574,7 @@ def _summarize_disk(data: Any) -> str:
 
     tightest = max(filesystems, key=lambda item: _percent_value(item.get("use_percent")))
     return (
-        f"当前共检测到 {len(filesystems)} 个挂载点，"
+        f"当前共检测到 {len(filesystems)} 个挂载点；"
         f"最紧张的是 {tightest.get('mounted_on', '未知挂载点')}，"
         f"使用率 {tightest.get('use_percent', '未知')}，"
         f"可用空间 {tightest.get('available', '未知')}。"
@@ -178,10 +588,7 @@ def _summarize_file_search(data: Any) -> str:
     truncated = "结果已截断" if payload.get("truncated") else "结果未截断"
     keyword = payload.get("name_contains")
     keyword_text = f"，文件名包含 {keyword}" if keyword else ""
-    return (
-        f"已在 {base_path} 中完成文件检索{keyword_text}，"
-        f"返回 {count} 条结果，{truncated}。"
-    )
+    return f"已在 {base_path} 中完成文件检索{keyword_text}，返回 {count} 条结果，{truncated}。"
 
 
 def _summarize_process(data: Any) -> str:
@@ -191,15 +598,15 @@ def _summarize_process(data: Any) -> str:
     mode_text = {
         "cpu": "CPU 占用",
         "memory": "内存占用",
-        "keyword": "关键词匹配",
+        "keyword": "关键字匹配",
         "pid": "PID",
     }.get(str(mode), str(mode))
     if not processes:
-        return f"已完成{mode_text}进程查询，没有返回匹配进程。"
+        return f"已完成 {mode_text} 进程查询，没有返回匹配进程。"
 
     first = processes[0]
     return (
-        f"已完成{mode_text}进程查询，返回 {len(processes)} 个进程；"
+        f"已完成 {mode_text} 进程查询，返回 {len(processes)} 个进程；"
         f"首条为 PID {first.get('pid')}，进程 {first.get('command')}，"
         f"用户 {first.get('user')}。"
     )
@@ -227,3 +634,40 @@ def _percent_value(value: Any) -> int:
         return int(text)
     except ValueError:
         return -1
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    plain = _to_plain(value)
+    return plain if isinstance(plain, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    plain = _to_plain(value)
+    if plain is None:
+        return []
+    if isinstance(plain, list):
+        return plain
+    if isinstance(plain, tuple):
+        return list(plain)
+    return [plain]
+
+
+def _to_plain(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        return {str(key): _to_plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_plain(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_plain(item) for item in value]
+    return value
+
+
+def _merge_refs(*groups: Any) -> list[str]:
+    refs: list[str] = []
+    for group in groups:
+        for item in _as_list(group):
+            if isinstance(item, str) and item.strip() and item not in refs:
+                refs.append(item)
+    return refs

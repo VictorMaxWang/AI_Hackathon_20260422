@@ -206,3 +206,46 @@
   - P3.5-T05：Workflow Retrieval in Planner；
   - P3.5-T06：Evo-Lite Orchestrator Hook；
   - P3.5-T07：Safety Regression Benchmark。
+
+---
+
+## DEC-P36-01：新增 Phase 3.6，优先建设可信控制面与证据层，而不是继续扩大能力面
+
+- 日期：2026-04-23
+- 决策人：项目总控
+- 当前 Phase：Phase 3.6
+- 关联 Task：P3.6-T00
+- 决策内容：
+  - 在 P0 ~ P3.5 之后插入 Phase 3.6：可信控制面、证据层与鲁棒闭环；
+  - 当前优先建设解释卡与证据层、确认绑定与执行闭包、连续任务鲁棒性、失败恢复建议、经验治理、可重放安全回归和可视化控制面；
+  - 不扩大执行面，不开放 arbitrary shell，不开放 raw command mode，不自动修改 policy/executor，也不做在线 RL 或高风险微调。
+- 决策原因：
+  - 为什么现在不直接进入 P4/P5：P4/P5 主要面向审计包装、演示材料和最终交付，而当前更高价值的短板在于可信解释、确认绑定、鲁棒恢复和可重放验证，先补齐这些能力能显著提升后续演示与交付质量；
+  - 为什么不优先扩工具面：现有工具面已覆盖当前 hackathon 主路径，再继续扩工具会放大风险面和验证成本，而不会同比提升可信度与可控性；
+  - 为什么不做在线 RL / 高风险微调：在线 RL、高风险持续微调和自修改都会引入边界漂移、不可控探索和审计困难，与 GuardedOps 的安全、可解释、可审计定位冲突；
+  - 为什么 Phase 3.6 是高 ROI 路线：证据链、确认绑定、断点续跑、失败恢复和 replayable regression 能同时提高安全解释质量、操作稳定性、评审说服力和后续演示复用率。
+- 替代方案：
+  - 直接进入 P4/P5，优先补交付材料；
+  - 继续扩工具面或扩危险能力面；
+  - 采用在线 RL、持续微调或其他高风险自进化方案。
+- 为什么不选替代方案：
+  - 直接进入 P4/P5 会把当前可信控制短板带入最终演示，导致审计与展示材料缺乏高质量支撑；
+  - 继续扩工具面会增加 blast radius、验证复杂度和误用风险，但不会同步增强证据链和控制闭环；
+  - 在线 RL 或高风险微调会引入不可预测行为、自修改风险和额外训练依赖，不适合当前 hackathon 的安全演示节奏。
+- 影响范围：
+  - 新增 Phase 3.6 任务链与并行规则；
+  - 更新 task_board、current_status、architecture_constraints、parallel_workstreams、validation_matrix、project_context 和设计说明文档；
+  - 当前只扩展可信控制与证据能力，不扩大执行面，不改变安全边界。
+- 风险：
+  - 容易把 explanation、workflow、experience 或 UX 展示误做成绕过 policy 的旁路；
+  - 容易把 failure recovery suggestion 误做成可执行脚本生成器；
+  - 控制面展示可能只做表层 UI，而缺少可重放、可验证和可追溯基础。
+- 后续动作：
+  - P3.6-T01：Evidence Layer Schema & Explanation Card Backend；
+  - P3.6-T02：Guarded Confirmation Token & Scope Binding；
+  - P3.6-T03：Step Contracts, Drift Revalidation & Checkpoint Resume；
+  - P3.6-T04：Experience Governance Guardrails；
+  - P3.6-T05：Failure Recovery Taxonomy & Suggestion Engine；
+  - P3.6-T06：Replayable Safety Regression & Red-Team Harness；
+  - P3.6-T07：Operator Control Panel UX I；
+  - P3.6-T08：Operator Control Panel UX II。

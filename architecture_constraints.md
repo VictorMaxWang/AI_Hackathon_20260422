@@ -401,7 +401,26 @@ Phase 3.5 的 Evo-Lite 只用于安全经验沉淀与自评估闭环，不改变
 
 ---
 
-## 18. 待确认项
+## 18. Phase 3.6 约束
+
+Phase 3.6 的可信控制面、证据层与鲁棒闭环必须在既有安全边界内增强，不能通过解释、记忆、经验或 UI 展示扩张执行能力。
+
+必须明确遵守：
+
+- 不能开放 arbitrary shell；
+- 不能开放 raw command mode；
+- 不能让 explanation / memory / workflow / reflection 绕过 policy；
+- 不能自动修改 policy / executor / 风控边界；
+- 不能自动生成可执行 shell 脚本；
+- confirmation 必须绑定执行闭包；
+- evidence 必须优先来自 trace / state assertion / policy events，而不是自由叙述；
+- workflow 只能调用白名单工具；
+- experience 必须有隔离、去重、晋升门禁；
+- benchmark 必须支持回归和重放。
+
+---
+
+## 19. 待确认项
 
 - 是否统一使用 sudo wrapper；
 - SSH 密钥路径配置格式；

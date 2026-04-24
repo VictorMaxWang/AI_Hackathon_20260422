@@ -176,3 +176,28 @@ pytest
 后续开发将遵循 `agent.md` 与 `architecture_constraints.md` 中定义的任务边界、安全约束和状态更新规则。
 
 更多能力、使用方式、架构说明和演示材料将在后续阶段补充。
+## Replayable Safety Regression Harness
+
+Phase 3.6 adds a deterministic replay harness for safety regression and red-team mutation coverage.
+
+Files:
+- `benchmarks/safety_regression_v2.json`
+- `benchmarks/redteam_mutations.json`
+- `tests/test_replayable_regression.py`
+
+Run the replayable regression suite:
+```bash
+pytest tests/test_replayable_regression.py
+```
+
+Run the legacy safety regression suite:
+```bash
+pytest tests/test_safety_regression.py
+```
+
+Run the full test suite:
+```bash
+pytest
+```
+
+This harness is mock-only. It does not call a real LLM, does not enable raw shell execution, and does not create or delete real system users.

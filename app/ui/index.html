@@ -3,89 +3,196 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>GuardedOps</title>
+    <title>GuardedOps Operator Panel</title>
     <link rel="stylesheet" href="/ui/style.css" />
   </head>
   <body>
-    <main class="shell">
-      <header class="header">
-        <h1>GuardedOps</h1>
-        <p>Phase 2 风险预览与确认闭环</p>
+    <main class="panel-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">GuardedOps / Operator Panel</p>
+          <h1>可信控制面</h1>
+          <p class="hero-text">
+            explanation、evidence、confidence、preflight 与 recovery 全部绑定到
+            orchestrator 的结构化输出中展示，不扩展任何执行边界。
+          </p>
+        </div>
+        <div class="hero-note">
+          <p>只接受自然语言请求。</p>
+          <p>控制面展示状态、确认门和恢复建议，不提供任意执行入口。</p>
+        </div>
       </header>
 
-      <form id="chat-form" class="query-form">
-        <label for="raw-user-input">自然语言请求</label>
-        <div class="input-row">
+      <form id="operator-form" class="request-form">
+        <label for="operator-request">运维请求</label>
+        <div class="request-row">
           <input
-            id="raw-user-input"
+            id="operator-request"
             name="raw_user_input"
             type="text"
             autocomplete="off"
             placeholder="例如：请创建普通用户 demo_guest"
             required
           />
-          <button id="send-button" type="submit">发送</button>
+          <button id="submit-request" type="submit">提交</button>
         </div>
       </form>
 
-      <section class="status-line" aria-live="polite">
-        <span id="request-status">等待输入</span>
+      <section class="status-strip" aria-live="polite">
+        <span id="request-status">等待请求</span>
       </section>
 
-      <section id="result-panel" class="result-panel" hidden>
-        <article class="request-card">
-          <h2>用户输入</h2>
-          <p id="user-input-text">-</p>
-        </article>
+      <section id="operator-panel" class="operator-panel" hidden>
+        <div class="workspace">
+          <section class="workspace-main">
+            <section class="surface surface-overview">
+              <div class="surface-head">
+                <p class="surface-kicker">Operator Snapshot</p>
+                <h2>请求与状态</h2>
+              </div>
+              <p id="user-input-text" class="request-preview">-</p>
+              <div class="badge-row">
+                <div class="metric">
+                  <span class="metric-label">状态</span>
+                  <span id="status-badge" class="pill" data-tone="neutral">-</span>
+                </div>
+                <div class="metric">
+                  <span class="metric-label">风险等级</span>
+                  <span id="risk-badge" class="pill" data-tone="neutral">-</span>
+                </div>
+                <div class="metric">
+                  <span class="metric-label">置信度</span>
+                  <span id="confidence-badge" class="pill" data-tone="neutral">-</span>
+                </div>
+              </div>
+              <p id="confidence-source" class="meta-text" hidden></p>
+              <div id="risk-reasons" class="tag-row"></div>
+            </section>
 
-        <div class="summary-grid">
-          <article id="risk-card" class="state-card">
-            <h2>风险等级</h2>
-            <p id="risk-level">-</p>
-            <p id="risk-reasons" class="muted">-</p>
-          </article>
-          <article>
-            <h2>计划状态</h2>
-            <p id="plan-status">-</p>
-            <p id="plan-reason" class="muted">-</p>
-          </article>
-          <article>
-            <h2>执行状态</h2>
-            <p id="execution-status">-</p>
-          </article>
+            <section id="blast-radius-panel" class="surface">
+              <div class="surface-head">
+                <p class="surface-kicker">Preview</p>
+                <h2>Blast Radius Preview</h2>
+              </div>
+              <p id="blast-radius-summary" class="body-text">-</p>
+              <div class="stack-block">
+                <h3>Known Facts</h3>
+                <div id="blast-radius-facts" class="detail-grid"></div>
+              </div>
+              <div class="stack-block">
+                <h3>Possible Impact</h3>
+                <ul id="blast-radius-impacts" class="impact-list"></ul>
+              </div>
+              <div class="stack-block">
+                <h3>Protected Paths</h3>
+                <div id="blast-radius-paths" class="tag-row"></div>
+              </div>
+              <div class="stack-block">
+                <h3>Conservative Notes</h3>
+                <ul id="blast-radius-notes" class="compact-list"></ul>
+              </div>
+            </section>
+
+            <section class="surface">
+              <div class="surface-head">
+                <p class="surface-kicker">Explanation Card</p>
+                <h2>八段解释卡</h2>
+              </div>
+              <div id="explanation-list" class="explanation-grid"></div>
+            </section>
+
+            <section class="surface">
+              <div class="surface-head">
+                <p class="surface-kicker">Evidence Layer</p>
+                <h2>Evidence Timeline / Narrative Timeline</h2>
+              </div>
+              <ol id="timeline-list" class="timeline"></ol>
+            </section>
+          </section>
+
+          <aside class="workspace-side">
+            <section class="surface">
+              <div class="surface-head">
+                <p class="surface-kicker">Readiness</p>
+                <h2>Preflight Checklist</h2>
+              </div>
+              <ul id="preflight-list" class="checklist"></ul>
+            </section>
+
+            <section id="policy-simulator-panel" class="surface">
+              <div class="surface-head">
+                <p class="surface-kicker">Policy</p>
+                <h2>Policy Simulator</h2>
+              </div>
+              <div class="metric-stack">
+                <div class="metric">
+                  <span class="metric-label">Risk</span>
+                  <span id="policy-risk-badge" class="pill" data-tone="neutral">-</span>
+                </div>
+              </div>
+              <p id="policy-scope-summary" class="body-text">-</p>
+              <p id="policy-version" class="meta-text">-</p>
+              <code id="policy-fingerprint" class="confirmation-copy">-</code>
+              <div class="stack-block">
+                <h3>Matched Rules</h3>
+                <ul id="policy-rules" class="rule-list"></ul>
+              </div>
+              <div class="stack-block">
+                <h3>Denied Because</h3>
+                <ul id="policy-denied" class="compact-list"></ul>
+              </div>
+              <div class="stack-block">
+                <h3>Requires Confirmation Because</h3>
+                <ul id="policy-confirmation-reasons" class="compact-list"></ul>
+              </div>
+              <p id="policy-safe-alternative" class="meta-text">-</p>
+            </section>
+
+            <section id="confirmation-panel" class="surface status-surface" hidden>
+              <div class="surface-head">
+                <p class="surface-kicker">Confirmation</p>
+                <h2>Pending Confirmation</h2>
+              </div>
+              <p id="confirmation-summary" class="body-text">-</p>
+              <code id="confirmation-text" class="confirmation-copy">-</code>
+            </section>
+
+            <section id="refusal-panel" class="surface status-surface" hidden>
+              <div class="surface-head">
+                <p class="surface-kicker">Refusal</p>
+                <h2>Refused</h2>
+              </div>
+              <p id="refusal-reason" class="body-text">-</p>
+              <p id="safe-alternative" class="meta-text">-</p>
+            </section>
+
+            <section id="recovery-panel" class="surface status-surface" hidden>
+              <div class="surface-head">
+                <p class="surface-kicker">Recovery</p>
+                <h2>Recovery Suggestion</h2>
+              </div>
+              <p id="recovery-why" class="body-text">-</p>
+              <div class="stack-block">
+                <h3>Safe Next Steps</h3>
+                <ul id="recovery-steps" class="compact-list"></ul>
+              </div>
+              <div class="stack-block">
+                <h3>Read-only Diagnostics</h3>
+                <ul id="recovery-diagnostics" class="compact-list"></ul>
+              </div>
+              <div id="recovery-flags" class="tag-row"></div>
+            </section>
+
+            <section class="surface">
+              <div class="surface-head">
+                <p class="surface-kicker">Residual</p>
+                <h2>Residual Risk / Next Step</h2>
+              </div>
+              <p id="residual-summary" class="body-text">-</p>
+              <div id="residual-refs" class="tag-row"></div>
+            </section>
+          </aside>
         </div>
-
-        <article id="confirmation-panel" class="confirmation-panel" hidden>
-          <h2>待确认</h2>
-          <p>请在上方输入框提交精确确认语。</p>
-          <code id="confirmation-text">-</code>
-        </article>
-
-        <article id="refusal-panel" class="refusal-panel" hidden>
-          <h2>拒绝原因与安全替代方案</h2>
-          <p id="refusal-reason">-</p>
-          <p id="safe-alternative" class="muted">-</p>
-        </article>
-
-        <article class="plan-card">
-          <h2>执行计划</h2>
-          <ul id="plan-steps" class="plan-steps"></ul>
-        </article>
-
-        <article class="explanation">
-          <h2>解释</h2>
-          <p id="explanation-text">-</p>
-        </article>
-
-        <article class="result-summary-card">
-          <h2>结果摘要</h2>
-          <p id="result-summary">-</p>
-        </article>
-
-        <article class="raw-result">
-          <h2>执行结果</h2>
-          <pre id="result-json">-</pre>
-        </article>
       </section>
     </main>
 

@@ -38,6 +38,24 @@ class SessionMemory(BaseModel):
         self._touch()
         return action
 
+    def get_pending_checkpoint(self) -> dict[str, Any] | None:
+        if self.pending_action is None:
+            return None
+        checkpoint = self.pending_action.context.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            return None
+        return dict(checkpoint)
+
+    def clear_pending_checkpoint(self) -> None:
+        if self.pending_action is None:
+            return
+        context = dict(self.pending_action.context)
+        if "checkpoint" not in context:
+            return
+        context.pop("checkpoint", None)
+        self.pending_action = self.pending_action.model_copy(update={"context": context})
+        self._touch()
+
     def remember_intent(
         self,
         parsed_intent: ParsedIntent,
