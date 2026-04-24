@@ -15,6 +15,7 @@ from app.agent.confirmation import (
     stable_file_content_hash,
     validate_confirmation_token,
 )
+from app.agent.llm_parser import parse_with_llm
 from app.agent.memory import AgentMemory
 from app.agent.parser import ReadonlyParser
 from app.agent.planner import (
@@ -55,6 +56,7 @@ from app.tools.user import MIN_NORMAL_UID, _lookup_user, create_user_tool, delet
 
 ToolCallable = Callable[..., ToolResult]
 EnvProbeCallable = Callable[[Any], EnvironmentSnapshot]
+LLMParserCallable = Callable[..., dict[str, Any]]
 
 CREATE_USER_INTENT = "create_user"
 DELETE_USER_INTENT = "delete_user"
@@ -97,6 +99,7 @@ class ReadonlyOrchestrator:
         delete_user_tool_fn: ToolCallable = delete_user_tool,
         evo_lite_enabled: bool = True,
         experience_store: ExperienceStore | None = None,
+        llm_parser_fn: LLMParserCallable | None = None,
     ) -> None:
         self.executor = executor
         self.parser = parser or ReadonlyParser()
@@ -107,6 +110,7 @@ class ReadonlyOrchestrator:
         self.env_probe = env_probe
         self.evo_lite_enabled = evo_lite_enabled
         self.experience_store = experience_store
+        self.llm_parser_fn = llm_parser_fn or parse_with_llm
         self.tools: dict[str, ToolCallable] = {
             "disk_usage_tool": disk_tool,
             "file_search_tool": file_search_tool_fn,
@@ -147,6 +151,8 @@ class ReadonlyOrchestrator:
             raw_user_input,
             memory=self.memory,
         )
+        if _should_try_llm_parser_fallback(parsed_intent):
+            parsed_intent = self._maybe_parse_with_llm(raw_user_input, parsed_intent)
         if _has_unresolved_context_ref(parsed_intent):
             return self._unresolved_context_response(parsed_intent)
 
@@ -335,6 +341,31 @@ class ReadonlyOrchestrator:
             },
             explanation=explanation,
         )
+
+    def _maybe_parse_with_llm(
+        self,
+        raw_user_input: str,
+        fallback_intent: ParsedIntent,
+    ) -> ParsedIntent:
+        try:
+            result = self.llm_parser_fn(
+                raw_user_input,
+                context=_llm_parser_context(self.memory),
+            )
+        except Exception:
+            return fallback_intent
+
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return fallback_intent
+
+        candidates = result.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return fallback_intent
+
+        try:
+            return ParsedIntent.model_validate(candidates[0])
+        except Exception:
+            return fallback_intent
 
     def _run_continuous_plan(
         self,
@@ -2216,6 +2247,22 @@ def _risk_decision(plan: ReadonlyPlan) -> PolicyDecision:
 
 def _has_unresolved_context_ref(parsed_intent: ParsedIntent) -> bool:
     return "unresolved_context_ref" in parsed_intent.constraints
+
+
+def _should_try_llm_parser_fallback(parsed_intent: ParsedIntent) -> bool:
+    return parsed_intent.intent == "unknown" and not _has_unresolved_context_ref(parsed_intent)
+
+
+def _llm_parser_context(memory: AgentMemory) -> dict[str, Any]:
+    return {
+        "session_id": memory.session_id,
+        "last_username": memory.last_username,
+        "last_path": memory.last_path,
+        "last_port": memory.last_port,
+        "last_pid": memory.last_pid,
+        "last_intent": memory.last_intent,
+        "last_risk_level": memory.last_risk_level,
+    }
 
 
 def _unresolved_context_reason(parsed_intent: ParsedIntent) -> str:
