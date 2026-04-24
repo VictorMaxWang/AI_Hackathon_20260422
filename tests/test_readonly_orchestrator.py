@@ -62,6 +62,34 @@ class ToolMocks:
             },
         )
 
+    def memory_usage(self, executor: Any, **kwargs: Any) -> ToolResult:
+        self.calls.append(("memory_usage_tool", kwargs))
+        return ToolResult(
+            tool_name="memory_usage_tool",
+            success=True,
+            data={
+                "status": "ok",
+                "total_bytes": 16 * 1024 * 1024 * 1024,
+                "used_bytes": 10 * 1024 * 1024 * 1024,
+                "available_bytes": 6 * 1024 * 1024 * 1024,
+                "used_percent": 62.5,
+                "source": "/proc/meminfo",
+                "top_processes": [
+                    {
+                        "pid": 123,
+                        "user": "root",
+                        "cpu_percent": 2.0,
+                        "memory_percent": 11.5,
+                        "memory_bytes": 1024 * 1024 * 1024,
+                        "command": "postgres",
+                        "args": "postgres: writer",
+                    }
+                ],
+                "process_source": "ps",
+                "process_error": "",
+            },
+        )
+
     def file_search(self, executor: Any, **kwargs: Any) -> ToolResult:
         self.calls.append(("file_search_tool", kwargs))
         return ToolResult(
@@ -128,6 +156,7 @@ def make_orchestrator(mocks: ToolMocks) -> ReadonlyOrchestrator:
         DummyExecutor(),
         env_probe=mocks.env_probe,
         disk_tool=mocks.disk_usage,
+        memory_usage_tool_fn=mocks.memory_usage,
         file_search_tool_fn=mocks.file_search,
         process_query_tool_fn=mocks.process_query,
         port_query_tool_fn=mocks.port_query,
@@ -145,6 +174,22 @@ def test_disk_query_request_closes_readonly_loop() -> None:
     assert result["result"]["status"] == "success"
     assert "最紧张" in result["explanation"]
     assert [name for name, _args in mocks.calls] == ["env_probe_tool", "disk_usage_tool"]
+
+
+def test_memory_query_request_uses_readonly_memory_tool() -> None:
+    mocks = ToolMocks()
+    result = make_orchestrator(mocks).run("帮我查看当前内存使用情况")
+
+    assert result["intent"]["intent"] == "query_memory_usage"
+    assert result["risk"]["risk_level"] == "S0"
+    assert result["risk"]["allow"] is True
+    assert result["plan"]["steps"][1]["tool_name"] == "memory_usage_tool"
+    assert result["result"]["status"] == "success"
+    assert result["result"]["tool_name"] == "memory_usage_tool"
+    assert "当前内存总量" in result["explanation"]
+    assert "可用" in result["explanation"]
+    assert "postgres" in result["explanation"]
+    assert [name for name, _args in mocks.calls] == ["env_probe_tool", "memory_usage_tool"]
 
 
 def test_file_search_request_parses_constraints_and_executes_tool() -> None:

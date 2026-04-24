@@ -51,11 +51,17 @@ py -3.11 -m app.cli "帮我查看当前磁盘使用情况"
 API 示例：
 
 ```powershell
+$body = @{
+  raw_user_input = "帮我查看当前磁盘使用情况"
+} | ConvertTo-Json -Compress
+
+$utf8Body = [System.Text.Encoding]::UTF8.GetBytes($body)
+
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8001/api/chat" `
   -Method Post `
-  -ContentType "application/json" `
-  -Body '{"raw_user_input":"帮我查看当前磁盘使用情况"}'
+  -ContentType "application/json; charset=utf-8" `
+  -Body $utf8Body
 ```
 
 Windows 本地模式可能缺少部分类 Unix 工具，完整运维测试建议使用 Linux/SSH 目标环境。

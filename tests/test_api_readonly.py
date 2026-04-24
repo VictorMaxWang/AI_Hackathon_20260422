@@ -48,6 +48,15 @@ def _responses() -> dict[tuple[str, ...], CommandResult]:
             ["cat", "/etc/os-release"],
             stdout='PRETTY_NAME="Ubuntu 24.04 LTS"\n',
         ),
+        ("cat", "/proc/meminfo"): _result(
+            ["cat", "/proc/meminfo"],
+            stdout="\n".join(
+                [
+                    "MemTotal:       16384000 kB",
+                    "MemAvailable:    4096000 kB",
+                ]
+            ),
+        ),
         ("uname", "-r"): _result(["uname", "-r"], stdout="6.8.0\n"),
         ("id", "-un"): _result(["id", "-un"], stdout="demo\n"),
         ("id", "-u"): _result(["id", "-u"], stdout="1000\n"),
@@ -65,6 +74,40 @@ def _responses() -> dict[tuple[str, ...], CommandResult]:
                     "/dev/sdb1      ext4  100G   91G    9G  91% /data",
                 ]
             ),
+        ),
+        (
+            "ps",
+            "-eo",
+            "pid=",
+            "-o",
+            "user=",
+            "-o",
+            "pcpu=",
+            "-o",
+            "pmem=",
+            "-o",
+            "comm=",
+            "-o",
+            "args=",
+            "--sort=-pmem",
+        ): _result(
+            [
+                "ps",
+                "-eo",
+                "pid=",
+                "-o",
+                "user=",
+                "-o",
+                "pcpu=",
+                "-o",
+                "pmem=",
+                "-o",
+                "comm=",
+                "-o",
+                "args=",
+                "--sort=-pmem",
+            ],
+            stdout="123 root 2.0 12.5 postgres postgres: writer\n",
         ),
     }
 
@@ -123,6 +166,28 @@ def test_disk_query_returns_structured_result() -> None:
     assert payload["result"]["data"]["filesystems"][1]["mounted_on"] == "/data"
     assert payload["result"]["data"]["count"] == 2
     assert ["df", "-hT"] in executor.calls
+
+
+def test_memory_query_returns_structured_readonly_result() -> None:
+    executor = MockExecutor()
+    client = _client_with_executor(executor)
+
+    response = client.post("/api/chat", json={"raw_user_input": "帮我查看当前内存使用情况"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"]["intent"] == "query_memory_usage"
+    assert payload["risk"]["risk_level"] == "S0"
+    assert payload["risk"]["allow"] is True
+    assert payload["result"]["status"] == "success"
+    assert payload["result"]["tool_name"] == "memory_usage_tool"
+    assert payload["result"]["data"]["total_bytes"] == 16384000 * 1024
+    assert payload["result"]["data"]["available_bytes"] == 4096000 * 1024
+    assert payload["result"]["data"]["top_processes"][0]["command"] == "postgres"
+    assert "当前内存总量" in payload["explanation"]
+    assert "可用" in payload["explanation"]
+    assert ["cat", "/proc/meminfo"] in executor.calls
+    assert any(call and call[0] == "ps" and "--sort=-pmem" in call for call in executor.calls)
 
 
 def test_port_query_missing_tools_returns_structured_business_failure() -> None:
