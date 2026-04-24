@@ -120,7 +120,7 @@ def _attach_linux_process_ranking(executor: Any, payload: dict[str, Any], limit:
     result = process_query_tool(executor, mode="memory", limit=limit)
     if result.success and isinstance(result.data, dict):
         payload["top_processes"] = list(result.data.get("processes") or [])
-        payload["process_source"] = "ps"
+        payload["process_source"] = str(result.data.get("source") or "ps")
         payload["process_error"] = ""
         return
     if _should_try_windows_process_ranking(result.error):

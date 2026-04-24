@@ -64,6 +64,13 @@ Invoke-RestMethod `
   -Body $utf8Body
 ```
 
+也可以运行只做 API smoke 的 Windows 脚本：
+
+```powershell
+.\scripts\smoke_api_windows.ps1 -Port 8001
+.\scripts\smoke_api_windows.ps1 -Port 8001 -Message "帮我查看当前磁盘使用情况"
+```
+
 Windows 本地模式可能缺少部分类 Unix 工具，完整运维测试建议使用 Linux/SSH 目标环境。
 
 ## CLI 调试入口

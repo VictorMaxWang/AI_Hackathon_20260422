@@ -71,7 +71,7 @@ def evaluate(
             allow=True,
             requires_confirmation=True,
             confirmation_text=CONFIRM_CREATE_USER.format(username=username),
-            reasons=["creating a normal non-privileged user is a restricted change"],
+            reasons=_dedupe_reasons(["creating a normal non-privileged user is a restricted change"]),
             safe_alternative=None,
         )
 
@@ -88,7 +88,9 @@ def evaluate(
             allow=True,
             requires_confirmation=True,
             confirmation_text=CONFIRM_DELETE_USER.format(username=username),
-            reasons=["deleting a normal user is a sensitive change and needs strong confirmation"],
+            reasons=_dedupe_reasons(
+                ["deleting a normal user is a sensitive change and needs strong confirmation"]
+            ),
             safe_alternative=None,
         )
 
@@ -101,7 +103,7 @@ def evaluate(
             allow=True,
             requires_confirmation=False,
             confirmation_text=None,
-            reasons=reasons,
+            reasons=_dedupe_reasons(reasons),
             safe_alternative=None,
         )
 
@@ -119,7 +121,7 @@ def evaluate(
         allow=False,
         requires_confirmation=False,
         confirmation_text=None,
-        reasons=["unsupported read-only operation"],
+        reasons=_dedupe_reasons(["unsupported read-only operation"]),
         safe_alternative=None,
     )
 
@@ -319,6 +321,18 @@ def _deny_s3(reasons: list[str], safe_alternative: str) -> PolicyDecision:
         allow=False,
         requires_confirmation=False,
         confirmation_text=None,
-        reasons=reasons,
+        reasons=_dedupe_reasons(reasons),
         safe_alternative=safe_alternative,
     )
+
+
+def _dedupe_reasons(reasons: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for reason in reasons:
+        text = str(reason).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result

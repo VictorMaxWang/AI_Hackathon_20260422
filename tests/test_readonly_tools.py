@@ -175,6 +175,54 @@ def test_process_query_tool_returns_basic_structure() -> None:
     assert timeout == 10
 
 
+def test_process_query_tool_uses_windows_fallback_for_incompatible_ps() -> None:
+    process_json = (
+        '[{"pid": 42, "user": null, "cpu_seconds": 120.5, '
+        '"memory_bytes": 536870912, "command": "Code", "args": ""}]'
+    )
+    executor = MockExecutor(
+        [
+            command_result(["ps"], exit_code=1, stderr="ps: unknown option -- o"),
+            command_result(["powershell"], stdout=process_json),
+        ]
+    )
+
+    result = process_query_tool(executor, mode="cpu", limit=10)
+
+    assert result.success is True
+    assert result.data["status"] == "ok"
+    assert result.data["source"] == "Get-Process"
+    assert result.data["mode"] == "cpu"
+    assert result.data["count"] == 1
+    assert result.data["processes"][0]["pid"] == 42
+    assert result.data["processes"][0]["command"] == "Code"
+    assert result.data["processes"][0]["cpu_seconds"] == 120.5
+    assert executor.calls[0][0][:2] == ["ps", "-eo"]
+    assert executor.calls[1][0][:3] == ["powershell", "-NoProfile", "-Command"]
+    assert "Get-Process" in executor.calls[1][0][3]
+
+
+def test_process_query_tool_reports_readable_failure_when_fallback_unavailable() -> None:
+    executor = MockExecutor(
+        [
+            command_result(["ps"], exit_code=1, stderr="ps: unknown option -- o"),
+            command_result(["powershell"], exit_code=127, stderr="powershell not found"),
+        ]
+    )
+
+    result = process_query_tool(executor, mode="cpu", limit=10)
+
+    assert result.success is False
+    assert result.data["status"] == "unsupported_on_current_environment"
+    assert result.data["source"] == "none"
+    assert result.data["attempted_sources"] == ["ps", "Get-Process"]
+    assert result.data["processes"] == []
+    assert result.error
+    assert "当前本地环境不支持此进程查询方式" in result.error
+    assert "ps: unknown option -- o" not in result.error
+    assert executor.calls[1][0][:3] == ["powershell", "-NoProfile", "-Command"]
+
+
 def test_memory_usage_tool_parses_linux_meminfo_and_process_ranking() -> None:
     meminfo = "\n".join(
         [

@@ -69,6 +69,13 @@ Invoke-RestMethod `
   -Body $utf8Body
 ```
 
+或运行仓库内的 API smoke 脚本：
+
+```powershell
+.\scripts\smoke_api_windows.ps1 -Port 8001
+.\scripts\smoke_api_windows.ps1 -Port 8001 -Message "帮我查看当前磁盘使用情况"
+```
+
 ## 6. 常见问题
 
 - `python` 指向 `C:\msys64\...`：改用 `py -3.11`，并删除后重建 `.venv`。

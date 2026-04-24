@@ -41,6 +41,11 @@ class ReadonlySummarizer:
                 or "当前本地环境缺少端口查询所需的系统工具，因此无法完成该查询。"
                 "建议在 Linux/SSH 目标环境中执行，或配置可用的端口查询工具。"
             )
+        if _is_process_query_unsupported_environment(parsed_intent, tool_result):
+            return (
+                tool_result.error
+                or "当前本地环境不支持此进程查询方式。建议在 Linux/SSH 目标环境中执行，或使用支持该查询的系统工具。"
+            )
         if status in {"unsupported", "refused", "skipped"}:
             return f"{reason or '当前只支持只读基础能力'}，未执行任何命令。"
         if status == "failed":
@@ -288,7 +293,9 @@ def _plan_section_summary(plan_data: dict[str, Any]) -> str:
 
 def _risk_section_summary(risk_data: dict[str, Any]) -> str:
     level = str(risk_data.get("risk_level") or "unknown")
-    reasons = [str(item) for item in _as_list(risk_data.get("reasons")) if str(item).strip()]
+    reasons = _dedupe_texts(
+        [str(item) for item in _as_list(risk_data.get("reasons")) if str(item).strip()]
+    )
     base = f"风险等级：{level}。"
     if reasons:
         return f"{base} 命中原因：{'；'.join(reasons)}。"
@@ -529,7 +536,10 @@ def _summarize_s3_refusal(
     del parsed_intent
 
     reasons = risk.reasons or ([reason] if reason else ["策略引擎拒绝该请求"])
-    reason_text = "；".join(_translate_policy_reason(item) for item in reasons if item)
+    translated_reasons = _dedupe_texts(
+        [_translate_policy_reason(item) for item in reasons if item]
+    )
+    reason_text = "；".join(translated_reasons)
     alternative = _translate_safe_alternative(risk.safe_alternative)
     return (
         "拒绝执行：该请求被策略引擎判定为禁止执行的高风险操作。"
@@ -678,6 +688,16 @@ def _is_port_query_unsupported_environment(
     return payload.get("status") == "unsupported_on_current_environment"
 
 
+def _is_process_query_unsupported_environment(
+    parsed_intent: ParsedIntent,
+    tool_result: ToolResult | None,
+) -> bool:
+    if parsed_intent.intent != PROCESS_INTENT or tool_result is None:
+        return False
+    payload = tool_result.data if isinstance(tool_result.data, Mapping) else {}
+    return payload.get("status") == "unsupported_on_current_environment"
+
+
 def _percent_value(value: Any) -> int:
     text = str(value or "").strip().rstrip("%")
     try:
@@ -743,3 +763,15 @@ def _merge_refs(*groups: Any) -> list[str]:
             if isinstance(item, str) and item.strip() and item not in refs:
                 refs.append(item)
     return refs
+
+
+def _dedupe_texts(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result

@@ -831,20 +831,24 @@
 
   function normalizeConfirmation(value) {
     const status = firstText(value.status, "not_required");
+    const required = Boolean(value.required);
+    const visible = required && isVisibleConfirmationStatus(status);
     return {
-      visible:
-        Boolean(value.required) ||
-        status !== "not_required" ||
-        Boolean(firstText(value.text)) ||
-        Boolean(firstText(value.summary)),
-      required: Boolean(value.required),
+      visible: visible,
+      required: required,
       status: status,
       statusLabel: formatStatusLabel(status),
       tone: toneForStatus(status),
-      summary: localizeText(firstText(value.summary, "当前请求无确认依据。")),
-      text: localizeText(firstText(value.text)),
-      evidenceRefs: uniqueStrings(value.evidence_refs),
+      summary: visible ? localizeText(firstText(value.summary, "等待精确确认后继续。")) : "",
+      text: visible ? localizeText(firstText(value.text)) : "",
+      evidenceRefs: visible ? uniqueStrings(value.evidence_refs) : [],
     };
+  }
+
+  function isVisibleConfirmationStatus(status) {
+    return ["pending_confirmation", "required", "mismatch"].indexOf(
+      firstText(status).toLowerCase()
+    ) >= 0;
   }
 
   function normalizeRefusal(value) {
@@ -1053,10 +1057,18 @@
 
   function renderConfirmation(doc, confirmation) {
     const panel = query(doc, "#confirmation-panel");
+    if (!confirmation.visible) {
+      panel.hidden = true;
+      panel.dataset.tone = "neutral";
+      query(doc, "#confirmation-summary").textContent = "";
+      query(doc, "#confirmation-text").textContent = "";
+      return;
+    }
+
     panel.hidden = !confirmation.visible;
     panel.dataset.tone = confirmation.tone;
     setText(doc, "#confirmation-summary", confirmation.summary);
-    setText(doc, "#confirmation-text", firstText(confirmation.text, "当前没有确认文本。"));
+    setText(doc, "#confirmation-text", confirmation.text);
   }
 
   function renderRefusal(doc, refusal) {

@@ -346,6 +346,56 @@ def _refused_payload() -> dict[str, Any]:
     return payload
 
 
+def _unsupported_payload() -> dict[str, Any]:
+    payload = _success_payload()
+    payload["intent"].update(
+        {
+            "intent": "unknown",
+            "raw_user_input": "请帮我安装 nginx",
+            "confidence": 0.2,
+        }
+    )
+    payload["risk"] = {
+        "risk_level": "S0",
+        "allow": False,
+        "requires_confirmation": False,
+        "reasons": ["unsupported read-only operation"],
+        "safe_alternative": "",
+    }
+    payload["plan"] = {
+        "status": "unsupported",
+        "reason": "当前只支持只读基础能力",
+        "steps": [],
+    }
+    payload["execution"] = {"status": "skipped", "steps": [], "results": []}
+    payload["result"] = {
+        "status": "unsupported",
+        "data": None,
+        "error": "当前只支持只读基础能力，未执行任何命令。",
+    }
+    payload["recovery"] = {
+        "failure_type": "unsupported_request",
+        "why_it_failed": (
+            "The request could not be mapped to a supported guarded workflow "
+            "with the current planner and tool boundary."
+        ),
+        "safe_next_steps": [
+            "Rephrase the request as a bounded read-only diagnostic.",
+            "Submit a fresh guarded request after narrowing the target.",
+        ],
+        "suggested_readonly_diagnostics": [
+            "Review the parsed intent and plan status to see which part of the request remained unsupported."
+        ],
+        "requires_confirmation_for_recovery": False,
+        "can_retry_safely": False,
+    }
+    payload["explanation_card"]["confirmation_basis"]["summary"] = "当前请求无确认依据。"
+    payload["explanation_card"]["residual_risks_or_next_step"]["summary"] = (
+        "Recovery guidance has been attached for the next bounded request."
+    )
+    return payload
+
+
 def _timeline_payload() -> dict[str, Any]:
     payload = _success_payload()
     payload["timeline"] = [
@@ -408,6 +458,9 @@ def test_api_chat_returns_explanation_card_and_operator_panel_projection() -> No
     assert "当前共检测到" in view_model["answerSummary"]["text"]
     assert "可用空间" in view_model["answerSummary"]["text"]
     assert view_model["answerSummary"]["meta"] == ["成功", "S0", "只读查询"]
+    assert view_model["confirmation"]["visible"] is False
+    assert view_model["confirmation"]["summary"] == ""
+    assert view_model["confirmation"]["text"] == ""
 
 
 def test_memory_response_generates_visible_answer_summary() -> None:
@@ -453,6 +506,23 @@ def test_refused_state_and_recovery_block_are_renderable() -> None:
     assert view_model["recovery"]["visible"] is True
     assert "暂不适合重试" in view_model["recovery"]["flags"]
     assert view_model["residualNextStep"]["summary"]
+    assert view_model["answerSummary"]["visible"] is False
+
+
+def test_unsupported_state_does_not_show_confirmation_placeholder() -> None:
+    client = _client_with_payload(_unsupported_payload())
+
+    response = client.post("/api/chat", json={"raw_user_input": "请帮我安装 nginx"})
+    payload = response.json()
+    view_model = _view_model(payload, raw_user_input="请帮我安装 nginx")
+
+    assert payload["operator_panel"]["confirmation"]["status"] == "not_required"
+    assert view_model["status"] == "unsupported"
+    assert view_model["confirmation"]["visible"] is False
+    assert view_model["confirmation"]["summary"] == ""
+    assert view_model["confirmation"]["text"] == ""
+    assert "当前没有确认文本" not in json.dumps(view_model, ensure_ascii=False)
+    assert view_model["recovery"]["visible"] is True
     assert view_model["answerSummary"]["visible"] is False
 
 
