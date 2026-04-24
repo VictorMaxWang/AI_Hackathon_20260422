@@ -187,3 +187,73 @@ def test_port_query_tool_returns_not_listening_for_unused_port() -> None:
     assert result.data["listeners"] == []
     assert result.data["source"] == "ss"
     assert executor.calls == [(["ss", "-ltnup"], 10)]
+
+
+def test_port_query_tool_reports_unsupported_when_query_tools_are_missing() -> None:
+    executor = MockExecutor(
+        [
+            command_result(
+                ["ss", "-ltnup"],
+                stderr="command not found: ss",
+                exit_code=127,
+            ),
+            command_result(
+                ["lsof", "-nP", "-iTCP:8080", "-sTCP:LISTEN"],
+                stderr="command not found: lsof",
+                exit_code=127,
+            ),
+        ]
+    )
+
+    result = port_query_tool(executor, 8080)
+
+    assert result.success is False
+    assert result.tool_name == "port_query_tool"
+    assert result.data["status"] == "unsupported_on_current_environment"
+    assert result.data["port"] == 8080
+    assert result.data["listeners"] == []
+    assert result.data["count"] == 0
+    assert result.data["source"] == "none"
+    assert result.data["missing_tools"] == ["ss", "lsof"]
+    assert result.data["attempted_sources"] == ["ss", "lsof"]
+    assert "缺少端口查询所需的系统工具" in result.error
+    assert executor.calls == [
+        (["ss", "-ltnup"], 10),
+        (["lsof", "-nP", "-iTCP:8080", "-sTCP:LISTEN"], 10),
+    ]
+
+
+def test_port_query_tool_falls_back_to_lsof_when_ss_is_missing() -> None:
+    stdout = "\n".join(
+        [
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME",
+            "python 123 appuser 3u IPv4 12345 0t0 TCP *:8080 (LISTEN)",
+        ]
+    )
+    executor = MockExecutor(
+        [
+            command_result(
+                ["ss", "-ltnup"],
+                stderr="command not found: ss",
+                exit_code=127,
+            ),
+            command_result(
+                ["lsof", "-nP", "-iTCP:8080", "-sTCP:LISTEN"],
+                stdout=stdout,
+            ),
+        ]
+    )
+
+    result = port_query_tool(executor, 8080)
+
+    assert result.success is True
+    assert result.data["status"] == "listening"
+    assert result.data["source"] == "lsof"
+    assert result.data["count"] == 1
+    assert result.data["listeners"][0]["pid"] == 123
+    assert result.data["listeners"][0]["process_name"] == "python"
+    assert result.data["listeners"][0]["user"] == "appuser"
+    assert executor.calls == [
+        (["ss", "-ltnup"], 10),
+        (["lsof", "-nP", "-iTCP:8080", "-sTCP:LISTEN"], 10),
+    ]

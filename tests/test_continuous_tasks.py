@@ -133,6 +133,29 @@ def make_orchestrator(
     )
 
 
+VALID_TIMELINE_INTENTS = {
+    "env_probe",
+    "checkpoint_saved",
+    "contract_revalidated",
+    "query_port",
+    "query_process",
+    "create_user",
+    "delete_user",
+    "verify_user_exists",
+    "verify_user_absent",
+}
+
+
+def assert_timeline_entries_are_readable(timeline: list[dict[str, Any]]) -> None:
+    required = {"step_id", "intent", "risk", "status", "result_summary"}
+    assert timeline
+    for item in timeline:
+        assert required <= set(item)
+        assert item["intent"] in VALID_TIMELINE_INTENTS
+        assert str(item["status"]).strip()
+        assert str(item["result_summary"]).strip()
+
+
 def test_environment_create_user_verify_exists_pause_and_resume() -> None:
     mocks = ContinuousToolMocks(sudo_available=True)
     orchestrator = make_orchestrator(mocks)
@@ -141,10 +164,17 @@ def test_environment_create_user_verify_exists_pause_and_resume() -> None:
 
     assert pending["result"]["status"] == "pending_confirmation"
     assert pending["result"]["confirmation_text"] == "确认创建普通用户 demo_temp"
+    assert [item["intent"] for item in pending["timeline"]] == [
+        "env_probe",
+        "checkpoint_saved",
+        "create_user",
+    ]
     assert [item["status"] for item in pending["timeline"]] == [
+        "success",
         "success",
         "pending_confirmation",
     ]
+    assert_timeline_entries_are_readable(pending["timeline"])
     assert [name for name, _args in mocks.calls] == ["env_probe_tool"]
 
     resumed = orchestrator.run("确认创建普通用户 demo_temp")
@@ -152,13 +182,17 @@ def test_environment_create_user_verify_exists_pause_and_resume() -> None:
     assert resumed["result"]["status"] == "success"
     assert [name for name, _args in mocks.calls] == [
         "env_probe_tool",
+        "env_probe_tool",
         "create_user_tool",
     ]
     assert [item["intent"] for item in resumed["timeline"]] == [
         "env_probe",
+        "checkpoint_saved",
+        "contract_revalidated",
         "create_user",
         "verify_user_exists",
     ]
+    assert_timeline_entries_are_readable(resumed["timeline"])
     assert resumed["timeline"][-1]["status"] == "success"
     assert "已存在" in resumed["timeline"][-1]["result_summary"]
 
@@ -175,6 +209,15 @@ def test_delete_contextual_user_requires_s2_confirmation_and_verifies_absent() -
     assert pending["result"]["confirmation_text"] == "确认删除普通用户 demo_temp"
     assert "删除比创建更敏感" in pending["explanation"]
     assert "账号访问" in pending["explanation"]
+    assert [item["intent"] for item in pending["timeline"]] == [
+        "checkpoint_saved",
+        "delete_user",
+    ]
+    assert [item["status"] for item in pending["timeline"]] == [
+        "success",
+        "pending_confirmation",
+    ]
+    assert_timeline_entries_are_readable(pending["timeline"])
     assert mocks.calls == []
 
     resumed = orchestrator.run("确认删除普通用户 demo_temp")
@@ -182,9 +225,12 @@ def test_delete_contextual_user_requires_s2_confirmation_and_verifies_absent() -
     assert resumed["result"]["status"] == "success"
     assert [name for name, _args in mocks.calls] == ["delete_user_tool"]
     assert [item["intent"] for item in resumed["timeline"]] == [
+        "checkpoint_saved",
+        "contract_revalidated",
         "delete_user",
         "verify_user_absent",
     ]
+    assert_timeline_entries_are_readable(resumed["timeline"])
     assert "已不存在" in resumed["timeline"][-1]["result_summary"]
     assert "删除比创建更敏感" in resumed["explanation"]
 
@@ -204,6 +250,7 @@ def test_port_then_process_query_only_runs_process_when_listener_exists() -> Non
         "query_port",
         "query_process",
     ]
+    assert_timeline_entries_are_readable(result["timeline"])
 
 
 def test_confirmation_mismatch_keeps_pending_and_resume_does_not_rerun_prior_steps() -> None:
@@ -215,6 +262,17 @@ def test_confirmation_mismatch_keeps_pending_and_resume_does_not_rerun_prior_ste
 
     assert mismatch["result"]["status"] == "pending_confirmation"
     assert mismatch["result"]["error"] == "confirmation_text_mismatch"
+    assert [item["intent"] for item in mismatch["timeline"]] == [
+        "env_probe",
+        "checkpoint_saved",
+        "create_user",
+    ]
+    assert [item["status"] for item in mismatch["timeline"]] == [
+        "success",
+        "success",
+        "pending_confirmation",
+    ]
+    assert_timeline_entries_are_readable(mismatch["timeline"])
     assert [name for name, _args in mocks.calls] == ["env_probe_tool"]
 
     resumed = orchestrator.run("确认创建普通用户 demo_temp")
@@ -222,8 +280,17 @@ def test_confirmation_mismatch_keeps_pending_and_resume_does_not_rerun_prior_ste
     assert resumed["result"]["status"] == "success"
     assert [name for name, _args in mocks.calls] == [
         "env_probe_tool",
+        "env_probe_tool",
         "create_user_tool",
     ]
+    assert [item["intent"] for item in resumed["timeline"]] == [
+        "env_probe",
+        "checkpoint_saved",
+        "contract_revalidated",
+        "create_user",
+        "verify_user_exists",
+    ]
+    assert_timeline_entries_are_readable(resumed["timeline"])
 
 
 def test_cancel_continuous_pending_step_clears_memory_and_does_not_run_write_tool() -> None:
@@ -235,6 +302,12 @@ def test_cancel_continuous_pending_step_clears_memory_and_does_not_run_write_too
 
     assert pending["result"]["status"] == "pending_confirmation"
     assert memory.pending_action is not None
+    assert [item["intent"] for item in pending["timeline"]] == [
+        "env_probe",
+        "checkpoint_saved",
+        "create_user",
+    ]
+    assert_timeline_entries_are_readable(pending["timeline"])
     assert [name for name, _args in mocks.calls] == ["env_probe_tool"]
 
     cancelled = orchestrator.run("取消")
@@ -255,6 +328,7 @@ def test_previous_failure_aborts_dependent_write_step() -> None:
     assert [name for name, _args in mocks.calls] == ["env_probe_tool"]
     assert [item["status"] for item in result["timeline"]] == ["failed", "aborted"]
     assert result["timeline"][1]["intent"] == "create_user"
+    assert_timeline_entries_are_readable(result["timeline"])
     assert "写操作不会盲目继续" in result["timeline"][1]["result_summary"]
 
 
@@ -262,7 +336,4 @@ def test_timeline_entries_have_required_structure() -> None:
     mocks = ContinuousToolMocks()
     result = make_orchestrator(mocks).run("先查 8080 端口，再告诉我对应的进程")
 
-    required = {"step_id", "intent", "risk", "status", "result_summary"}
-    assert result["timeline"]
-    for item in result["timeline"]:
-        assert required <= set(item)
+    assert_timeline_entries_are_readable(result["timeline"])
