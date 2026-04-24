@@ -29,6 +29,12 @@ class ReadonlySummarizer:
     ) -> str:
         if status == "refused" and risk is not None and risk.risk_level == RiskLevel.S3:
             return _summarize_s3_refusal(parsed_intent, risk, reason)
+        if _is_port_query_unsupported_environment(parsed_intent, tool_result):
+            return (
+                tool_result.error
+                or "当前本地环境缺少端口查询所需的系统工具，因此无法完成该查询。"
+                "建议在 Linux/SSH 目标环境中执行，或配置可用的端口查询工具。"
+            )
         if status in {"unsupported", "refused", "skipped"}:
             return f"{reason or '当前只支持只读基础能力'}，未执行任何命令。"
         if status == "failed":
@@ -626,6 +632,16 @@ def _summarize_port(data: Any) -> str:
         f"PID {first.get('pid') or '未知'}，"
         f"用户 {first.get('user') or '未知'}。"
     )
+
+
+def _is_port_query_unsupported_environment(
+    parsed_intent: ParsedIntent,
+    tool_result: ToolResult | None,
+) -> bool:
+    if parsed_intent.intent != PORT_INTENT or tool_result is None:
+        return False
+    payload = tool_result.data if isinstance(tool_result.data, Mapping) else {}
+    return payload.get("status") == "unsupported_on_current_environment"
 
 
 def _percent_value(value: Any) -> int:

@@ -58,6 +58,15 @@ class MockExecutor:
         return _result(argv, exit_code=127, stderr="unexpected command")
 
 
+CREATE_USER_LOOKUP = ["getent", "passwd", "demo_guest"]
+CREATE_USER_COMMAND = [
+    "bash",
+    "scripts/guardedops_create_user.sh",
+    "--create-home",
+    "demo_guest",
+]
+
+
 def _client_with_executor(executor: MockExecutor) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_executor] = lambda: executor
@@ -80,7 +89,15 @@ def test_api_pending_confirmation() -> None:
     assert payload["result"]["confirmation_text"] == "确认创建普通用户 demo_guest"
     assert payload["execution"]["status"] == "skipped"
     assert isinstance(payload["explanation"], str)
-    assert executor.calls == []
+    pending_action = payload["result"]["pending_action"]
+    assert pending_action["tool_name"] == "create_user_tool"
+    assert pending_action["confirmation_text"] == "确认创建普通用户 demo_guest"
+    assert pending_action["confirmation_token"]["risk_level"] == "S1"
+    assert pending_action["confirmation_token"]["plan_hash"]
+    assert pending_action["confirmation_token"]["target_fingerprint"]
+    assert pending_action["confirmation_token"]["policy_version"]
+    assert CREATE_USER_LOOKUP not in executor.calls
+    assert CREATE_USER_COMMAND not in executor.calls
 
 
 def test_exact_confirmation_returns_success_result() -> None:
@@ -103,11 +120,13 @@ def test_exact_confirmation_returns_success_result() -> None:
     assert payload["result"]["data"]["status"] == "created"
     assert payload["result"]["data"]["username"] == "demo_guest"
     assert payload["explanation"]
-    assert executor.calls == [
-        ["getent", "passwd", "demo_guest"],
-        ["bash", "scripts/guardedops_create_user.sh", "--create-home", "demo_guest"],
-        ["getent", "passwd", "demo_guest"],
+    assert executor.calls[-3:] == [
+        CREATE_USER_LOOKUP,
+        CREATE_USER_COMMAND,
+        CREATE_USER_LOOKUP,
     ]
+    assert executor.calls.count(CREATE_USER_LOOKUP) == 2
+    assert executor.calls.count(CREATE_USER_COMMAND) == 1
 
 
 def test_api_refused_high_risk() -> None:
@@ -139,10 +158,18 @@ def test_static_page_is_accessible() -> None:
     css_response = client.get("/ui/style.css")
 
     assert index_response.status_code == 200
-    assert "风险预览与确认闭环" in index_response.text
-    assert "confirmation-panel" in index_response.text
+    assert 'id="operator-request"' in index_response.text
+    assert 'id="submit-request"' in index_response.text
+    assert 'id="operator-panel"' in index_response.text
+    assert 'id="request-status"' in index_response.text
+    assert 'id="risk-badge"' in index_response.text
+    assert 'id="status-badge"' in index_response.text
+    assert 'id="confirmation-panel"' in index_response.text
     assert js_response.status_code == 200
     assert "/api/chat" in js_response.text
+    assert "operator_panel" in js_response.text
     assert "safe_alternative" in js_response.text
     assert css_response.status_code == 200
-    assert "pending_confirmation" in css_response.text
+    assert ".operator-panel" in css_response.text
+    assert ".status-strip" in css_response.text
+    assert ".status-surface" in css_response.text

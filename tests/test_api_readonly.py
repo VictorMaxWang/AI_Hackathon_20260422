@@ -125,6 +125,29 @@ def test_disk_query_returns_structured_result() -> None:
     assert ["df", "-hT"] in executor.calls
 
 
+def test_port_query_missing_tools_returns_structured_business_failure() -> None:
+    executor = MockExecutor()
+    client = _client_with_executor(executor)
+
+    response = client.post("/api/chat", json={"raw_user_input": "8080 端口现在是谁在占用"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"]["intent"] == "query_port"
+    assert payload["result"]["status"] == "failed"
+    assert payload["result"]["tool_name"] == "port_query_tool"
+    assert payload["result"]["data"]["status"] == "unsupported_on_current_environment"
+    assert payload["result"]["data"]["port"] == 8080
+    assert payload["result"]["data"]["listeners"] == []
+    assert payload["result"]["data"]["count"] == 0
+    assert payload["result"]["data"]["source"] == "none"
+    assert payload["result"]["data"]["missing_tools"] == ["ss", "lsof"]
+    assert "缺少端口查询所需的系统工具" in payload["result"]["error"]
+    assert "缺少端口查询所需的系统工具" in payload["explanation"]
+    assert ["ss", "-ltnup"] in executor.calls
+    assert ["lsof", "-nP", "-iTCP:8080", "-sTCP:LISTEN"] in executor.calls
+
+
 def test_unknown_or_write_request_is_refused_without_tool_execution() -> None:
     executor = MockExecutor()
     client = _client_with_executor(executor)
@@ -167,7 +190,18 @@ def test_static_page_resources_are_accessible() -> None:
 
     assert index_response.status_code == 200
     assert "GuardedOps" in index_response.text
+    assert 'id="operator-request"' in index_response.text
+    assert 'id="submit-request"' in index_response.text
+    assert 'id="operator-panel"' in index_response.text
+    assert 'id="request-status"' in index_response.text
+    assert 'id="risk-badge"' in index_response.text
+    assert 'id="status-badge"' in index_response.text
+    assert 'id="confirmation-panel"' in index_response.text
     assert js_response.status_code == 200
     assert "/api/chat" in js_response.text
+    assert "operator_panel" in js_response.text
+    assert "safe_alternative" in js_response.text
     assert css_response.status_code == 200
-    assert "result-panel" in css_response.text
+    assert ".operator-panel" in css_response.text
+    assert ".status-strip" in css_response.text
+    assert ".status-surface" in css_response.text

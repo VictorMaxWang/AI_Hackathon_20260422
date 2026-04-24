@@ -13,6 +13,53 @@ GuardedOps 是一个安全对话式 Linux/SSH 运维代理项目。
 - Prompt 不作为最终风控边界。
 - 执行层只允许调用白名单工具。
 
+## Windows Quick Start
+
+Windows PowerShell 本地启动建议使用标准 Windows CPython 3.11。不要用 MSYS2 Python 运行本项目；如果 `python` 指向 `C:\msys64\...`，请改用 `py -3.11`。
+
+如果 `.venv` 曾经由错误解释器创建，先删除后重建：
+
+```powershell
+cd C:\Users\12804\Desktop\AI_Hackathon_20260422
+
+where python
+py -0p
+
+Remove-Item -Recurse -Force .venv -ErrorAction SilentlyContinue
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn fastapi uvicorn pydantic paramiko openai pytest
+
+python -c "import fastapi, uvicorn, pydantic; print('ok')"
+```
+
+启动 Web 到 8001：
+
+```powershell
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+```
+
+如果 8000 不可用，使用 8001。
+
+CLI 示例：
+
+```powershell
+py -3.11 -m app.cli "帮我查看当前磁盘使用情况"
+```
+
+API 示例：
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8001/api/chat" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body '{"raw_user_input":"帮我查看当前磁盘使用情况"}'
+```
+
+Windows 本地模式可能缺少部分类 Unix 工具，完整运维测试建议使用 Linux/SSH 目标环境。
+
 ## CLI 调试入口
 
 当前 CLI 仅用于本地调试和 smoke test，会调用现有只读 Orchestrator，不是 raw shell，也不会把自然语言拼成 bash 执行。

@@ -8,6 +8,11 @@ from app.models import CommandResult, ToolResult
 
 TOOL_NAME = "port_query_tool"
 PROCESS_RE = re.compile(r'"(?P<name>[^"]+)".*?pid=(?P<pid>\d+)')
+MISSING_COMMAND_EXIT_CODES = {-1, 126, 127}
+UNSUPPORTED_PORT_QUERY_MESSAGE = (
+    "当前本地环境缺少端口查询所需的系统工具，因此无法完成该查询。"
+    "建议在 Linux/SSH 目标环境中执行，或配置可用的端口查询工具。"
+)
 
 
 def port_query_tool(executor: Any, port: int) -> ToolResult:
@@ -30,6 +35,16 @@ def port_query_tool(executor: Any, port: int) -> ToolResult:
         ["lsof", "-nP", f"-iTCP:{effective_port}", "-sTCP:LISTEN"],
         timeout=10,
     )
+    if _looks_like_missing_command(ss_result, "ss") and _looks_like_missing_command(
+        lsof_result,
+        "lsof",
+    ):
+        return _unsupported_environment_result(
+            effective_port,
+            missing_tools=["ss", "lsof"],
+            attempted_sources=["ss", "lsof"],
+        )
+
     listeners = _parse_lsof_output(lsof_result.stdout, effective_port)
     if listeners or _looks_like_no_lsof_match(lsof_result):
         return _listening_result(effective_port, listeners, source="lsof")
@@ -155,6 +170,17 @@ def _looks_like_no_lsof_match(result: CommandResult) -> bool:
     return not result.stdout.strip() and not result.stderr.strip()
 
 
+def _looks_like_missing_command(result: CommandResult, command: str) -> bool:
+    stderr = result.stderr.lower()
+    return result.exit_code in MISSING_COMMAND_EXIT_CODES and (
+        "command not found" in stderr
+        or "not recognized" in stderr
+        or "no such file" in stderr
+        or "系统找不到指定的文件" in stderr
+        or command.lower() in stderr
+    )
+
+
 def _listening_result(port: int, listeners: list[dict[str, Any]], source: str) -> ToolResult:
     status = "listening" if listeners else "not_listening"
     return ToolResult(
@@ -167,6 +193,29 @@ def _listening_result(port: int, listeners: list[dict[str, Any]], source: str) -
             "count": len(listeners),
             "source": source,
         },
+    )
+
+
+def _unsupported_environment_result(
+    port: int,
+    *,
+    missing_tools: list[str],
+    attempted_sources: list[str],
+) -> ToolResult:
+    return ToolResult(
+        tool_name=TOOL_NAME,
+        success=False,
+        data={
+            "status": "unsupported_on_current_environment",
+            "port": port,
+            "listeners": [],
+            "count": 0,
+            "source": "none",
+            "missing_tools": missing_tools,
+            "attempted_sources": attempted_sources,
+            "reason": "missing_port_query_tools",
+        },
+        error=UNSUPPORTED_PORT_QUERY_MESSAGE,
     )
 
 
