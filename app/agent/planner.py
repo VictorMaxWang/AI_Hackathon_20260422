@@ -26,6 +26,18 @@ WORKFLOW_TOOL_INTENTS = {
     "process_query_tool": PROCESS_INTENT,
 }
 
+ENV_FINGERPRINT_KEYS = [
+    "host.hostname",
+    "host.connection_mode",
+    "env.current_user",
+    "env.is_root",
+    "env.sudo_available",
+]
+USER_TARGET_FINGERPRINT_KEYS = [
+    "target.user_exists",
+    "target.user_uid",
+]
+
 
 @dataclass(frozen=True)
 class PlannedToolCall:
@@ -345,17 +357,21 @@ def _workflow_plan_step(
     step_id_map: dict[str, str],
 ) -> PlanStep:
     intent = _workflow_intent(workflow_step)
+    target = _workflow_step_target(text, template, workflow_step, intent, step_id_map)
+    condition = _workflow_condition(workflow_step, intent, step_id_map)
+    contract = _step_contract(intent, target, condition=condition)
     return PlanStep(
         step_id=f"step_{number}",
         intent=intent,
-        target=_workflow_step_target(text, template, workflow_step, intent, step_id_map),
+        target=target,
         depends_on=[
             step_id_map[dependency]
             for dependency in workflow_step.depends_on
             if dependency in step_id_map
         ],
-        condition=_workflow_condition(workflow_step, intent, step_id_map),
+        condition=condition,
         description=workflow_step.description,
+        **contract,
         requires_policy=workflow_step.requires_policy,
         requires_confirmation=workflow_step.requires_confirmation,
     )
@@ -504,16 +520,96 @@ def _step(
     requires_policy: bool = True,
     requires_confirmation: bool = False,
 ) -> PlanStep:
+    target_payload = dict(target)
+    contract = _step_contract(intent, target_payload, condition=condition)
     return PlanStep(
         step_id=f"step_{number}",
         intent=intent,
-        target=dict(target),
+        target=target_payload,
         depends_on=list(depends_on or []),
         condition=condition,
         description=description,
+        **contract,
         requires_policy=requires_policy,
         requires_confirmation=requires_confirmation,
     )
+
+
+def _step_contract(
+    intent: str,
+    target: dict[str, Any],
+    *,
+    condition: str | None,
+) -> dict[str, Any]:
+    if intent == ENV_PROBE_INTENT:
+        return {
+            "preconditions": [],
+            "expected_observation": "collect current environment snapshot",
+            "postconditions": ["env.snapshot_available"],
+            "freshness_keys": [],
+            "fingerprint_keys": list(ENV_FINGERPRINT_KEYS),
+            "checkpointable": False,
+            "write_step": False,
+        }
+
+    if intent == CREATE_USER_INTENT:
+        username = target.get("username") or "target_user"
+        preconditions = ["env.snapshot_available", "target.user_absent"]
+        if condition == "env.sudo_available or env.is_root":
+            preconditions.append("env.sudo_available_or_root")
+        return {
+            "preconditions": preconditions,
+            "expected_observation": f"user {username} remains absent before create",
+            "postconditions": ["target.user_exists", "target.user_uid >= 1000"],
+            "freshness_keys": list(ENV_FINGERPRINT_KEYS + USER_TARGET_FINGERPRINT_KEYS),
+            "fingerprint_keys": list(ENV_FINGERPRINT_KEYS + USER_TARGET_FINGERPRINT_KEYS),
+            "checkpointable": True,
+            "write_step": True,
+        }
+
+    if intent == DELETE_USER_INTENT:
+        username = target.get("username") or "target_user"
+        return {
+            "preconditions": ["target.user_exists", "target.user_uid >= 1000"],
+            "expected_observation": f"user {username} remains deletable before delete",
+            "postconditions": ["target.user_absent"],
+            "freshness_keys": list(ENV_FINGERPRINT_KEYS + USER_TARGET_FINGERPRINT_KEYS),
+            "fingerprint_keys": list(ENV_FINGERPRINT_KEYS + USER_TARGET_FINGERPRINT_KEYS),
+            "checkpointable": True,
+            "write_step": True,
+        }
+
+    if intent == PORT_INTENT:
+        return {
+            "preconditions": [],
+            "expected_observation": "observe port listener state",
+            "postconditions": ["target.port_observed"],
+            "freshness_keys": [],
+            "fingerprint_keys": [],
+            "checkpointable": False,
+            "write_step": False,
+        }
+
+    if intent == PROCESS_INTENT:
+        return {
+            "preconditions": ["target.port_listener_available"],
+            "expected_observation": "observe mapped process state",
+            "postconditions": ["target.process_observed"],
+            "freshness_keys": [],
+            "fingerprint_keys": [],
+            "checkpointable": False,
+            "write_step": False,
+        }
+
+    return {
+        "preconditions": [],
+        "expected_observation": "",
+        "postconditions": [],
+        "freshness_keys": [],
+        "fingerprint_keys": [],
+        "checkpointable": False,
+        "write_step": False,
+    }
 
 
 def _env_create_steps(username: str) -> list[PlanStep]:

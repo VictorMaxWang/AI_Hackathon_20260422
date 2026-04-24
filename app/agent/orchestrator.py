@@ -3,12 +3,17 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from app.agent.confirmation import (
     PendingAction,
     confirmation_text_for,
+    issue_confirmation_token,
     is_cancel_pending_text,
+    stable_hash,
+    stable_file_content_hash,
+    validate_confirmation_token,
 )
 from app.agent.memory import AgentMemory
 from app.agent.parser import ReadonlyParser
@@ -18,6 +23,8 @@ from app.agent.planner import (
     ReadonlyPlan,
     ReadonlyPlanner,
 )
+from app.agent.previews import build_blast_radius_preview, build_policy_simulator
+from app.agent.recovery import build_recovery_suggestion
 from app.agent.summarizer import ReadonlySummarizer
 from app.evolution.experience_store import ExperienceStore
 from app.evolution.init import apply_evo_lite_hook
@@ -30,6 +37,12 @@ from app.models import (
     RiskLevel,
     ToolResult,
 )
+from app.models.evidence import (
+    EvidenceBuilder,
+    EvidenceChain,
+    EvidenceSeverity,
+    EvidenceStage,
+)
 from app.models.intent import ExecutionPlan, PlanStep
 from app.policy import evaluate as evaluate_policy
 from app.tools.disk import disk_usage_tool
@@ -37,7 +50,7 @@ from app.tools.env_probe import env_probe_tool
 from app.tools.file_search import file_search_tool
 from app.tools.port import port_query_tool
 from app.tools.process import process_query_tool
-from app.tools.user import create_user_tool, delete_user_tool
+from app.tools.user import MIN_NORMAL_UID, _lookup_user, create_user_tool, delete_user_tool
 
 
 ToolCallable = Callable[..., ToolResult]
@@ -54,8 +67,13 @@ ENV_PROBE_TOOL_NAME = "env_probe_tool"
 PORT_QUERY_TOOL_NAME = "port_query_tool"
 PROCESS_QUERY_TOOL_NAME = "process_query_tool"
 CONTINUOUS_PENDING_KEY = "continuous_task"
+CHECKPOINT_KEY = "checkpoint"
 VERIFY_USER_EXISTS_INTENT = "verify_user_exists"
 VERIFY_USER_ABSENT_INTENT = "verify_user_absent"
+CHECKPOINT_SAVED_INTENT = "checkpoint_saved"
+CONTRACT_REVALIDATED_INTENT = "contract_revalidated"
+CONTRACT_DRIFT_INTENT = "contract_drift"
+POLICY_DIR = Path(__file__).resolve().parents[1] / "policy"
 
 
 class ReadonlyOrchestrator:
@@ -159,7 +177,7 @@ class ReadonlyOrchestrator:
             )
 
         if _requires_pending_confirmation(risk):
-            pending_action = _pending_action_from_intent(parsed_intent, risk)
+            pending_action = self._build_pending_action(parsed_intent, risk)
             if pending_action is not None:
                 self.memory.remember_intent(parsed_intent, risk_level=risk.risk_level)
                 self.memory.set_pending_action(pending_action)
@@ -417,22 +435,34 @@ class ReadonlyOrchestrator:
                 )
 
             if _requires_pending_confirmation(risk):
+                checkpoint = self._build_continuous_step_checkpoint(
+                    step,
+                    step_index=index,
+                    environment=environment,
+                )
+                pending_context_timeline = list(timeline)
+                if checkpoint is not None:
+                    pending_context_timeline.append(_checkpoint_timeline_entry(step, checkpoint))
                 pending_action = _pending_action_from_continuous_step(
                     parsed_intent=parsed_intent,
                     risk=risk,
                     step=step,
                     plan=plan,
                     step_index=index,
-                    timeline=timeline,
+                    timeline=pending_context_timeline,
                     execution_steps=execution_steps,
                     execution_results=execution_results,
                     environment=environment,
                     step_results=step_results,
+                    checkpoint=checkpoint,
+                    host_id=_probe_confirmation_host_id(self.executor),
+                    policy_version=_current_policy_version(),
                 )
                 self.memory.remember_intent(parsed_intent, risk_level=risk.risk_level)
                 self.memory.set_pending_action(pending_action)
 
-                pending_timeline = timeline + [
+                pending_timeline = list(pending_context_timeline)
+                pending_timeline.append(
                     _timeline_entry(
                         step_id=step.step_id,
                         intent=step.intent,
@@ -444,7 +474,7 @@ class ReadonlyOrchestrator:
                             pending_action.confirmation_text,
                         ),
                     )
-                ]
+                )
                 explanation = self.summarizer.summarize_continuous(
                     status="pending_confirmation",
                     timeline=pending_timeline,
@@ -521,6 +551,37 @@ class ReadonlyOrchestrator:
             execution_results=execution_results,
         )
 
+    def _build_continuous_step_checkpoint(
+        self,
+        step: PlanStep,
+        *,
+        step_index: int,
+        environment: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not step.checkpointable:
+            return None
+        return _build_step_checkpoint(
+            step=step,
+            step_index=step_index,
+            environment=environment,
+            executor=self.executor,
+        )
+
+    def _revalidate_continuous_step_checkpoint(
+        self,
+        step: PlanStep,
+        *,
+        checkpoint: dict[str, Any],
+        environment: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+        return _revalidate_step_checkpoint(
+            step=step,
+            checkpoint=checkpoint,
+            environment=environment,
+            executor=self.executor,
+            env_probe=self.env_probe,
+        )
+
     def _resume_continuous_action(
         self,
         raw_user_input: str,
@@ -565,6 +626,74 @@ class ReadonlyOrchestrator:
                     reason=reason,
                     pending_intent=step.intent,
                 ),
+            )
+
+        token_error = _validate_pending_confirmation_token_binding(
+            pending_action,
+            risk=risk,
+            host_id=_probe_confirmation_host_id(self.executor),
+            policy_version=_current_policy_version(),
+        )
+        if token_error is not None:
+            return self._invalid_continuous_confirmation_token_response(
+                raw_user_input=raw_user_input,
+                pending_action=pending_action,
+                error_code=token_error,
+            )
+
+        checkpoint = self.memory.get_pending_checkpoint()
+        if checkpoint is None:
+            self.memory.clear_pending_action()
+            reason = "safe checkpoint is missing; resume is refused"
+            timeline.append(_drift_timeline_entry(step, reason))
+            _append_aborted_remaining_steps(
+                plan.steps[pending_step_index + 1 :],
+                timeline,
+                failed_step_id=step.step_id,
+                reason=reason,
+            )
+            return self._continuous_finished_response(
+                plan=plan,
+                environment=environment,
+                risk=PolicyDecision(
+                    risk_level=pending_action.risk_level,
+                    allow=False,
+                    requires_confirmation=False,
+                    reasons=[reason],
+                ),
+                timeline=timeline,
+                execution_steps=execution_steps,
+                execution_results=execution_results,
+            )
+
+        environment, revalidation_entries, revalidation_error = (
+            self._revalidate_continuous_step_checkpoint(
+                step,
+                checkpoint=checkpoint,
+                environment=environment,
+            )
+        )
+        timeline.extend(revalidation_entries)
+        if revalidation_error is not None:
+            self.memory.clear_pending_action()
+            _append_aborted_remaining_steps(
+                plan.steps[pending_step_index + 1 :],
+                timeline,
+                failed_step_id=step.step_id,
+                reason=revalidation_error,
+            )
+            return self._continuous_finished_response(
+                plan=plan,
+                environment=environment,
+                risk=PolicyDecision(
+                    risk_level=pending_action.risk_level,
+                    allow=False,
+                    requires_confirmation=False,
+                    reasons=[revalidation_error],
+                ),
+                timeline=timeline,
+                execution_steps=execution_steps,
+                execution_results=execution_results,
             )
 
         self.memory.clear_pending_action()
@@ -669,6 +798,70 @@ class ReadonlyOrchestrator:
                 confirmation_text=pending_action.confirmation_text,
                 pending_intent=step.intent,
                 reason="confirmation_text_mismatch",
+            ),
+        )
+
+    def _invalid_continuous_confirmation_token_response(
+        self,
+        *,
+        raw_user_input: str,
+        pending_action: PendingAction,
+        error_code: str,
+    ) -> dict[str, Any]:
+        self.memory.clear_pending_action()
+        plan = ExecutionPlan.model_validate(pending_action.context["plan"])
+        step = plan.steps[int(pending_action.context["pending_step_index"])]
+        timeline = list(pending_action.context.get("timeline") or [])
+        reason = _confirmation_token_error_reason(error_code)
+        timeline.append(
+            _timeline_entry(
+                step_id=step.step_id,
+                intent=step.intent,
+                risk=pending_action.risk_level,
+                status="refused",
+                result_summary=reason,
+            )
+        )
+        if error_code in {
+            "confirmation_token_host_mismatch",
+            "confirmation_token_target_mismatch",
+        }:
+            timeline.append(_drift_timeline_entry(step, reason))
+        parsed_intent = _parsed_intent_from_pending(pending_action, raw_user_input)
+        risk = PolicyDecision(
+            risk_level=pending_action.risk_level,
+            allow=False,
+            requires_confirmation=False,
+            confirmation_text=None,
+            reasons=[reason],
+        )
+        return self._continuous_envelope(
+            plan=plan,
+            environment=dict(
+                pending_action.context.get("environment")
+                or {"status": "not_collected", "snapshot": None}
+            ),
+            risk=risk,
+            timeline=timeline,
+            execution={
+                "status": "refused",
+                "steps": list(pending_action.context.get("execution_steps") or []),
+                "results": list(pending_action.context.get("execution_results") or []),
+            },
+            result={
+                "status": "refused",
+                "data": {
+                    "invalidated_pending_action": pending_action.public_payload(),
+                    "raw_user_input": raw_user_input,
+                    "intent": parsed_intent.intent,
+                },
+                "error": error_code,
+            },
+            explanation=self.summarizer.summarize_continuous(
+                status="refused",
+                timeline=timeline,
+                reason=reason,
+                pending_intent=step.intent,
             ),
         )
 
@@ -788,21 +981,15 @@ class ReadonlyOrchestrator:
                 raw_user_input=plan.raw_user_input,
                 confidence=1.0,
             )
-        envelope = {
-            "intent": parsed_intent.model_dump(mode="json"),
-            "environment": environment,
-            "risk": risk.model_dump(mode="json"),
-            "plan": plan.to_dict(),
-            "execution": execution,
-            "result": result,
-            "explanation": explanation,
-            "timeline": timeline,
-        }
-        return apply_evo_lite_hook(
-            envelope,
-            memory=self.memory,
-            experience_store=self.experience_store,
-            enabled=self.evo_lite_enabled,
+        return self._build_enriched_envelope(
+            parsed_intent=parsed_intent,
+            environment=environment,
+            risk=risk,
+            plan_payload=plan.to_dict(),
+            execution=execution,
+            result=result,
+            explanation=explanation,
+            timeline=timeline,
         )
 
     def _envelope(
@@ -816,20 +1003,111 @@ class ReadonlyOrchestrator:
         result: dict[str, Any],
         explanation: str,
     ) -> dict[str, Any]:
+        return self._build_enriched_envelope(
+            parsed_intent=parsed_intent,
+            environment=environment,
+            risk=risk,
+            plan_payload=_plan_payload(plan),
+            execution=execution,
+            result=result,
+            explanation=explanation,
+        )
+
+    def _build_enriched_envelope(
+        self,
+        *,
+        parsed_intent: ParsedIntent,
+        environment: dict[str, Any],
+        risk: PolicyDecision,
+        plan_payload: dict[str, Any],
+        execution: dict[str, Any],
+        result: dict[str, Any],
+        explanation: str,
+        timeline: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        policy_version = _current_policy_version()
+        evidence_chain = _build_evidence_chain(
+            parsed_intent=parsed_intent,
+            environment=environment,
+            risk=risk,
+            plan_payload=plan_payload,
+            execution=execution,
+            result=result,
+            timeline=timeline,
+        )
+        recovery = build_recovery_suggestion(
+            parsed_intent=parsed_intent,
+            environment=environment,
+            risk=risk,
+            plan=plan_payload,
+            execution=execution,
+            result=result,
+            timeline=timeline,
+        )
+        explanation_card = self.summarizer.build_explanation_card(
+            parsed_intent=parsed_intent,
+            environment=environment,
+            risk=risk,
+            plan=plan_payload,
+            execution=execution,
+            result=result,
+            evidence_chain=evidence_chain,
+            recovery=recovery,
+            legacy_explanation=explanation,
+            timeline=timeline,
+        )
+        rendered_explanation = self.summarizer.render_explanation_card(
+            explanation_card,
+            fallback=explanation,
+        )
+        blast_radius_preview = build_blast_radius_preview(
+            parsed_intent=parsed_intent,
+            risk=risk,
+            plan=plan_payload,
+            execution=execution,
+            result=result,
+            environment=environment,
+        )
+        policy_simulator = build_policy_simulator(
+            parsed_intent=parsed_intent,
+            risk=risk,
+            policy_version=policy_version,
+        )
         envelope = {
             "intent": parsed_intent.model_dump(mode="json"),
             "environment": environment,
             "risk": risk.model_dump(mode="json"),
-            "plan": _plan_payload(plan),
+            "plan": plan_payload,
             "execution": execution,
             "result": result,
-            "explanation": explanation,
+            "recovery": recovery,
+            "blast_radius_preview": blast_radius_preview,
+            "policy_simulator": policy_simulator,
+            "explanation": rendered_explanation,
+            "evidence_chain": evidence_chain.model_dump(mode="json"),
+            "explanation_card": explanation_card.model_dump(mode="json"),
         }
+        if timeline is not None:
+            envelope["timeline"] = timeline
         return apply_evo_lite_hook(
             envelope,
             memory=self.memory,
             experience_store=self.experience_store,
             enabled=self.evo_lite_enabled,
+        )
+
+    def _build_pending_action(
+        self,
+        parsed_intent: ParsedIntent,
+        risk: PolicyDecision,
+    ) -> PendingAction | None:
+        pending_action = _pending_action_from_intent(parsed_intent, risk)
+        if pending_action is None:
+            return None
+        return _bind_confirmation_token_to_pending_action(
+            pending_action,
+            host_id=_probe_confirmation_host_id(self.executor),
+            policy_version=_current_policy_version(),
         )
 
     def _unresolved_context_response(self, parsed_intent: ParsedIntent) -> dict[str, Any]:
@@ -931,6 +1209,41 @@ class ReadonlyOrchestrator:
             explanation=explanation,
         )
 
+    def _invalid_confirmation_token_response(
+        self,
+        *,
+        raw_user_input: str,
+        pending_action: PendingAction,
+        error_code: str,
+    ) -> dict[str, Any]:
+        self.memory.clear_pending_action()
+        parsed_intent = _parsed_intent_from_pending(pending_action, raw_user_input)
+        reason = _confirmation_token_error_reason(error_code)
+        risk = PolicyDecision(
+            risk_level=pending_action.risk_level,
+            allow=False,
+            requires_confirmation=False,
+            confirmation_text=None,
+            reasons=[reason],
+        )
+        explanation = f"{reason}\uff0c\u65e7\u786e\u8ba4\u5df2\u5931\u6548\uff0c\u8bf7\u91cd\u65b0\u53d1\u8d77\u539f\u59cb\u8bf7\u6c42\u3002"
+        return self._envelope(
+            parsed_intent=parsed_intent,
+            environment={
+                "status": "not_collected",
+                "reason": "invalid_confirmation_token",
+            },
+            risk=risk,
+            plan=ReadonlyPlan(status="refused", reason=reason),
+            execution={"status": "skipped", "steps": [], "results": []},
+            result={
+                "status": "refused",
+                "data": {"invalidated_pending_action": pending_action.public_payload()},
+                "error": error_code,
+            },
+            explanation=explanation,
+        )
+
     def _cancel_pending_action(
         self,
         raw_user_input: str,
@@ -994,6 +1307,19 @@ class ReadonlyOrchestrator:
                     "error": _policy_refusal_reason(risk),
                 },
                 explanation=explanation,
+            )
+
+        token_error = _validate_pending_confirmation_token_binding(
+            pending_action,
+            risk=risk,
+            host_id=_probe_confirmation_host_id(self.executor),
+            policy_version=_current_policy_version(),
+        )
+        if token_error is not None:
+            return self._invalid_confirmation_token_response(
+                raw_user_input=raw_user_input,
+                pending_action=pending_action,
+                error_code=token_error,
             )
 
         tool_started = _utc_now()
@@ -1121,6 +1447,9 @@ def _pending_action_from_continuous_step(
     execution_results: list[dict[str, Any]],
     environment: dict[str, Any],
     step_results: dict[str, dict[str, Any]],
+    checkpoint: dict[str, Any] | None,
+    host_id: str,
+    policy_version: str,
 ) -> PendingAction:
     pending_action = _pending_action_from_intent(parsed_intent, risk)
     if pending_action is None:
@@ -1140,7 +1469,267 @@ def _pending_action_from_continuous_step(
             "step_results": dict(step_results),
         }
     )
-    return pending_action.model_copy(update={"context": context})
+    if checkpoint is not None:
+        context[CHECKPOINT_KEY] = dict(checkpoint)
+    pending_action = pending_action.model_copy(update={"context": context})
+    return _bind_confirmation_token_to_pending_action(
+        pending_action,
+        host_id=host_id,
+        policy_version=policy_version,
+    )
+
+
+def _build_step_checkpoint(
+    *,
+    step: PlanStep,
+    step_index: int,
+    environment: dict[str, Any],
+    executor: Any,
+) -> dict[str, Any]:
+    facts = _baseline_contract_facts(step, environment=environment, executor=executor)
+    tracked_keys = _tracked_contract_keys(step, facts)
+    return {
+        "step_id": step.step_id,
+        "step_index": step_index,
+        "write_step": step.write_step,
+        "checkpointable": step.checkpointable,
+        "resume_from_index": step_index,
+        "saved_at": _utc_now(),
+        "environment": dict(environment),
+        "facts": facts,
+        "tracked_keys": tracked_keys,
+        "fingerprint": _contract_fingerprint(facts, step.fingerprint_keys),
+        "contract": {
+            "preconditions": list(step.preconditions),
+            "expected_observation": step.expected_observation,
+            "postconditions": list(step.postconditions),
+            "freshness_keys": list(step.freshness_keys),
+            "fingerprint_keys": list(step.fingerprint_keys),
+            "checkpointable": step.checkpointable,
+            "write_step": step.write_step,
+        },
+    }
+
+
+def _baseline_contract_facts(
+    step: PlanStep,
+    *,
+    environment: dict[str, Any],
+    executor: Any,
+) -> dict[str, Any]:
+    tracked_keys = _contract_key_set(step)
+    facts = _snapshot_contract_facts(
+        _environment_snapshot_payload(environment),
+        tracked_keys,
+    )
+    if "host.hostname" in tracked_keys and "host.hostname" not in facts:
+        host_id = _probe_confirmation_host_id(executor)
+        if host_id != "unknown":
+            facts["host.hostname"] = host_id
+
+    username = _str_or_none(step.target.get("username"))
+    if username and _needs_target_user_facts(tracked_keys):
+        lookup = _lookup_user(executor, username)
+        if lookup.error is None:
+            facts["target.user_exists"] = lookup.exists
+            facts["target.user_uid"] = lookup.record.uid if lookup.record else None
+    return facts
+
+
+def _revalidate_step_checkpoint(
+    *,
+    step: PlanStep,
+    checkpoint: dict[str, Any],
+    environment: dict[str, Any],
+    executor: Any,
+    env_probe: EnvProbeCallable,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+    baseline_facts = dict(checkpoint.get("facts") or {})
+    tracked_keys = [key for key in _tracked_contract_keys(step, baseline_facts) if key in baseline_facts]
+    current_environment = dict(environment)
+    current_facts = dict(_snapshot_contract_facts(_environment_snapshot_payload(environment), tracked_keys))
+
+    env_keys = [key for key in tracked_keys if key.startswith("host.") or key.startswith("env.")]
+    if env_keys:
+        try:
+            snapshot = env_probe(executor)
+        except Exception as exc:
+            reason = f"unable to revalidate environment before write step: {exc}"
+            return current_environment, [_drift_timeline_entry(step, reason)], reason
+        current_environment = {
+            "status": "ok",
+            "snapshot": snapshot.model_dump(mode="json"),
+        }
+        current_facts.update(_snapshot_contract_facts(current_environment["snapshot"], env_keys))
+
+    username = _str_or_none(step.target.get("username"))
+    target_keys = [key for key in tracked_keys if key.startswith("target.")]
+    if username and target_keys:
+        lookup = _lookup_user(executor, username)
+        if lookup.error is not None:
+            reason = f"unable to revalidate target state before write step: {lookup.error}"
+            return current_environment, [_drift_timeline_entry(step, reason)], reason
+        current_facts["target.user_exists"] = lookup.exists
+        current_facts["target.user_uid"] = lookup.record.uid if lookup.record else None
+
+    drift_messages = _contract_drift_messages(step, baseline_facts, current_facts)
+    precondition_failures = _contract_precondition_failures(
+        step,
+        facts=current_facts,
+        environment=current_environment,
+    )
+    if precondition_failures:
+        drift_messages.extend(precondition_failures)
+
+    if drift_messages:
+        reason = "contract drift detected: " + "；".join(drift_messages)
+        return current_environment, [_drift_timeline_entry(step, reason)], reason
+
+    compared_keys = [key for key in tracked_keys if key in current_facts]
+    summary = (
+        f"write-step contract revalidated on {len(compared_keys)} tracked facts."
+        if compared_keys
+        else "write-step contract resumed from checkpoint without comparable drift facts."
+    )
+    return current_environment, [_revalidation_timeline_entry(step, summary)], None
+
+
+def _contract_key_set(step: PlanStep) -> set[str]:
+    return {
+        str(key)
+        for key in [*step.freshness_keys, *step.fingerprint_keys]
+        if isinstance(key, str) and key
+    }
+
+
+def _tracked_contract_keys(step: PlanStep, facts: dict[str, Any]) -> list[str]:
+    tracked = [
+        key
+        for key in [*step.freshness_keys, *step.fingerprint_keys]
+        if isinstance(key, str) and key and key in facts
+    ]
+    return list(dict.fromkeys(tracked))
+
+
+def _environment_snapshot_payload(environment: dict[str, Any]) -> dict[str, Any]:
+    snapshot = environment.get("snapshot") if isinstance(environment, dict) else None
+    return dict(snapshot) if isinstance(snapshot, dict) else {}
+
+
+def _snapshot_contract_facts(
+    snapshot: dict[str, Any],
+    tracked_keys: list[str] | set[str],
+) -> dict[str, Any]:
+    tracked = set(tracked_keys)
+    facts: dict[str, Any] = {}
+    if "host.hostname" in tracked and "hostname" in snapshot:
+        facts["host.hostname"] = snapshot.get("hostname")
+    if "host.connection_mode" in tracked and "connection_mode" in snapshot:
+        facts["host.connection_mode"] = snapshot.get("connection_mode")
+    if "env.current_user" in tracked and "current_user" in snapshot:
+        facts["env.current_user"] = snapshot.get("current_user")
+    if "env.is_root" in tracked and "is_root" in snapshot:
+        facts["env.is_root"] = bool(snapshot.get("is_root"))
+    if "env.sudo_available" in tracked and "sudo_available" in snapshot:
+        facts["env.sudo_available"] = bool(snapshot.get("sudo_available"))
+    return facts
+
+
+def _needs_target_user_facts(tracked_keys: list[str] | set[str]) -> bool:
+    tracked = set(tracked_keys)
+    return "target.user_exists" in tracked or "target.user_uid" in tracked
+
+
+def _contract_fingerprint(facts: dict[str, Any], keys: list[str]) -> str | None:
+    selected = {
+        key: facts.get(key)
+        for key in keys
+        if isinstance(key, str) and key and key in facts
+    }
+    if not selected:
+        return None
+    return stable_hash(selected)
+
+
+def _contract_drift_messages(
+    step: PlanStep,
+    baseline_facts: dict[str, Any],
+    current_facts: dict[str, Any],
+) -> list[str]:
+    messages: list[str] = []
+    for key in step.freshness_keys:
+        if key not in baseline_facts or key not in current_facts:
+            continue
+        if baseline_facts.get(key) != current_facts.get(key):
+            messages.append(
+                f"{key} changed from {baseline_facts.get(key)!r} to {current_facts.get(key)!r}"
+            )
+
+    baseline_fingerprint = _contract_fingerprint(baseline_facts, step.fingerprint_keys)
+    current_fingerprint = _contract_fingerprint(current_facts, step.fingerprint_keys)
+    if (
+        baseline_fingerprint is not None
+        and current_fingerprint is not None
+        and baseline_fingerprint != current_fingerprint
+        and not messages
+    ):
+        messages.append("fingerprint_keys no longer match the saved checkpoint")
+    return messages
+
+
+def _contract_precondition_failures(
+    step: PlanStep,
+    *,
+    facts: dict[str, Any],
+    environment: dict[str, Any],
+) -> list[str]:
+    failures: list[str] = []
+    snapshot_available = bool(_environment_snapshot_payload(environment))
+    for precondition in step.preconditions:
+        if precondition == "env.snapshot_available":
+            if snapshot_available:
+                continue
+            if _precondition_keys_available({"env.current_user", "env.is_root", "env.sudo_available"}, facts):
+                continue
+            failures.append("environment snapshot is no longer available")
+            continue
+
+        if precondition == "env.sudo_available_or_root":
+            if not _precondition_keys_available({"env.sudo_available", "env.is_root"}, facts):
+                continue
+            if bool(facts.get("env.sudo_available")) or bool(facts.get("env.is_root")):
+                continue
+            failures.append("write privilege precondition changed")
+            continue
+
+        if precondition == "target.user_absent":
+            if not _precondition_keys_available({"target.user_exists"}, facts):
+                continue
+            if not bool(facts.get("target.user_exists")):
+                continue
+            failures.append("target object no longer satisfies user_absent")
+            continue
+
+        if precondition == "target.user_exists":
+            if not _precondition_keys_available({"target.user_exists"}, facts):
+                continue
+            if bool(facts.get("target.user_exists")):
+                continue
+            failures.append("target object no longer satisfies user_exists")
+            continue
+
+        if precondition == "target.user_uid >= 1000":
+            if not _precondition_keys_available({"target.user_uid"}, facts):
+                continue
+            uid = _int_or_none(facts.get("target.user_uid"))
+            if uid is not None and uid >= MIN_NORMAL_UID:
+                continue
+            failures.append("target user UID is no longer a normal user")
+    return failures
+
+
+def _precondition_keys_available(required_keys: set[str], facts: dict[str, Any]) -> bool:
+    return all(key in facts for key in required_keys)
 
 
 def _parsed_intent_from_plan_step(
@@ -1330,6 +1919,50 @@ def _timeline_entry(
         "status": status,
         "result_summary": result_summary,
     }
+
+
+def _checkpoint_timeline_entry(
+    step: PlanStep,
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    tracked_count = len(list(checkpoint.get("tracked_keys") or []))
+    return _timeline_entry(
+        step_id=f"{step.step_id}_checkpoint",
+        intent=CHECKPOINT_SAVED_INTENT,
+        risk=_step_timeline_risk(step),
+        status="success",
+        result_summary=f"safe checkpoint saved with {tracked_count} tracked contract facts.",
+    )
+
+
+def _revalidation_timeline_entry(step: PlanStep, summary: str) -> dict[str, Any]:
+    return _timeline_entry(
+        step_id=f"{step.step_id}_revalidate",
+        intent=CONTRACT_REVALIDATED_INTENT,
+        risk=_step_timeline_risk(step),
+        status="success",
+        result_summary=summary,
+    )
+
+
+def _drift_timeline_entry(step: PlanStep, reason: str) -> dict[str, Any]:
+    return _timeline_entry(
+        step_id=f"{step.step_id}_drift",
+        intent=CONTRACT_DRIFT_INTENT,
+        risk=_step_timeline_risk(step),
+        status="refused",
+        result_summary=reason,
+    )
+
+
+def _step_timeline_risk(step: PlanStep) -> RiskLevel | str:
+    raw_risk = step.target.get("risk_level")
+    if isinstance(raw_risk, str):
+        try:
+            return RiskLevel(raw_risk)
+        except ValueError:
+            return raw_risk
+    return RiskLevel.S1 if step.write_step else RiskLevel.S0
 
 
 def _timeline_entry_from_tool_result(
@@ -1610,6 +2243,94 @@ def _requires_pending_confirmation(risk: PolicyDecision) -> bool:
     )
 
 
+def _policy_file_paths() -> list[Path]:
+    return [path for path in sorted(POLICY_DIR.glob("*.py")) if path.is_file()]
+
+
+def _current_policy_version() -> str:
+    return stable_file_content_hash(_policy_file_paths())
+
+
+def _probe_confirmation_host_id(executor: Any) -> str:
+    snapshot = env_probe_tool(executor)
+    hostname = getattr(snapshot, "hostname", None)
+    if isinstance(hostname, str) and hostname.strip():
+        return hostname.strip()
+    return "unknown"
+
+
+def _pending_confirmation_plan_payload(pending_action: PendingAction) -> dict[str, Any]:
+    if _is_continuous_pending(pending_action):
+        return {
+            "mode": "continuous",
+            "plan": dict(pending_action.context.get("plan") or {}),
+            "pending_step_id": pending_action.context.get("pending_step_id"),
+            "pending_step_index": pending_action.context.get("pending_step_index"),
+            "tool_name": pending_action.tool_name,
+            "tool_args": dict(pending_action.tool_args),
+            "checkpoint": dict(pending_action.context.get(CHECKPOINT_KEY) or {}),
+        }
+    return {
+        "mode": "single_step",
+        "intent": pending_action.intent,
+        "tool_name": pending_action.tool_name,
+        "tool_args": dict(pending_action.tool_args),
+        "constraints": dict(pending_action.context.get("constraints") or {}),
+    }
+
+
+def _bind_confirmation_token_to_pending_action(
+    pending_action: PendingAction,
+    *,
+    host_id: str,
+    policy_version: str,
+) -> PendingAction:
+    token = issue_confirmation_token(
+        plan_payload=_pending_confirmation_plan_payload(pending_action),
+        host_id=host_id,
+        target=dict(pending_action.target),
+        risk_level=pending_action.risk_level,
+        policy_version=policy_version,
+        issued_at=pending_action.created_at,
+    )
+    return pending_action.model_copy(update={"confirmation_token": token})
+
+
+def _validate_pending_confirmation_token_binding(
+    pending_action: PendingAction,
+    *,
+    risk: PolicyDecision,
+    host_id: str,
+    policy_version: str,
+) -> str | None:
+    return validate_confirmation_token(
+        pending_action.confirmation_token,
+        plan_payload=_pending_confirmation_plan_payload(pending_action),
+        host_id=host_id,
+        target=dict(pending_action.target),
+        risk_level=risk.risk_level,
+        policy_version=policy_version,
+    )
+
+
+def _confirmation_token_error_reason(error_code: str) -> str:
+    if error_code == "missing_confirmation_token":
+        return "confirmation token is missing"
+    if error_code == "confirmation_token_expired":
+        return "confirmation token expired"
+    if error_code == "confirmation_token_host_mismatch":
+        return "confirmation token host binding no longer matches the current host"
+    if error_code == "confirmation_token_target_mismatch":
+        return "confirmation token target binding no longer matches the current target set"
+    if error_code == "confirmation_token_risk_mismatch":
+        return "confirmation token risk binding no longer matches the current risk level"
+    if error_code == "confirmation_token_policy_mismatch":
+        return "confirmation token policy binding no longer matches the current policy version"
+    if error_code == "confirmation_token_plan_mismatch":
+        return "confirmation token plan binding no longer matches the current execution plan"
+    return "confirmation token validation failed"
+
+
 def _pending_action_from_intent(
     parsed_intent: ParsedIntent,
     risk: PolicyDecision,
@@ -1756,6 +2477,466 @@ def _execution_step(
         "success": success,
         "error": error,
     }
+
+
+def _build_evidence_chain(
+    *,
+    parsed_intent: ParsedIntent,
+    environment: dict[str, Any],
+    risk: PolicyDecision,
+    plan_payload: dict[str, Any],
+    execution: dict[str, Any],
+    result: dict[str, Any],
+    timeline: list[dict[str, Any]] | None = None,
+) -> EvidenceChain:
+    del environment
+
+    timeline = [item for item in (timeline or []) if isinstance(item, dict)]
+    builder = EvidenceBuilder()
+
+    parse_event = builder.add_event(
+        stage=EvidenceStage.PARSE,
+        title="intent_parsed",
+        details={
+            "raw_user_input": parsed_intent.raw_user_input,
+            "intent": parsed_intent.intent,
+            "target": parsed_intent.target.model_dump(mode="json"),
+            "constraints": dict(parsed_intent.constraints),
+            "context_refs": list(parsed_intent.context_refs),
+            "requires_write": parsed_intent.requires_write,
+            "confidence": parsed_intent.confidence,
+        },
+        refs=[f"intent:{parsed_intent.intent}"],
+    )
+    plan_event = builder.add_event(
+        stage=EvidenceStage.PLAN,
+        title="plan_evaluated",
+        details={
+            "status": plan_payload.get("status"),
+            "reason": plan_payload.get("reason"),
+            "steps": _evidence_step_preview(plan_payload),
+        },
+        severity=_plan_event_severity(plan_payload),
+        refs=[parse_event.event_id],
+    )
+    policy_event = builder.add_event(
+        stage=EvidenceStage.POLICY,
+        title="policy_decision",
+        details={
+            "risk_level": risk.risk_level.value,
+            "allow": risk.allow,
+            "requires_confirmation": risk.requires_confirmation,
+            "confirmation_text": risk.confirmation_text,
+            "reasons": list(risk.reasons),
+            "safe_alternative": risk.safe_alternative,
+        },
+        severity=_policy_event_severity(risk),
+        refs=[parse_event.event_id, plan_event.event_id],
+    )
+
+    confirmation_status = _evidence_confirmation_status(
+        risk=risk,
+        plan_payload=plan_payload,
+        execution=execution,
+        result=result,
+        timeline=timeline,
+    )
+    confirmation_event = builder.add_event(
+        stage=EvidenceStage.CONFIRMATION,
+        title=f"confirmation_{confirmation_status}",
+        details={
+            "status": confirmation_status,
+            "requires_confirmation": risk.requires_confirmation,
+            "confirmation_text": result.get("confirmation_text") or risk.confirmation_text,
+            "plan_status": plan_payload.get("status"),
+            "result_status": result.get("status"),
+        },
+        severity=_confirmation_event_severity(confirmation_status),
+        refs=[policy_event.event_id, plan_event.event_id],
+    )
+
+    tool_events = _add_tool_call_events(builder, execution)
+    post_check_events = _add_post_check_events(builder, execution, timeline)
+    recovery_events = _add_recovery_events(
+        builder,
+        confirmation_status=confirmation_status,
+        plan_payload=plan_payload,
+        result=result,
+        timeline=timeline,
+        confirmation_event=confirmation_event,
+    )
+    result_event = builder.add_event(
+        stage=EvidenceStage.RESULT,
+        title="final_result",
+        details={
+            "status": result.get("status"),
+            "error": result.get("error"),
+            "tool_name": result.get("tool_name"),
+        },
+        severity=_result_event_severity(result),
+        refs=[
+            policy_event.event_id,
+            *[event.event_id for event in tool_events[-1:]],
+            *[event.event_id for event in post_check_events[-1:]],
+            *[event.event_id for event in recovery_events[-1:]],
+        ],
+    )
+
+    if risk.risk_level == RiskLevel.S3 or confirmation_status == "mismatch":
+        passed = not tool_events
+        builder.add_assertion(
+            name="blocked_request_tool_suppression",
+            passed=passed,
+            evidence_refs=[
+                policy_event.event_id,
+                confirmation_event.event_id,
+                *[event.event_id for event in tool_events],
+            ],
+            summary=(
+                "S3/confirmation mismatch 下未执行任何工具。"
+                if passed
+                else "S3/confirmation mismatch 下仍发生了工具执行，需要回归检查。"
+            ),
+        )
+
+    builder.add_assertion(
+        name="confirmation_state",
+        passed=confirmation_status in {"not_required", "confirmed"},
+        evidence_refs=[confirmation_event.event_id],
+        summary=_confirmation_assertion_summary(confirmation_status),
+    )
+
+    if post_check_events:
+        post_check_passed = all(bool(event.details.get("passed")) for event in post_check_events)
+        builder.add_assertion(
+            name="post_check_state",
+            passed=post_check_passed,
+            evidence_refs=[event.event_id for event in post_check_events],
+            summary="后置校验通过。" if post_check_passed else "后置校验失败。",
+        )
+
+    builder.add_assertion(
+        name="final_outcome",
+        passed=str(result.get("status") or "").lower() == "success",
+        evidence_refs=[
+            result_event.event_id,
+            *[event.event_id for event in post_check_events],
+        ],
+        summary=_final_outcome_assertion_summary(result),
+    )
+    return builder.build()
+
+
+def _evidence_step_preview(plan_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    preview: list[dict[str, Any]] = []
+    for index, step in enumerate(plan_payload.get("steps") or [], start=1):
+        if not isinstance(step, dict):
+            continue
+        preview.append(
+            {
+                "order": index,
+                "label": step.get("tool_name") or step.get("intent") or step.get("step_id"),
+                "args": dict(step.get("args") or {}),
+                "target": dict(step.get("target") or {}),
+            }
+        )
+    return preview
+
+
+def _add_tool_call_events(
+    builder: EvidenceBuilder,
+    execution: dict[str, Any],
+) -> list[Any]:
+    events = []
+    steps = [item for item in execution.get("steps") or [] if isinstance(item, dict)]
+    results = [item for item in execution.get("results") or [] if isinstance(item, dict)]
+    for index, result in enumerate(results, start=1):
+        step = steps[index - 1] if index - 1 < len(steps) else {}
+        tool_name = str(result.get("tool_name") or step.get("tool_name") or "unknown")
+        refs = [f"tool:{tool_name}"]
+        step_id = step.get("step_id")
+        if isinstance(step_id, str) and step_id:
+            refs.append(f"step:{step_id}")
+        events.append(
+            builder.add_event(
+                stage=EvidenceStage.TOOL_CALL,
+                title=tool_name,
+                details={
+                    "order": index,
+                    "tool_name": tool_name,
+                    "args": dict(step.get("args") or {}),
+                    "success": result.get("success"),
+                    "error": result.get("error"),
+                    "started_at": step.get("started_at"),
+                    "finished_at": step.get("finished_at"),
+                },
+                severity=EvidenceSeverity.INFO if result.get("success") else EvidenceSeverity.WARNING,
+                refs=refs,
+            )
+        )
+    return events
+
+
+def _add_post_check_events(
+    builder: EvidenceBuilder,
+    execution: dict[str, Any],
+    timeline: list[dict[str, Any]],
+) -> list[Any]:
+    events = []
+    for item in timeline:
+        if not _is_post_check_timeline_entry(item):
+            continue
+        passed = str(item.get("status") or "").lower() == "success"
+        refs = []
+        step_id = item.get("step_id")
+        if isinstance(step_id, str) and step_id:
+            refs.append(f"step:{step_id}")
+        events.append(
+            builder.add_event(
+                stage=EvidenceStage.POST_CHECK,
+                title=str(item.get("intent") or step_id or "post_check"),
+                details={
+                    "source": "timeline",
+                    "step_id": step_id,
+                    "intent": item.get("intent"),
+                    "status": item.get("status"),
+                    "result_summary": item.get("result_summary"),
+                    "passed": passed,
+                },
+                severity=EvidenceSeverity.INFO if passed else EvidenceSeverity.CRITICAL,
+                refs=refs,
+            )
+        )
+
+    if events:
+        return events
+
+    results = [item for item in execution.get("results") or [] if isinstance(item, dict)]
+    for index, result in enumerate(results, start=1):
+        data = result.get("data")
+        if not isinstance(data, dict):
+            continue
+        for key in ("verified", "verified_absent"):
+            if key not in data:
+                continue
+            passed = bool(data[key])
+            events.append(
+                builder.add_event(
+                    stage=EvidenceStage.POST_CHECK,
+                    title=f"{result.get('tool_name') or 'tool'}_{key}",
+                    details={
+                        "source": "tool_result",
+                        "order": index,
+                        "tool_name": result.get("tool_name"),
+                        "key": key,
+                        "value": data[key],
+                        "passed": passed,
+                    },
+                    severity=EvidenceSeverity.INFO if passed else EvidenceSeverity.CRITICAL,
+                    refs=[f"tool:{result.get('tool_name') or 'unknown'}"],
+                )
+            )
+    return events
+
+
+def _add_recovery_events(
+    builder: EvidenceBuilder,
+    *,
+    confirmation_status: str,
+    plan_payload: dict[str, Any],
+    result: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    confirmation_event: Any,
+) -> list[Any]:
+    events = []
+    if confirmation_status == "mismatch":
+        events.append(
+            builder.add_event(
+                stage=EvidenceStage.RECOVERY,
+                title="confirmation_mismatch",
+                details={
+                    "status": result.get("status"),
+                    "error": result.get("error"),
+                },
+                severity=EvidenceSeverity.WARNING,
+                refs=[confirmation_event.event_id],
+            )
+        )
+    if str(result.get("status") or plan_payload.get("status") or "").lower() == "cancelled":
+        events.append(
+            builder.add_event(
+                stage=EvidenceStage.RECOVERY,
+                title="pending_action_cancelled",
+                details={"status": result.get("status") or plan_payload.get("status")},
+                severity=EvidenceSeverity.WARNING,
+                refs=[confirmation_event.event_id],
+            )
+        )
+    for item in timeline:
+        intent = str(item.get("intent") or "")
+        refs: list[str] = [confirmation_event.event_id]
+        step_id = item.get("step_id")
+        if isinstance(step_id, str) and step_id:
+            refs.append(f"step:{step_id}")
+
+        if intent == CHECKPOINT_SAVED_INTENT:
+            events.append(
+                builder.add_event(
+                    stage=EvidenceStage.RECOVERY,
+                    title="checkpoint_saved",
+                    details={
+                        "step_id": step_id,
+                        "result_summary": item.get("result_summary"),
+                    },
+                    severity=EvidenceSeverity.INFO,
+                    refs=refs,
+                )
+            )
+            continue
+
+        if intent == CONTRACT_REVALIDATED_INTENT:
+            events.append(
+                builder.add_event(
+                    stage=EvidenceStage.RECOVERY,
+                    title="contract_revalidated",
+                    details={
+                        "step_id": step_id,
+                        "result_summary": item.get("result_summary"),
+                    },
+                    severity=EvidenceSeverity.INFO,
+                    refs=refs,
+                )
+            )
+            continue
+
+        if intent == CONTRACT_DRIFT_INTENT:
+            events.append(
+                builder.add_event(
+                    stage=EvidenceStage.RECOVERY,
+                    title="contract_drift",
+                    details={
+                        "step_id": step_id,
+                        "result_summary": item.get("result_summary"),
+                    },
+                    severity=EvidenceSeverity.WARNING,
+                    refs=refs,
+                )
+            )
+            continue
+
+        if str(item.get("status") or "").lower() != "aborted":
+            continue
+        events.append(
+            builder.add_event(
+                stage=EvidenceStage.RECOVERY,
+                title="dependency_abort",
+                details={
+                    "step_id": step_id,
+                    "intent": item.get("intent"),
+                    "result_summary": item.get("result_summary"),
+                },
+                severity=EvidenceSeverity.WARNING,
+                refs=refs,
+            )
+        )
+    return events
+
+
+def _confirmation_assertion_summary(confirmation_status: str) -> str:
+    if confirmation_status == "confirmed":
+        return "确认已满足。"
+    if confirmation_status == "pending":
+        return "确认仍待满足。"
+    if confirmation_status == "mismatch":
+        return "确认语不匹配。"
+    if confirmation_status == "cancelled":
+        return "确认流程已取消。"
+    return "当前请求无需确认。"
+
+
+def _final_outcome_assertion_summary(result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "unknown")
+    if status == "success":
+        return "最终结果为 success。"
+    if status == "pending_confirmation":
+        return "最终结果为 pending_confirmation。"
+    if status == "refused":
+        return "最终结果为 refused。"
+    if status == "failed":
+        return "最终结果为 failed。"
+    if status == "cancelled":
+        return "最终结果为 cancelled。"
+    if status == "aborted":
+        return "最终结果为 aborted。"
+    return f"最终结果为 {status}。"
+
+
+def _evidence_confirmation_status(
+    *,
+    risk: PolicyDecision,
+    plan_payload: dict[str, Any],
+    execution: dict[str, Any],
+    result: dict[str, Any],
+    timeline: list[dict[str, Any]],
+) -> str:
+    plan_status = str(plan_payload.get("status") or "").lower()
+    result_status = str(result.get("status") or "").lower()
+    result_error = str(result.get("error") or "").lower()
+    execution_results = execution.get("results") or []
+
+    if result_error == "confirmation_text_mismatch" or result_error.startswith(
+        "confirmation_token_"
+    ) or result_error == "missing_confirmation_token":
+        return "mismatch"
+    if result_status == "cancelled" or plan_status == "cancelled":
+        return "cancelled"
+    if result_status == "pending_confirmation" or plan_status == "pending_confirmation":
+        return "pending"
+    if plan_status == "confirmed":
+        return "confirmed"
+    if any(str(item.get("status") or "").lower() == "pending_confirmation" for item in timeline):
+        return "pending"
+    if risk.requires_confirmation and execution_results:
+        return "confirmed"
+    return "not_required"
+
+
+def _plan_event_severity(plan_payload: dict[str, Any]) -> EvidenceSeverity:
+    status = str(plan_payload.get("status") or "").lower()
+    if status in {"refused", "unsupported"}:
+        return EvidenceSeverity.WARNING
+    if status in {"pending_confirmation", "cancelled"}:
+        return EvidenceSeverity.WARNING
+    return EvidenceSeverity.INFO
+
+
+def _policy_event_severity(risk: PolicyDecision) -> EvidenceSeverity:
+    if risk.risk_level == RiskLevel.S3:
+        return EvidenceSeverity.CRITICAL
+    if risk.risk_level in {RiskLevel.S1, RiskLevel.S2}:
+        return EvidenceSeverity.WARNING
+    return EvidenceSeverity.INFO
+
+
+def _confirmation_event_severity(confirmation_status: str) -> EvidenceSeverity:
+    if confirmation_status in {"pending", "mismatch", "cancelled"}:
+        return EvidenceSeverity.WARNING
+    return EvidenceSeverity.INFO
+
+
+def _result_event_severity(result: dict[str, Any]) -> EvidenceSeverity:
+    status = str(result.get("status") or "").lower()
+    if status in {"failed", "refused"}:
+        return EvidenceSeverity.CRITICAL
+    if status in {"pending_confirmation", "cancelled", "aborted", "skipped"}:
+        return EvidenceSeverity.WARNING
+    return EvidenceSeverity.INFO
+
+
+def _is_post_check_timeline_entry(item: dict[str, Any]) -> bool:
+    intent = str(item.get("intent") or "")
+    step_id = str(item.get("step_id") or "")
+    return intent.startswith("verify_") or step_id.endswith("_verify")
 
 
 def _utc_now() -> str:

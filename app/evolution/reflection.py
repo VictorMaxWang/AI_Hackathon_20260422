@@ -52,9 +52,11 @@ def generate_reflection(
     context = _as_dict(execution_context)
     template = _select_template(evaluation_data, context)
     tags = _merge_tags(["reflection", template.tag], evaluation_data["tags"])
+    reflection_id = f"reflection-{uuid4().hex[:12]}"
+    evidence_refs = _extract_evidence_refs(context)
 
     record = ReflectionRecord(
-        reflection_id=f"reflection-{uuid4().hex[:12]}",
+        reflection_id=reflection_id,
         source_request_id=source_request_id,
         memory_type=template.memory_type,
         summary=template.summary,
@@ -62,6 +64,13 @@ def generate_reflection(
         failure_reason=template.failure_reason,
         next_time_suggestion=template.next_time_suggestion,
         tags=tags,
+        evidence_refs=evidence_refs,
+        provenance=_build_provenance(
+            context,
+            source_request_id=source_request_id,
+            reflection_id=reflection_id,
+            evidence_refs=evidence_refs,
+        ),
         promote_to_workflow_candidate=template.promote_to_workflow_candidate,
         created_at=created_at or datetime.now(timezone.utc),
     )
@@ -323,6 +332,44 @@ def _flatten_text(value: Any) -> str:
     if plain is None:
         return ""
     return str(plain)
+
+
+def _extract_evidence_refs(context: dict[str, Any]) -> list[str]:
+    chain = _as_dict(context.get("evidence_chain"))
+    refs: list[str] = []
+    for event in _as_list(chain.get("events")):
+        event_id = str(_as_dict(event).get("event_id") or "").strip()
+        if event_id:
+            refs.append(event_id)
+    for assertion in _as_list(chain.get("state_assertions")):
+        refs.extend(
+            str(item).strip()
+            for item in _as_list(_as_dict(assertion).get("evidence_refs"))
+            if str(item).strip()
+        )
+    return _merge_tags([], refs)
+
+
+def _build_provenance(
+    context: dict[str, Any],
+    *,
+    source_request_id: str,
+    reflection_id: str,
+    evidence_refs: list[str],
+) -> dict[str, Any]:
+    provenance = {
+        "sources": ["reflection"],
+        "request_ids": [source_request_id],
+        "reflection_ids": [reflection_id],
+    }
+    intent_name = _intent_name(context)
+    if intent_name:
+        provenance["intent_names"] = [intent_name]
+    if evidence_refs:
+        provenance["evidence_origin"] = "evidence_chain"
+    else:
+        provenance["evidence_origin"] = "derived"
+    return provenance
 
 
 def _intent_name(context: dict[str, Any]) -> str:

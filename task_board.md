@@ -27,7 +27,7 @@
 |---|---|---|---|---|---|---|---|---|
 | P0-T01 | Phase 0 | 初始化总控文件 | 创建管理文件体系 | 无 | SERIAL | G0 | DONE | 所有管理文件落盘 |
 | P0-T02 | Phase 0 | 初始化仓库骨架 | 创建基础目录、README、依赖文件 | P0-T01 | SERIAL | G0 | DONE | repo 可安装、结构清晰 |
-| P0-T03 | Phase 0 | 建立任务执行规范 | 建立 Codex 执行和状态更新规范 | P0-T01 | PARALLEL | G0-DOC | DEFERRED | prompt 模板与状态更新规则可用；Phase 3.5 期间暂缓或低优先级 |
+| P0-T03 | Phase 0 | 建立任务执行规范 | 建立 Codex 执行和状态更新规范 | P0-T01 | PARALLEL | G0-DOC | DEFERRED | prompt 模板与状态更新规则可用；Phase 3.6 期间暂缓或低优先级 |
 | P1-T01 | Phase 1 | 核心数据模型 | 定义 Intent、PolicyDecision、CommandResult 等模型 | P0-T02 | SERIAL | G1-CORE | DONE | 模型可被导入，测试通过 |
 | P1-T02 | Phase 1 | Executor 底座 | 实现 BaseExecutor、LocalExecutor、SSHExecutor 骨架 | P1-T01 | SERIAL | G1-CORE | DONE | 本地 whoami/hostname 可执行 |
 | P1-T03 | Phase 1 | 环境探测工具 | 实现 env_probe_tool | P1-T02 | CONDITIONAL | G1-TOOLS | DONE | 能返回系统环境快照 |
@@ -48,18 +48,27 @@
 | P3-T04 | Phase 3 | LLM Parser Stub 与 Prompt 文档 | 预留 LLM JSON 接口并记录 Prompt | P1-T05 | PARALLEL | G3-DOC | DONE | 不启用真实 LLM 也不影响运行 |
 | P3-T05 | Phase 3 | Phase 3 测试 | 测试上下文、多轮、连续任务 | P3-T03 | CONDITIONAL | G3-QA | DONE | 多轮 demo 测试通过 |
 | P3.5-T00 | Phase 3.5 | 更新总控文件以加入 Evo-Lite 阶段 | 在总控体系中记录 Evo-Lite 阶段、边界和任务编号 | Phase 3 已完成 | SERIAL | G3.5-CONTROL | DONE | task_board、current_status、architecture_constraints、decision_log、parallel_workstreams 已记录 Phase 3.5；docs/evo_lite_design.md 已新增 |
-| P3.5-T01 | Phase 3.5 | Execution Evaluator | 将真实执行结果转化为受控评估记录 | P3.5-T00 | PARALLEL | G3.5-EVAL | NOT_STARTED | 可基于审计/执行结果产出结构化评估，不触发执行能力扩展 |
-| P3.5-T02 | Phase 3.5 | Experience Store | 存储可审计、可检索的安全经验记录 | P3.5-T00 | PARALLEL | G3.5-STORE | NOT_STARTED | 经验记录可追溯来源，不修改 policy、executor 或模型权重 |
-| P3.5-T03 | Phase 3.5 | Reflection Generator | 基于评估结果生成安全反思与经验条目 | P3.5-T01 | CONDITIONAL | G3.5-REFLECT | NOT_STARTED | reflection 只写入经验，不改变系统边界或执行规则 |
-| P3.5-T04 | Phase 3.5 | Safe Workflow Templates | 沉淀只调用白名单工具的安全工作流模板 | P3.5-T00 | PARALLEL | G3.5-WORKFLOW | NOT_STARTED | workflow 模板只包含受控步骤和白名单工具，不生成可执行脚本 |
-| P3.5-T05 | Phase 3.5 | Workflow Retrieval in Planner | 允许 planner 检索安全 workflow 作为建议 | P3.5-T04 | CONDITIONAL | G3.5-PLAN | NOT_STARTED | planner 可读取 workflow 建议，但最终仍必须经过 policy 与工具白名单 |
-| P3.5-T06 | Phase 3.5 | Evo-Lite Orchestrator Hook | 在 orchestrator 边界内挂接评估、经验和 workflow 建议 | P3.5-T01,P3.5-T02,P3.5-T03,P3.5-T05 | SERIAL | G3.5-ORCH | NOT_STARTED | hook 不绕过确认、policy、executor 或审计流程 |
-| P3.5-T07 | Phase 3.5 | Safety Regression Benchmark | 建立 Evo-Lite 安全回归基准 | P3.5-T06 | SERIAL | G3.5-QA | NOT_STARTED | 覆盖禁止训练、禁止 raw shell、禁止绕过 policy 的回归用例 |
-| P4-T01 | Phase 4 | 审计存储 | 实现 SQLite + JSONL 审计 | P1-T05,P2-T03 | SERIAL | G4-AUDIT | DEFERRED | 每次请求有完整审计；Phase 3.5 期间暂缓 |
-| P4-T02 | Phase 4 | 审计查询与导出 | 实现审计 API/UI 和导出 | P4-T01,P1-T07 | CONDITIONAL | G4-AUDIT | DEFERRED | 可查看和导出审计；Phase 3.5 期间暂缓 |
-| P4-T03 | Phase 4 | Demo 场景脚本 | 编写 6 个演示场景和验证步骤 | P3-T03,P4-T01 | PARALLEL | G4-DEMO | DEFERRED | demo_scenarios 可直接照录；Phase 3.5 期间暂缓 |
-| P4-T04 | Phase 4 | 自测验证矩阵 | 映射功能到评分点和验证材料 | P4-T03 | PARALLEL | G4-DOC | DEFERRED | validation_matrix 完整；Phase 3.5 期间暂缓 |
-| P4-T05 | Phase 4 | 异常处理与恢复提示 | 增强权限不足、命令缺失等反馈 | P4-T01 | CONDITIONAL | G4-QA | DEFERRED | 失败场景反馈清晰；Phase 3.5 期间暂缓 |
+| P3.5-T01 | Phase 3.5 | Execution Evaluator | 将真实执行结果转化为受控评估记录 | P3.5-T00 | PARALLEL | G3.5-EVAL | DONE | 可基于审计/执行结果产出结构化评估，不触发执行能力扩展 |
+| P3.5-T02 | Phase 3.5 | Experience Store | 存储可审计、可检索的安全经验记录 | P3.5-T00 | PARALLEL | G3.5-STORE | DONE | 经验记录可追溯来源，不修改 policy、executor 或模型权重 |
+| P3.5-T03 | Phase 3.5 | Reflection Generator | 基于评估结果生成安全反思与经验条目 | P3.5-T01 | CONDITIONAL | G3.5-REFLECT | DONE | reflection 只写入经验，不改变系统边界或执行规则 |
+| P3.5-T04 | Phase 3.5 | Safe Workflow Templates | 沉淀只调用白名单工具的安全工作流模板 | P3.5-T00 | PARALLEL | G3.5-WORKFLOW | DONE | workflow 模板只包含受控步骤和白名单工具，不生成可执行脚本 |
+| P3.5-T05 | Phase 3.5 | Workflow Retrieval in Planner | 允许 planner 检索安全 workflow 作为建议 | P3.5-T04 | CONDITIONAL | G3.5-PLAN | DONE | planner 可读取 workflow 建议，但最终仍必须经过 policy 与工具白名单 |
+| P3.5-T06 | Phase 3.5 | Evo-Lite Orchestrator Hook | 在 orchestrator 边界内挂接评估、经验和 workflow 建议 | P3.5-T01,P3.5-T02,P3.5-T03,P3.5-T05 | SERIAL | G3.5-ORCH | DONE | hook 不绕过确认、policy、executor 或审计流程 |
+| P3.5-T07 | Phase 3.5 | Safety Regression Benchmark | 建立 Evo-Lite 安全回归基准 | P3.5-T06 | SERIAL | G3.5-QA | DONE | 覆盖禁止训练、禁止 raw shell、禁止绕过 policy 的回归用例 |
+| P3.6-T00 | Phase 3.6 | 更新总控文件并加入 Phase 3.6 | 在总控体系中正式插入 Phase 3.6 及其任务链 | Phase 3.5 已完成 | SERIAL | G3.6-CONTROL | DONE | task_board、current_status、architecture_constraints、parallel_workstreams、decision_log、validation_matrix 已写入 Phase 3.6；docs/phase_3_6_design.md 可新增 |
+| P3.6-T01 | Phase 3.6 | Evidence Layer Schema & Explanation Card Backend | 建立解释卡与证据层统一 schema，并约束证据来源 | P3.6-T00 | SERIAL | G3.6-EVIDENCE | NOT_STARTED | 解释卡与证据层有统一 schema，证据优先来自 trace / state assertion / policy events |
+| P3.6-T02 | Phase 3.6 | Guarded Confirmation Token & Scope Binding | 让确认令牌与执行闭包、作用域和风险等级绑定 | P3.6-T01 | PARALLEL | G3.6-CONFIRM | NOT_STARTED | confirmation token 与执行闭包、作用域、风险等级绑定，不能脱离闭包复用 |
+| P3.6-T03 | Phase 3.6 | Step Contracts, Drift Revalidation & Checkpoint Resume | 为连续任务建立 step contract、漂移重校验与断点续跑约束 | P3.6-T01,P3.6-T02 | SERIAL | G3.6-RESUME | NOT_STARTED | 多步任务具备 step contract、漂移重校验、断点续跑与检查点恢复约束 |
+| P3.6-T04 | Phase 3.6 | Experience Governance Guardrails | 为 experience 建立隔离、去重和晋升门禁 | P3.6-T01 | PARALLEL | G3.6-GOVERN | NOT_STARTED | experience 具备隔离、去重、晋升门禁，不能直接成为 allow/deny 来源 |
+| P3.6-T05 | Phase 3.6 | Failure Recovery Taxonomy & Suggestion Engine | 将失败归类并输出受控恢复建议 | P3.6-T03,P3.6-T04 | SERIAL | G3.6-RECOVERY | NOT_STARTED | 失败被归类并给出受控恢复建议，不生成可执行 shell 脚本 |
+| P3.6-T06 | Phase 3.6 | Replayable Safety Regression & Red-Team Harness | 建立可重放的安全回归与红队验证框架 | P3.6-T05 | PARALLEL | G3.6-QA | NOT_STARTED | 安全回归可重放、可复现，覆盖 evidence / confirmation / drift / recovery 关键路径 |
+| P3.6-T07 | Phase 3.6 | Operator Control Panel UX I | 建设第一阶段可信控制面展示解释、证据与恢复信息 | P3.6-T05 | PARALLEL | G3.6-UX1 | NOT_STARTED | 控制面第一阶段可展示解释卡、证据来源、确认绑定、恢复建议 |
+| P3.6-T08 | Phase 3.6 | Operator Control Panel UX II | 建设第二阶段可信控制面展示 replay、blast radius 与 simulator | P3.6-T06,P3.6-T07 | SERIAL | G3.6-UX2 | NOT_STARTED | 控制面第二阶段补齐 replay、blast radius、policy simulator 等可信展示能力 |
+| P4-T01 | Phase 4 | 审计存储 | 实现 SQLite + JSONL 审计 | P1-T05,P2-T03 | SERIAL | G4-AUDIT | DEFERRED | 每次请求有完整审计；Phase 3.6 期间暂缓 |
+| P4-T02 | Phase 4 | 审计查询与导出 | 实现审计 API/UI 和导出 | P4-T01,P1-T07 | CONDITIONAL | G4-AUDIT | DEFERRED | 可查看和导出审计；Phase 3.6 期间暂缓 |
+| P4-T03 | Phase 4 | Demo 场景脚本 | 编写 6 个演示场景和验证步骤 | P3-T03,P4-T01 | PARALLEL | G4-DEMO | DEFERRED | demo_scenarios 可直接照录；Phase 3.6 期间暂缓 |
+| P4-T04 | Phase 4 | 自测验证矩阵 | 映射功能到评分点和验证材料 | P4-T03 | PARALLEL | G4-DOC | DEFERRED | validation_matrix 完整；Phase 3.6 期间暂缓 |
+| P4-T05 | Phase 4 | 异常处理与恢复提示 | 增强权限不足、命令缺失等反馈 | P4-T01 | CONDITIONAL | G4-QA | DEFERRED | 失败场景反馈清晰；Phase 3.6 期间暂缓 |
 | P5-T01 | Phase 5 | Agent 配置说明 | 完成 agent_config 文档 | P4-T03 | PARALLEL | G5-DOC | DEFERRED | 文档可提交；P4 完成前暂缓 |
 | P5-T02 | Phase 5 | 工具能力定义文档 | 完成 tools_and_capabilities 文档 | P4-T03 | PARALLEL | G5-DOC | DEFERRED | 工具范围和限制清晰；P4 完成前暂缓 |
 | P5-T03 | Phase 5 | 架构与安全说明 | 完成 architecture/security 文档 | P4-T04 | PARALLEL | G5-DOC | DEFERRED | 可解释设计取舍；P4 完成前暂缓 |
@@ -71,12 +80,12 @@
 
 ## 当前活跃任务
 
-- 当前阶段：Phase 3.5
-- 当前任务：P3.5-T00（已完成）
-- 当前主线：Evo-Lite 安全经验沉淀与自评估闭环
-- 下一步建议：P3.5-T01 / P3.5-T02 / P3.5-T04
-- 当前阻塞：无业务实现阻塞；P4/P5 暂缓；P0-T03 暂缓或低优先级
-- 最新决策：DEC-P35-01 新增 Evo-Lite 阶段，采用不改权重的经验沉淀路线
+- 当前阶段：Phase 3.6
+- 当前任务：P3.6-T00（已完成）
+- 当前主线：可信控制面、证据层与鲁棒闭环
+- 下一步建议：P3.6-T01
+- 当前阻塞：无业务实现阻塞；P4/P5 暂缓；P0-T03 暂缓或低优先级；不扩大系统能力边界
+- 最新决策：DEC-P36-01 新增 Phase 3.6，优先建设可信控制面与证据层
 
 ---
 
@@ -87,3 +96,4 @@
 | 2026-04-22 | ChatGPT | 完成 P0-T01 总控管理文件体系初始化 |
 | 2026-04-22 | Codex | 完成 P0-T02 仓库骨架初始化；当前目录不是 Git 工作区，未提交或推送 |
 | 2026-04-23 | Codex | 完成 P3.5-T00 总控文件更新，加入 Evo-Lite 阶段与任务编号 |
+| 2026-04-23 | Codex | 完成 P3.6-T00 总控文件更新，加入 Phase 3.6 阶段、任务链与设计说明 |

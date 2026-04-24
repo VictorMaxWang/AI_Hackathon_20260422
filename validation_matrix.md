@@ -37,6 +37,14 @@
 | Planner workflow 检索 | P3.5-T05 | planner 可读取 workflow 建议但不绕过 policy | Evo-Lite 自评估 | retrieval_trace | NOT_STARTED |
 | Evo-Lite Hook | P3.5-T06 | hook 不绕过 confirmation、policy、executor 或 audit | Evo-Lite 自评估 | hook_trace | NOT_STARTED |
 | 安全回归基准 | P3.5-T07 | 覆盖禁止训练、禁止 raw shell、禁止绕过 policy 的回归用例 | Evo-Lite 自评估 | regression_report | NOT_STARTED |
+| 解释卡与证据层 | P3.6-T01 | explanation card 含风险、作用域、证据引用和来源类型，并统一 evidence schema | Phase 3.6 控制面 | explanation_card + evidence_trace | NOT_STARTED |
+| 确认绑定有效性 | P3.6-T02 | confirmation token 与执行闭包、作用域和风险等级绑定，不能脱离闭包复用 | Phase 3.6 控制面 | confirmation_binding_record | NOT_STARTED |
+| Step contract / drift revalidation / checkpoint resume | P3.6-T03 | 多步任务在漂移后重新校验，并可基于 checkpoint 安全续跑 | Phase 3.6 控制面 | step_contract + checkpoint_trace | NOT_STARTED |
+| Experience Governance | P3.6-T04 | experience 记录具备隔离、去重、晋升门禁，且不直接参与 allow / deny | Phase 3.6 控制面 | experience_governance_log | NOT_STARTED |
+| Failure Recovery Suggestion | P3.6-T05 | 失败被归类并生成受控恢复建议，不输出可执行 shell 脚本 | Phase 3.6 控制面 | recovery_suggestion_record | NOT_STARTED |
+| Replayable Safety Regression | P3.6-T06 | 回归与红队用例可重放、可复现，覆盖 evidence / confirmation / drift / recovery | Phase 3.6 回归 | replay_regression_report | NOT_STARTED |
+| Operator Control Panel UX I | P3.6-T07 | 控制面展示解释卡、证据来源、确认绑定和恢复建议 | Phase 3.6 控制面 | ui_trace + ux_snapshot | NOT_STARTED |
+| Operator Control Panel UX II | P3.6-T08 | 控制面展示 replay、blast radius 和 policy simulator | Phase 3.6 控制面 | ui_trace + simulator_snapshot | NOT_STARTED |
 | 审计日志 | P4-T01 | SQLite/JSONL 有完整记录 | 所有场景 | audit_log | NOT_STARTED |
 | 审计导出 | P4-T02 | 可导出最近操作 | 提交材料 | exported_report | NOT_STARTED |
 
@@ -59,13 +67,32 @@
 | 风险场景闭环 | 拒绝 + 替代方案 | Demo 5 |
 | 连续任务闭环稳定性 | multi-step orchestrator | Demo 6 |
 | 自评估与经验沉淀 | Execution Evaluator + Experience Store + Reflection + Safe Workflow Templates | Phase 3.5 自评估记录与回归报告 |
+| 可信解释与证据链 | Explanation Card + Evidence Layer + Evidence Trace | Phase 3.6 解释卡与证据引用 |
+| 确认绑定与执行闭包 | Guarded Confirmation Token + Scope Binding | Phase 3.6 确认绑定记录 |
+| 连续任务鲁棒性与恢复 | Step Contracts + Drift Revalidation + Checkpoint Resume + Failure Recovery | Phase 3.6 checkpoint 与恢复建议记录 |
+| 可重放可信控制面 | Replayable Regression + Operator Control Panel UX | Phase 3.6 回归报告与控制面快照 |
 | 稳定性一致性 | pytest + smoke tests | Test report |
 | 工程质量 | 清晰分层 + 白名单工具 + 审计 | Architecture docs |
 | 创新性 | 去命令行化安全运维入口 | Web demo |
 
 ---
 
-## 4. Demo 场景验证清单
+## 4. Phase 3.6 目标验证项
+
+| 验证项 | 对应任务 | 验证目标 | 预期证据 | 状态 |
+|---|---|---|---|---|
+| 解释卡完整性 | P3.6-T01 | 解释卡完整展示意图、风险、计划、作用域、证据来源和限制说明 | explanation_card + evidence_trace | NOT_STARTED |
+| 确认绑定有效性 | P3.6-T02 | confirmation token 绑定执行闭包，不能跨闭包或跨风险等级复用 | confirmation_binding_record | NOT_STARTED |
+| drift revalidation | P3.6-T03 | 环境或步骤漂移时必须重新校验，再决定是否继续执行 | revalidation_trace | NOT_STARTED |
+| checkpoint resume | P3.6-T03 | 中断后可基于 checkpoint 恢复，并保留 step contract 与审计链 | checkpoint_trace | NOT_STARTED |
+| failure recovery suggestion | P3.6-T05 | 失败后给出受控恢复建议，不生成可执行 shell 脚本 | recovery_suggestion_record | NOT_STARTED |
+| replayable regression | P3.6-T06 | 关键安全回归与红队用例可以稳定重放和复现 | replay_regression_report | NOT_STARTED |
+| UX 风险解释展示 | P3.6-T07 | 控制面可清晰展示风险解释、证据来源、确认绑定和恢复建议 | ui_trace + ux_snapshot | NOT_STARTED |
+| blast radius / policy simulator 展示 | P3.6-T08 | 控制面可展示 blast radius 与 policy simulator，且有真实可追溯数据支撑 | simulator_snapshot + policy_trace | NOT_STARTED |
+
+---
+
+## 5. Demo 场景验证清单
 
 ### Demo 1：磁盘查询
 

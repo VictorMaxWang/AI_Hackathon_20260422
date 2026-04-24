@@ -177,6 +177,14 @@ def evaluate_execution(
     if post_check_present and post_check_passed:
         _add_tag(tags, "post_check_passed")
 
+    if final_refused or risk_level == "S3":
+        _add_reason(reasons, "automatic workflow promotion blocked for refused or high-risk outcome")
+        _add_tag(tags, "auto_promotion_blocked")
+    elif suggested_memory_type == MemoryType.EPISODIC and experience_candidate:
+        _add_tag(tags, "auto_promotion_blocked")
+    elif experience_candidate:
+        _add_tag(tags, "requires_governance_review")
+
     if needs_reflection:
         _add_tag(tags, "needs_reflection")
     if experience_candidate:

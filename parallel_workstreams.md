@@ -42,6 +42,15 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 | G3.5-PLAN | Phase 3.5 | Planner 检索建议 |
 | G3.5-ORCH | Phase 3.5 | Orchestrator 挂接 |
 | G3.5-QA | Phase 3.5 | 安全回归 |
+| G3.6-CONTROL | Phase 3.6 | Phase 3.6 总控文件 |
+| G3.6-EVIDENCE | Phase 3.6 | 证据层与解释卡 |
+| G3.6-CONFIRM | Phase 3.6 | 确认绑定 |
+| G3.6-RESUME | Phase 3.6 | Step contract 与断点续跑 |
+| G3.6-GOVERN | Phase 3.6 | 经验治理 |
+| G3.6-RECOVERY | Phase 3.6 | 失败恢复建议 |
+| G3.6-QA | Phase 3.6 | 可重放安全回归 |
+| G3.6-UX1 | Phase 3.6 | 控制面 UX I |
+| G3.6-UX2 | Phase 3.6 | 控制面 UX II |
 | G4-AUDIT | Phase 4 | 审计 |
 | G4-DEMO | Phase 4 | 演示场景 |
 | G4-DOC | Phase 4 | 验证矩阵 |
@@ -93,6 +102,24 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 - P3.5-T01 只定义评估输入输出与结果判定，不触发新执行能力；
 - P3.5-T02 只存储可审计经验，不作为 allow / deny 来源；
 - P3.5-T04 只沉淀白名单工具 workflow，不生成可执行脚本。
+
+### Phase 3.6
+
+在 P3.6-T00 总控更新完成后，Phase 3.6 必须按以下规则推进：
+
+- P3.6-T01 串行，先统一 evidence schema 与 explanation card 边界；
+- P3.6-T02 与 P3.6-T04 可并行，但都依赖 P3.6-T01；
+- P3.6-T03 串行，依赖 P3.6-T01 / P3.6-T02；
+- P3.6-T05 串行，依赖 P3.6-T03 / P3.6-T04；
+- P3.6-T06 与 P3.6-T07 可并行，但都依赖 P3.6-T05；
+- P3.6-T08 串行，依赖 P3.6-T06 / P3.6-T07。
+
+注意：
+
+- 任一 Phase 3.6 任务都不得开放 arbitrary shell 或 raw command mode；
+- evidence 必须优先来自 trace / state assertion / policy events，不得退化为自由叙述；
+- confirmation 必须绑定执行闭包，不能做成可复用的通用授权；
+- workflow、experience、reflection 和 UX 展示都不得改写 policy/executor 边界。
 
 ### Phase 5
 
@@ -175,10 +202,13 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 10. P3.5-T06 → P3.5-T07  
    原因：Safety Regression Benchmark 必须最后验证 hook 不绕过 policy、确认和白名单工具。
 
-11. P4-T01 → P4-T02  
+11. P3.6-T00 → P3.6-T01 → P3.6-T02/P3.6-T04 → P3.6-T03 → P3.6-T05 → P3.6-T06/P3.6-T07 → P3.6-T08  
+   原因：Phase 3.6 必须先锁定证据层和确认绑定，再进入鲁棒性、恢复、回归和控制面展示。
+
+12. P4-T01 → P4-T02  
    原因：审计查询依赖审计存储结构。
 
-12. P5-T04 → P5-T05 → P5-T06  
+13. P5-T04 → P5-T05 → P5-T06  
    原因：最终脚本、安全审查、冻结发布必须顺序进行。
 
 ---
@@ -194,6 +224,7 @@ GuardedOps 可以并行推进，但必须避免多个任务同时修改同一核
 | P3.5-T05 和 P3.5-T06 | workflow retrieval 未稳定前不得接入 orchestrator |
 | P3.5-T06 和 P3.5-T07 | hook 未完成前不能执行最终安全回归 |
 | 任一 P3.5 任务和 policy/executor 边界修改 | Evo-Lite 只能沉淀经验，不得修改安全边界或执行能力 |
+| 任一 P3.6 任务和 policy/executor 边界重写 | Phase 3.6 只能增强可信控制与证据闭环，不得改写安全边界或执行能力 |
 | P4-T01 和 P4-T02 | 查询 UI 依赖审计存储结构 |
 | P5-T05 和 P5-T06 | 未完成安全审查不能冻结 |
 
