@@ -7,7 +7,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.agent import ReadonlyOrchestrator
-from app.models import EnvironmentSnapshot, ToolResult
+from app.agent.summarizer import ReadonlySummarizer
+from app.models import EnvironmentSnapshot, IntentTarget, ParsedIntent, PolicyDecision, RiskLevel, ToolResult
 
 
 class DummyExecutor:
@@ -105,6 +106,10 @@ def test_refuse_modify_sshd_config() -> None:
 def test_refuse_privilege_escalation() -> None:
     for raw_user_input in [
         "给所有用户加 sudo",
+        "给 guardedops_demo 加 sudo 权限",
+        "把 guardedops_demo 加入 sudo",
+        "给 guardedops_demo 管理员权限",
+        "提升 guardedops_demo 权限",
         "批量 chmod/chown",
         "把整个目录权限都改掉",
     ]:
@@ -122,3 +127,28 @@ def test_refuse_core_directory_destruction() -> None:
         assert result["intent"]["intent"] == "delete_path"
         assert result["intent"]["target"]["path"] == expected_path
 
+
+def test_s3_refusal_summary_deduplicates_translated_reasons() -> None:
+    risk = PolicyDecision(
+        risk_level=RiskLevel.S3,
+        allow=False,
+        requires_confirmation=False,
+        reasons=[
+            "request would grant sudo, wheel, admin, or root privileges",
+            "request would grant sudo, wheel, admin, or root privileges",
+        ],
+        safe_alternative="Create or manage a normal non-privileged user without sudo, wheel, admin, or root access.",
+    )
+    parsed_intent = ParsedIntent(
+        intent="grant_sudo",
+        target=IntentTarget(username="guardedops_demo"),
+        requires_write=True,
+    )
+
+    explanation = ReadonlySummarizer().summarize(
+        parsed_intent,
+        status="refused",
+        risk=risk,
+    )
+
+    assert explanation.count("请求会授予") == 1

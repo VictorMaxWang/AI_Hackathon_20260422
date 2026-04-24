@@ -1061,6 +1061,7 @@ class ReadonlyOrchestrator:
         explanation: str,
         timeline: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        risk = _dedupe_policy_decision(risk)
         policy_version = _current_policy_version()
         evidence_chain = _build_evidence_chain(
             parsed_intent=parsed_intent,
@@ -2258,7 +2259,7 @@ def _str_or_none(value: Any) -> str | None:
 
 def _policy_refusal_reason(risk: PolicyDecision) -> str:
     if risk.reasons:
-        return "；".join(risk.reasons)
+        return "；".join(_dedupe_texts(risk.reasons))
     return "policy denied this request"
 
 
@@ -2484,9 +2485,14 @@ def _parse_confirmable_user_request(raw_user_input: str) -> ParsedIntent | None:
     constraints: dict[str, Any] = {}
     if _requests_privilege_in_user_text(text):
         constraints["groups"] = ["sudo"]
+    elif _has_no_privilege_constraint(text):
+        constraints["groups"] = []
+        constraints["no_sudo"] = True
 
     if _contains_any(text, ["创建", "新增", "添加"]):
         constraints.setdefault("groups", [])
+        if not constraints["groups"]:
+            constraints.setdefault("no_sudo", True)
         constraints["create_home"] = True
         return ParsedIntent(
             intent=CREATE_USER_INTENT,
@@ -2519,16 +2525,59 @@ def _extract_username_after_normal_user(text: str) -> str | None:
 
 
 def _requests_privilege_in_user_text(text: str) -> bool:
-    lower_text = text.lower()
+    scan_text = _strip_negated_privilege_constraints(text)
+    lower_text = scan_text.lower()
     return bool(
-        re.search(r"\b(?:admin|administrator|wheel)\b", lower_text)
-        or _contains_any(text, ["管理员权限", "root 权限", "root权限", "加入 sudo", "加到 sudo", "sudo 权限"])
+        (
+            re.search(r"\b(?:admin|administrator|wheel)\b", lower_text) is not None
+            and _contains_any(scan_text, ["给", "授予", "加入", "加到", "添加", "设为", "设置", "提升", "权限"])
+        )
+        or _contains_any(
+            scan_text,
+            ["管理员权限", "root 权限", "root权限", "加入 sudo", "加到 sudo", "添加到 sudo", "给 sudo", "sudo 权限"],
+        )
+        or ("sudo" in lower_text and _contains_any(scan_text, ["加入", "加到", "添加", "给", "授予", "提升"]))
+        or ("提升" in scan_text and "权限" in scan_text)
     )
 
 
 def _contains_any(text: str, needles: list[str]) -> bool:
     lower_text = text.lower()
     return any(needle.lower() in lower_text for needle in needles)
+
+
+def _has_no_privilege_constraint(text: str) -> bool:
+    return _strip_negated_privilege_constraints(text) != str(text or "")
+
+
+def _strip_negated_privilege_constraints(text: str) -> str:
+    cleaned = str(text or "")
+    patterns = [
+        r"(?:不要|不用|无需|不需要|别|不能|不可|不给|无|没有)\s*(?:给\s*)?(?:[a-z_][a-z0-9_-]{2,31}\s*)?(?:sudo|管理员|admin|administrator|wheel|root)\s*(?:权限|访问)?",
+        r"不\s*(?:加入|加到|添加到|加进)\s*(?:sudo|wheel|admin|administrator|管理员)",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _dedupe_policy_decision(risk: PolicyDecision) -> PolicyDecision:
+    reasons = _dedupe_texts(risk.reasons)
+    if reasons == list(risk.reasons):
+        return risk
+    return risk.model_copy(update={"reasons": reasons})
+
+
+def _dedupe_texts(values: list[str] | tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def _write_execution_explanation(

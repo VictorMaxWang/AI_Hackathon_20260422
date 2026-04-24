@@ -3,10 +3,15 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent import ReadonlyOrchestrator
 from app.executors import BaseExecutor, LocalExecutor
+
+
+class Utf8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
 
 
 router = APIRouter()
@@ -45,7 +50,7 @@ def get_orchestrator(
     return orchestrator
 
 
-@router.post("/api/chat")
+@router.post("/api/chat", response_class=Utf8JSONResponse)
 def chat(
     request: ChatRequest,
     orchestrator: ReadonlyOrchestrator = Depends(get_orchestrator),

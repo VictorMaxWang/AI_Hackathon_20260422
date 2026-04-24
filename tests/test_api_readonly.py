@@ -139,6 +139,9 @@ def test_post_chat_returns_unified_response() -> None:
     response = client.post("/api/chat", json={"raw_user_input": "帮我查看当前磁盘使用情况"})
 
     assert response.status_code == 200
+    content_type = response.headers["content-type"].lower()
+    assert "application/json" in content_type
+    assert "charset=utf-8" in content_type
     payload = response.json()
     assert {
         "intent",
@@ -270,3 +273,21 @@ def test_static_page_resources_are_accessible() -> None:
     assert ".operator-panel" in css_response.text
     assert ".status-strip" in css_response.text
     assert ".status-surface" in css_response.text
+
+
+def test_windows_api_examples_send_utf8_json_bytes() -> None:
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        root / "README.md",
+        root / "docs" / "local_smoke_test_windows.md",
+        root / "scripts" / "smoke_api_windows.ps1",
+    ]
+
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "[System.Text.Encoding]::UTF8.GetBytes($body)" in text
+        assert "application/json; charset=utf-8" in text
+
+    script_text = (root / "scripts" / "smoke_api_windows.ps1").read_text(encoding="utf-8")
+    assert "[int]$Port" in script_text
+    assert "[string]$Message" in script_text

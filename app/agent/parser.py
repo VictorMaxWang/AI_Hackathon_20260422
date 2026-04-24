@@ -443,10 +443,22 @@ def _looks_like_sshd_config_change(text: str) -> bool:
 
 
 def _looks_like_privilege_escalation(text: str) -> bool:
-    lower_text = text.lower()
+    scan_text = _strip_negated_privilege_constraints(text)
+    lower_text = scan_text.lower()
     return bool(
-        "sudo" in lower_text
-        and _contains_any(text, ["加", "加入", "添加", "给", "权限", "所有用户", "全部用户"])
+        (
+            "sudo" in lower_text
+            and _contains_any(scan_text, ["加", "加入", "添加", "给", "权限", "所有用户", "全部用户"])
+        )
+        or (
+            _contains_any(scan_text, ["管理员权限", "root 权限", "root权限"])
+            and _contains_any(scan_text, ["给", "授予", "提升", "加", "加入", "添加", "设为", "设置"])
+        )
+        or (
+            re.search(r"\b(?:admin|administrator|wheel)\b", lower_text) is not None
+            and _contains_any(scan_text, ["给", "授予", "提升", "加", "加入", "添加", "设为", "设置", "权限"])
+        )
+        or ("提升" in scan_text and "权限" in scan_text)
     )
 
 
@@ -505,11 +517,24 @@ def _extract_username_for_sudo(text: str) -> str | None:
         r"把\s*([a-z_][a-z0-9_-]{2,31})\s*(?:加到|加入|添加到)",
         r"给\s*([a-z_][a-z0-9_-]{2,31})\s*sudo",
         r"给\s*([a-z_][a-z0-9_-]{2,31})\s*.*?sudo\s*权限",
+        r"给\s*([a-z_][a-z0-9_-]{2,31})\s*.*?(?:管理员|admin|administrator|wheel|root)\s*权限",
+        r"提升\s*([a-z_][a-z0-9_-]{2,31})\s*权限",
     ]:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return match.group(1)
     return None
+
+
+def _strip_negated_privilege_constraints(text: str) -> str:
+    cleaned = str(text or "")
+    patterns = [
+        r"(?:不要|不用|无需|不需要|别|不能|不可|不给|无|没有)\s*(?:给\s*)?(?:[a-z_][a-z0-9_-]{2,31}\s*)?(?:sudo|管理员|admin|administrator|wheel|root)\s*(?:权限|访问)?",
+        r"不\s*(?:加入|加到|添加到|加进)\s*(?:sudo|wheel|admin|administrator|管理员)",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _write_scan_text(text: str) -> str:

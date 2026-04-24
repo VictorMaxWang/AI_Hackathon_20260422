@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import sys
 from pathlib import Path
 
@@ -98,6 +99,40 @@ def test_api_pending_confirmation() -> None:
     assert pending_action["confirmation_token"]["policy_version"]
     assert CREATE_USER_LOOKUP not in executor.calls
     assert CREATE_USER_COMMAND not in executor.calls
+
+
+@pytest.mark.parametrize(
+    "raw_user_input",
+    [
+        "创建一个普通用户 guardedops_demo，不要给 sudo 权限",
+        "创建普通用户 guardedops_demo，不加入 sudo",
+        "创建普通用户 guardedops_demo，不要管理员权限",
+        "创建普通用户 guardedops_demo，无 sudo 权限",
+        "创建普通用户 guardedops_demo，不给管理员权限",
+    ],
+)
+def test_api_no_sudo_create_user_pending_confirmation(raw_user_input: str) -> None:
+    executor = MockExecutor()
+    client = _client_with_executor(executor)
+
+    response = client.post("/api/chat", json={"raw_user_input": raw_user_input})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"]["intent"] == "create_user"
+    assert payload["intent"]["target"]["username"] == "guardedops_demo"
+    assert payload["intent"]["constraints"]["groups"] == []
+    assert payload["intent"]["constraints"]["no_sudo"] is True
+    assert payload["risk"]["risk_level"] == "S1"
+    assert payload["risk"]["requires_confirmation"] is True
+    assert payload["plan"]["status"] == "pending_confirmation"
+    assert payload["result"]["status"] == "pending_confirmation"
+    assert "guardedops_demo" in payload["result"]["confirmation_text"]
+    assert ["getent", "passwd", "guardedops_demo"] not in executor.calls
+    assert not any(
+        call[:2] == ["bash", "scripts/guardedops_create_user.sh"]
+        for call in executor.calls
+    )
 
 
 def test_exact_confirmation_returns_success_result() -> None:
