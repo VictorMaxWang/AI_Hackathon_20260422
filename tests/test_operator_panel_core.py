@@ -145,6 +145,39 @@ def _evidence_chain(*, confirmation_status: str = "not_required") -> dict[str, A
 
 
 def _success_payload() -> dict[str, Any]:
+    disk_data = {
+        "status": "ok",
+        "count": 3,
+        "filesystems": [
+            {
+                "filesystem": "/dev/sda1",
+                "type": "ext4",
+                "size": "340G",
+                "used": "268G",
+                "available": "72G",
+                "use_percent": "79%",
+                "mounted_on": "/",
+            },
+            {
+                "filesystem": "tmpfs",
+                "type": "tmpfs",
+                "size": "16G",
+                "used": "1G",
+                "available": "15G",
+                "use_percent": "7%",
+                "mounted_on": "/run",
+            },
+            {
+                "filesystem": "/dev/sdb1",
+                "type": "ext4",
+                "size": "1T",
+                "used": "200G",
+                "available": "824G",
+                "use_percent": "20%",
+                "mounted_on": "/data",
+            },
+        ],
+    }
     return {
         "intent": {
             "intent": "query_disk_usage",
@@ -171,19 +204,65 @@ def _success_payload() -> dict[str, Any]:
         "execution": {
             "status": "success",
             "steps": [{"tool_name": "disk_usage_tool", "args": {}}],
-            "results": [{"tool_name": "disk_usage_tool", "success": True, "data": {"status": "ok"}}],
+            "results": [{"tool_name": "disk_usage_tool", "success": True, "data": disk_data}],
         },
         "result": {
             "status": "success",
             "tool_name": "disk_usage_tool",
-            "data": {"status": "ok"},
+            "data": disk_data,
             "error": None,
         },
         "recovery": None,
-        "explanation": "只读请求已成功执行。",
+        "explanation": "当前共检测到 3 个挂载点；最紧张的是 /，使用率 79%，可用空间 72G。",
         "evidence_chain": _evidence_chain(),
         "explanation_card": _explanation_card(),
     }
+
+
+def _memory_payload() -> dict[str, Any]:
+    payload = _success_payload()
+    memory_data = {
+        "status": "ok",
+        "total_bytes": 16 * 1024 * 1024 * 1024,
+        "used_bytes": 10 * 1024 * 1024 * 1024,
+        "available_bytes": 6 * 1024 * 1024 * 1024,
+        "used_percent": 62.5,
+        "source": "/proc/meminfo",
+        "top_processes": [
+            {
+                "pid": 123,
+                "user": "root",
+                "memory_percent": 11.5,
+                "memory_bytes": 1024 * 1024 * 1024,
+                "command": "postgres",
+                "args": "postgres: writer",
+            }
+        ],
+        "process_source": "ps",
+        "process_error": "",
+    }
+    payload["intent"].update(
+        {
+            "intent": "query_memory_usage",
+            "raw_user_input": "帮我查看当前内存使用情况",
+        }
+    )
+    payload["plan"]["steps"] = [{"tool_name": "memory_usage_tool", "args": {"limit": 10}}]
+    payload["execution"]["steps"] = [{"tool_name": "memory_usage_tool", "args": {"limit": 10}}]
+    payload["execution"]["results"] = [
+        {"tool_name": "memory_usage_tool", "success": True, "data": memory_data}
+    ]
+    payload["result"] = {
+        "status": "success",
+        "tool_name": "memory_usage_tool",
+        "data": memory_data,
+        "error": None,
+    }
+    payload["explanation"] = (
+        "当前内存总量 16.0 GB，已用 10.0 GB（62.5%），可用 6.0 GB；"
+        "内存占用最高的进程是 postgres（PID 123，占用 1.0 GB）。"
+    )
+    return payload
 
 
 def _pending_payload() -> dict[str, Any]:
@@ -324,6 +403,26 @@ def test_api_chat_returns_explanation_card_and_operator_panel_projection() -> No
     assert operator_panel["timeline_entries"]
     assert operator_panel["timeline_entries"][0]["source"] == "evidence"
 
+    view_model = _view_model(payload, raw_user_input="帮我看看当前磁盘使用情况")
+    assert view_model["answerSummary"]["visible"] is True
+    assert "当前共检测到" in view_model["answerSummary"]["text"]
+    assert "可用空间" in view_model["answerSummary"]["text"]
+    assert view_model["answerSummary"]["meta"] == ["成功", "S0", "只读查询"]
+
+
+def test_memory_response_generates_visible_answer_summary() -> None:
+    client = _client_with_payload(_memory_payload())
+
+    response = client.post("/api/chat", json={"raw_user_input": "帮我查看当前内存使用情况"})
+    payload = response.json()
+    view_model = _view_model(payload, raw_user_input="帮我查看当前内存使用情况")
+
+    assert view_model["answerSummary"]["visible"] is True
+    assert "当前内存总量" in view_model["answerSummary"]["text"]
+    assert "可用" in view_model["answerSummary"]["text"]
+    assert "postgres" in view_model["answerSummary"]["text"]
+    assert view_model["answerSummary"]["meta"] == ["成功", "S0", "只读查询"]
+
 
 def test_pending_confirmation_state_is_exposed_to_operator_panel_view_model() -> None:
     client = _client_with_payload(_pending_payload())
@@ -338,6 +437,7 @@ def test_pending_confirmation_state_is_exposed_to_operator_panel_view_model() ->
     assert view_model["confirmation"]["status"] == "pending_confirmation"
     assert view_model["confirmation"]["text"] == "确认创建普通用户 demo_guest"
     assert view_model["refusal"]["visible"] is False
+    assert view_model["answerSummary"]["visible"] is False
 
 
 def test_refused_state_and_recovery_block_are_renderable() -> None:
@@ -349,10 +449,11 @@ def test_refused_state_and_recovery_block_are_renderable() -> None:
 
     assert payload["operator_panel"]["refusal"]["is_refused"] is True
     assert view_model["refusal"]["visible"] is True
-    assert "guarded policy boundary" in view_model["recovery"]["why"]
+    assert "受控策略边界" in view_model["recovery"]["why"]
     assert view_model["recovery"]["visible"] is True
-    assert "Retry not yet safe" in view_model["recovery"]["flags"]
+    assert "暂不适合重试" in view_model["recovery"]["flags"]
     assert view_model["residualNextStep"]["summary"]
+    assert view_model["answerSummary"]["visible"] is False
 
 
 def test_evidence_timeline_prefers_narrative_timeline_when_available() -> None:
@@ -373,6 +474,10 @@ def test_page_has_no_raw_shell_input_and_keeps_natural_language_entry() -> None:
 
     assert "可信控制面" in html
     assert "运维请求" in html
+    assert "<header" not in html
+    assert 'class="hero"' not in html
     assert "<textarea" not in html
     assert "raw shell" not in html
+    assert "answer-summary-panel" in html
+    assert "答案摘要" in html
     assert 'id="operator-request"' in html

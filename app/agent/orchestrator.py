@@ -49,6 +49,7 @@ from app.policy import evaluate as evaluate_policy
 from app.tools.disk import disk_usage_tool
 from app.tools.env_probe import env_probe_tool
 from app.tools.file_search import file_search_tool
+from app.tools.memory import memory_usage_tool
 from app.tools.port import port_query_tool
 from app.tools.process import process_query_tool
 from app.tools.user import MIN_NORMAL_UID, _lookup_user, create_user_tool, delete_user_tool
@@ -61,11 +62,13 @@ LLMParserCallable = Callable[..., dict[str, Any]]
 CREATE_USER_INTENT = "create_user"
 DELETE_USER_INTENT = "delete_user"
 ENV_PROBE_INTENT = "env_probe"
+MEMORY_QUERY_INTENT = "query_memory_usage"
 PORT_QUERY_INTENT = "query_port"
 PROCESS_QUERY_INTENT = "query_process"
 CREATE_USER_TOOL_NAME = "create_user_tool"
 DELETE_USER_TOOL_NAME = "delete_user_tool"
 ENV_PROBE_TOOL_NAME = "env_probe_tool"
+MEMORY_USAGE_TOOL_NAME = "memory_usage_tool"
 PORT_QUERY_TOOL_NAME = "port_query_tool"
 PROCESS_QUERY_TOOL_NAME = "process_query_tool"
 CONTINUOUS_PENDING_KEY = "continuous_task"
@@ -92,6 +95,7 @@ class ReadonlyOrchestrator:
         memory: AgentMemory | None = None,
         env_probe: EnvProbeCallable = env_probe_tool,
         disk_tool: ToolCallable = disk_usage_tool,
+        memory_usage_tool_fn: ToolCallable = memory_usage_tool,
         file_search_tool_fn: ToolCallable = file_search_tool,
         process_query_tool_fn: ToolCallable = process_query_tool,
         port_query_tool_fn: ToolCallable = port_query_tool,
@@ -113,6 +117,7 @@ class ReadonlyOrchestrator:
         self.llm_parser_fn = llm_parser_fn or parse_with_llm
         self.tools: dict[str, ToolCallable] = {
             "disk_usage_tool": disk_tool,
+            MEMORY_USAGE_TOOL_NAME: memory_usage_tool_fn,
             "file_search_tool": file_search_tool_fn,
             "process_query_tool": process_query_tool_fn,
             "port_query_tool": port_query_tool_fn,
@@ -2107,6 +2112,12 @@ def _success_summary(step: PlanStep, tool_result: ToolResult) -> str:
             return f"端口 {port} 当前没有监听。"
         pid = _first_listener_pid(listeners)
         return f"端口 {port} 当前存在监听，PID {pid or '未知'}。"
+    if step.intent == MEMORY_QUERY_INTENT:
+        total = _format_bytes(data.get("total_bytes"))
+        used = _format_bytes(data.get("used_bytes"))
+        available = _format_bytes(data.get("available_bytes"))
+        used_percent = _format_percent(data.get("used_percent"))
+        return f"当前内存总量 {total}，已用 {used}（{used_percent}），可用 {available}。"
     if step.intent == PROCESS_QUERY_INTENT:
         processes = list(data.get("processes") or [])
         if not processes:
@@ -2123,6 +2134,28 @@ def _success_summary(step: PlanStep, tool_result: ToolResult) -> str:
         username = data.get("username") or step.target.get("username")
         return f"删除普通用户 {username} 成功。"
     return f"{step.intent} 执行成功。"
+
+
+def _format_bytes(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "未知"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while number >= 1024 and index < len(units) - 1:
+        number /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(number)} {units[index]}"
+    return f"{number:.1f} {units[index]}"
+
+
+def _format_percent(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "未知"
+    return text if text.endswith("%") else f"{text}%"
 
 
 def _continuous_risk_from_timeline(timeline: list[dict[str, Any]]) -> PolicyDecision:

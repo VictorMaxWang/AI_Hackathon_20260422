@@ -56,11 +56,17 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 另开一个 PowerShell 窗口测试 API：
 
 ```powershell
+$body = @{
+  raw_user_input = "帮我查看当前磁盘使用情况"
+} | ConvertTo-Json -Compress
+
+$utf8Body = [System.Text.Encoding]::UTF8.GetBytes($body)
+
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8001/api/chat" `
   -Method Post `
-  -ContentType "application/json" `
-  -Body '{"raw_user_input":"帮我查看当前磁盘使用情况"}'
+  -ContentType "application/json; charset=utf-8" `
+  -Body $utf8Body
 ```
 
 ## 6. 常见问题

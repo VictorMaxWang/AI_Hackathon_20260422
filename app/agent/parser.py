@@ -7,6 +7,7 @@ from app.models import IntentTarget, ParsedIntent
 
 
 DISK_INTENT = "query_disk_usage"
+MEMORY_INTENT = "query_memory_usage"
 FILE_INTENT = "search_files"
 PROCESS_INTENT = "query_process"
 PORT_INTENT = "query_port"
@@ -55,6 +56,8 @@ class ReadonlyParser:
             return self._parse_file_search(text, raw_user_input)
         if _looks_like_port_query(text):
             return self._parse_port_query(text, raw_user_input)
+        if _looks_like_memory_usage_query(text):
+            return self._parse_memory_usage(text, raw_user_input)
         if _looks_like_process_query(text):
             return self._parse_process_query(text, raw_user_input)
         if _looks_like_disk_query(text):
@@ -96,6 +99,18 @@ class ReadonlyParser:
             constraints=constraints,
             raw_user_input=raw_user_input,
             confidence=confidence,
+        )
+
+    def _parse_memory_usage(self, text: str, raw_user_input: str) -> ParsedIntent:
+        return ParsedIntent(
+            intent=MEMORY_INTENT,
+            target=IntentTarget(),
+            constraints={
+                "mode": "summary_with_top_processes",
+                "limit": _extract_top_limit(text, 10),
+            },
+            raw_user_input=raw_user_input,
+            confidence=0.88,
         )
 
     def _parse_process_query(self, text: str, raw_user_input: str) -> ParsedIntent:
@@ -515,6 +530,17 @@ def _looks_like_process_query(text: str) -> bool:
     return bool(
         re.search(r"\bpid\s*\d+\b", text, flags=re.IGNORECASE)
         or _contains_any(text, ["进程", "CPU", "cpu", "内存", "相关进程"])
+    )
+
+
+def _looks_like_memory_usage_query(text: str) -> bool:
+    if not _contains_any(text, ["内存", "memory", "mem", "ram"]):
+        return False
+    if re.search(r"\bpid\s*\d+\b", text, flags=re.IGNORECASE):
+        return False
+    return not _contains_any(
+        text,
+        ["进程", "process", "相关进程", "排行", "排名", "最高", "top"],
     )
 
 

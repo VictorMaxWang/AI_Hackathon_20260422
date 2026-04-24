@@ -18,6 +18,7 @@ LLM_PARSER_ENABLED: Final[bool] = False
 ALLOWED_LLM_PROVIDER = "aliyun_bailian"
 SUPPORTED_LLM_INTENTS = {
     "disk_usage": "query_disk_usage",
+    "memory_usage": "query_memory_usage",
     "file_search": "search_files",
     "process_query": "query_process",
     "port_query": "query_port",
@@ -26,6 +27,7 @@ SUPPORTED_LLM_INTENTS = {
 }
 READONLY_INTENTS = {
     "query_disk_usage",
+    "query_memory_usage",
     "search_files",
     "query_process",
     "query_port",
@@ -33,6 +35,7 @@ READONLY_INTENTS = {
 WRITE_INTENTS = {"create_user", "delete_user"}
 INTENT_TOOL_WHITELIST = {
     "query_disk_usage": "disk_usage_tool",
+    "query_memory_usage": "memory_usage_tool",
     "search_files": "file_search_tool",
     "query_process": "process_query_tool",
     "query_port": "port_query_tool",

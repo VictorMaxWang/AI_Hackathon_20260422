@@ -9,7 +9,13 @@ from app.models import ParsedIntent
 from app.models.evolution import WorkflowStep, WorkflowTemplate
 from app.models.intent import ExecutionPlan, PlanStep
 
-from app.agent.parser import DISK_INTENT, FILE_INTENT, PORT_INTENT, PROCESS_INTENT
+from app.agent.parser import (
+    DISK_INTENT,
+    FILE_INTENT,
+    MEMORY_INTENT,
+    PORT_INTENT,
+    PROCESS_INTENT,
+)
 
 
 ENV_PROBE_INTENT = "env_probe"
@@ -22,6 +28,7 @@ WORKFLOW_TOOL_INTENTS = {
     "disk_usage_tool": DISK_INTENT,
     "env_probe_tool": ENV_PROBE_INTENT,
     "file_search_tool": FILE_INTENT,
+    "memory_usage_tool": MEMORY_INTENT,
     "port_query_tool": PORT_INTENT,
     "process_query_tool": PROCESS_INTENT,
 }
@@ -80,6 +87,17 @@ class ReadonlyPlanner:
             return ReadonlyPlan(
                 status="ready",
                 steps=[PlannedToolCall("disk_usage_tool", {})],
+            )
+
+        if parsed_intent.intent == MEMORY_INTENT:
+            return ReadonlyPlan(
+                status="ready",
+                steps=[
+                    PlannedToolCall(
+                        "memory_usage_tool",
+                        {"limit": parsed_intent.constraints.get("limit", 10)},
+                    )
+                ],
             )
 
         if parsed_intent.intent == FILE_INTENT:
@@ -142,7 +160,7 @@ class ReadonlyPlanner:
 
         return ReadonlyPlan(
             status="unsupported",
-            reason="当前只支持只读基础能力：磁盘、文件检索、进程和端口查询",
+            reason="当前只支持只读基础能力：磁盘、内存、文件检索、进程和端口查询",
         )
 
 

@@ -5,7 +5,13 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from app.agent.parser import DISK_INTENT, FILE_INTENT, PORT_INTENT, PROCESS_INTENT
+from app.agent.parser import (
+    DISK_INTENT,
+    FILE_INTENT,
+    MEMORY_INTENT,
+    PORT_INTENT,
+    PROCESS_INTENT,
+)
 from app.models import ParsedIntent, PolicyDecision, RiskLevel, ToolResult
 from app.models.evidence import (
     EvidenceChain,
@@ -46,6 +52,8 @@ class ReadonlySummarizer:
 
         if parsed_intent.intent == DISK_INTENT:
             return _summarize_disk(tool_result.data)
+        if parsed_intent.intent == MEMORY_INTENT:
+            return _summarize_memory(tool_result.data)
         if parsed_intent.intent == FILE_INTENT:
             return _summarize_file_search(tool_result.data)
         if parsed_intent.intent == PROCESS_INTENT:
@@ -587,6 +595,32 @@ def _summarize_disk(data: Any) -> str:
     )
 
 
+def _summarize_memory(data: Any) -> str:
+    payload = data or {}
+    total = _format_bytes(payload.get("total_bytes"))
+    used = _format_bytes(payload.get("used_bytes"))
+    available = _format_bytes(payload.get("available_bytes"))
+    used_percent = _format_percent(payload.get("used_percent"))
+    if total == "未知" or available == "未知":
+        return "已查询内存使用情况，但没有返回可用的系统内存摘要。"
+
+    base = f"当前内存总量 {total}，已用 {used}（{used_percent}），可用 {available}"
+    processes = list(payload.get("top_processes") or [])
+    if processes:
+        first = processes[0]
+        command = first.get("command") or first.get("process_name") or "未知进程"
+        pid = first.get("pid") or "未知"
+        memory = _format_bytes(first.get("memory_bytes"))
+        if memory != "未知":
+            return f"{base}；内存占用最高的进程是 {command}（PID {pid}，占用 {memory}）。"
+        return f"{base}；内存占用最高的进程是 {command}（PID {pid}）。"
+
+    process_error = payload.get("process_error")
+    if process_error:
+        return f"{base}；进程排行暂不可用：{process_error}。"
+    return f"{base}。"
+
+
 def _summarize_file_search(data: Any) -> str:
     payload = data or {}
     count = payload.get("count", 0)
@@ -650,6 +684,28 @@ def _percent_value(value: Any) -> int:
         return int(text)
     except ValueError:
         return -1
+
+
+def _format_bytes(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "未知"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while number >= 1024 and index < len(units) - 1:
+        number /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(number)} {units[index]}"
+    return f"{number:.1f} {units[index]}"
+
+
+def _format_percent(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "未知"
+    return text if text.endswith("%") else f"{text}%"
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

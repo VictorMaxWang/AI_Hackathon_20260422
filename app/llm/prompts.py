@@ -16,11 +16,11 @@ If unsupported or uncertain, return intent "unsupported".
 For high-risk requests, set intent "high_risk_request" and risk_hint, but do not decide final risk.
 
 Allowed intent values:
-disk_usage, file_search, process_query, port_query, create_user, delete_user, high_risk_request, unsupported
+disk_usage, memory_usage, file_search, process_query, port_query, create_user, delete_user, high_risk_request, unsupported
 
 Output JSON shape:
 {
-  "intent": "disk_usage | file_search | process_query | port_query | create_user | delete_user | high_risk_request | unsupported",
+  "intent": "disk_usage | memory_usage | file_search | process_query | port_query | create_user | delete_user | high_risk_request | unsupported",
   "target": {
     "username": null,
     "path": null,

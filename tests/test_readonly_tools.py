@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.models import CommandResult
 from app.tools.disk import disk_usage_tool
 from app.tools.file_search import file_search_tool
+from app.tools.memory import memory_usage_tool
 from app.tools.port import port_query_tool
 from app.tools.process import process_query_tool
 
@@ -172,6 +173,127 @@ def test_process_query_tool_returns_basic_structure() -> None:
     assert argv[:2] == ["ps", "-eo"]
     assert "--sort=-pcpu" in argv
     assert timeout == 10
+
+
+def test_memory_usage_tool_parses_linux_meminfo_and_process_ranking() -> None:
+    meminfo = "\n".join(
+        [
+            "MemTotal:       16384000 kB",
+            "MemFree:         1024000 kB",
+            "MemAvailable:    4096000 kB",
+            "Buffers:          256000 kB",
+            "Cached:          2048000 kB",
+        ]
+    )
+    ps_output = "\n".join(
+        [
+            "123 root 3.5 12.0 postgres postgres: writer",
+            "456 demo 2.0 7.5 python python app.py",
+        ]
+    )
+    executor = MockExecutor(
+        [
+            command_result(["cat", "/proc/meminfo"], stdout=meminfo),
+            command_result(["ps"], stdout=ps_output),
+        ]
+    )
+
+    result = memory_usage_tool(executor, limit=1)
+
+    assert result.success is True
+    assert result.tool_name == "memory_usage_tool"
+    assert result.data["status"] == "ok"
+    assert result.data["source"] == "/proc/meminfo"
+    assert result.data["total_bytes"] == 16384000 * 1024
+    assert result.data["available_bytes"] == 4096000 * 1024
+    assert result.data["used_percent"] == 75.0
+    assert result.data["process_source"] == "ps"
+    assert result.data["process_error"] == ""
+    assert result.data["top_processes"][0]["command"] == "postgres"
+    assert result.data["top_processes"][0]["memory_percent"] == 12.0
+    assert executor.calls[0] == (["cat", "/proc/meminfo"], 10)
+    assert executor.calls[1][0][:2] == ["ps", "-eo"]
+    assert "--sort=-pmem" in executor.calls[1][0]
+
+
+def test_memory_usage_tool_parses_windows_cim_json_and_process_ranking() -> None:
+    memory_json = '{"TotalVisibleMemorySize": 8388608, "FreePhysicalMemory": 2097152}'
+    process_json = (
+        '[{"pid": 42, "user": null, "memory_bytes": 536870912, '
+        '"command": "Code", "args": ""}]'
+    )
+    executor = MockExecutor(
+        [
+            command_result(["cat", "/proc/meminfo"], exit_code=1, stderr="not found"),
+            command_result(["powershell"], stdout=memory_json),
+            command_result(["powershell"], stdout=process_json),
+        ]
+    )
+
+    result = memory_usage_tool(executor)
+
+    assert result.success is True
+    assert result.data["source"] == "Win32_OperatingSystem"
+    assert result.data["total_bytes"] == 8388608 * 1024
+    assert result.data["available_bytes"] == 2097152 * 1024
+    assert result.data["used_percent"] == 75.0
+    assert result.data["process_source"] == "Get-Process"
+    assert result.data["top_processes"][0]["pid"] == 42
+    assert result.data["top_processes"][0]["memory_bytes"] == 536870912
+    assert executor.calls[1][0][:3] == ["powershell", "-NoProfile", "-Command"]
+    assert executor.calls[2][0][:3] == ["powershell", "-NoProfile", "-Command"]
+
+
+def test_memory_usage_tool_keeps_summary_success_when_process_ranking_fails() -> None:
+    meminfo = "\n".join(
+        [
+            "MemTotal:       1048576 kB",
+            "MemAvailable:    524288 kB",
+        ]
+    )
+    executor = MockExecutor(
+        [
+            command_result(["cat", "/proc/meminfo"], stdout=meminfo),
+            command_result(["ps"], exit_code=1, stderr="ps unavailable"),
+        ]
+    )
+
+    result = memory_usage_tool(executor)
+
+    assert result.success is True
+    assert result.data["status"] == "ok"
+    assert result.data["available_bytes"] == 524288 * 1024
+    assert result.data["top_processes"] == []
+    assert result.data["process_source"] == "ps"
+    assert result.data["process_error"] == "ps unavailable"
+
+
+def test_memory_usage_tool_uses_windows_process_fallback_for_incompatible_ps() -> None:
+    meminfo = "\n".join(
+        [
+            "MemTotal:       1048576 kB",
+            "MemAvailable:    524288 kB",
+        ]
+    )
+    process_json = (
+        '[{"pid": 42, "user": null, "memory_bytes": 536870912, '
+        '"command": "Code", "args": ""}]'
+    )
+    executor = MockExecutor(
+        [
+            command_result(["cat", "/proc/meminfo"], stdout=meminfo),
+            command_result(["ps"], exit_code=1, stderr="ps: unknown option -- o"),
+            command_result(["powershell"], stdout=process_json),
+        ]
+    )
+
+    result = memory_usage_tool(executor)
+
+    assert result.success is True
+    assert result.data["process_source"] == "Get-Process"
+    assert result.data["process_error"] == ""
+    assert result.data["top_processes"][0]["command"] == "Code"
+    assert result.data["top_processes"][0]["memory_bytes"] == 536870912
 
 
 def test_port_query_tool_returns_not_listening_for_unused_port() -> None:

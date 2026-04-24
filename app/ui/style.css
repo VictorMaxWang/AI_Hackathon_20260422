@@ -50,21 +50,6 @@ input {
   margin: 28px auto 40px;
 }
 
-.hero {
-  display: grid;
-  grid-template-columns: minmax(0, 1.8fr) minmax(280px, 0.9fr);
-  gap: 24px;
-  align-items: end;
-  padding: 28px 30px 26px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background:
-    linear-gradient(135deg, rgba(255, 251, 245, 0.95), rgba(248, 240, 227, 0.84)),
-    radial-gradient(circle at right top, rgba(154, 81, 37, 0.18), transparent 38%);
-  box-shadow: var(--shadow);
-}
-
-.eyebrow,
 .surface-kicker,
 .metric-label {
   margin: 0;
@@ -75,21 +60,12 @@ input {
   text-transform: uppercase;
 }
 
-.hero h1,
 .surface h2 {
   margin: 0;
   font-weight: 600;
-  letter-spacing: -0.04em;
+  letter-spacing: 0;
 }
 
-.hero h1 {
-  margin-top: 10px;
-  font-size: clamp(44px, 7vw, 84px);
-  line-height: 0.92;
-}
-
-.hero-text,
-.hero-note p,
 .body-text,
 .meta-text,
 .request-preview,
@@ -97,28 +73,6 @@ input {
 .check-summary,
 .explanation-summary {
   line-height: 1.6;
-}
-
-.hero-text {
-  max-width: 58ch;
-  margin: 14px 0 0;
-  font-size: 16px;
-  color: var(--muted);
-}
-
-.hero-note {
-  display: grid;
-  gap: 12px;
-  align-self: stretch;
-  padding: 20px;
-  border: 1px solid rgba(47, 41, 34, 0.12);
-  border-radius: calc(var(--radius-md) + 2px);
-  background: rgba(255, 255, 255, 0.56);
-}
-
-.hero-note p {
-  margin: 0;
-  color: var(--text);
 }
 
 .request-form,
@@ -130,7 +84,7 @@ input {
 }
 
 .request-form {
-  margin-top: 18px;
+  margin-top: 0;
   padding: 22px 24px;
   border-radius: var(--radius-md);
 }
@@ -230,6 +184,21 @@ input {
   background:
     linear-gradient(180deg, rgba(255, 253, 248, 0.96), rgba(249, 242, 231, 0.9)),
     radial-gradient(circle at top right, rgba(154, 81, 37, 0.16), transparent 36%);
+}
+
+.answer-summary-surface {
+  border-color: rgba(29, 106, 82, 0.24);
+  background:
+    linear-gradient(180deg, rgba(248, 255, 251, 0.98), rgba(240, 250, 244, 0.92)),
+    radial-gradient(circle at top right, rgba(29, 106, 82, 0.14), transparent 34%);
+}
+
+.answer-summary-text {
+  margin: 0 0 16px;
+  color: var(--text);
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.45;
 }
 
 .request-preview {
@@ -641,7 +610,6 @@ input {
 }
 
 @media (max-width: 1080px) {
-  .hero,
   .workspace {
     grid-template-columns: 1fr;
   }
@@ -657,7 +625,6 @@ input {
     margin-top: 16px;
   }
 
-  .hero,
   .request-form,
   .surface {
     padding: 18px;
@@ -668,6 +635,10 @@ input {
   .explanation-grid,
   .workspace-side {
     grid-template-columns: 1fr;
+  }
+
+  .answer-summary-text {
+    font-size: 22px;
   }
 
   .request-row button {
