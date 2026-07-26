@@ -4,12 +4,14 @@ import json
 from typing import Any
 
 from app.models import CommandResult, ToolResult
+from app.tools import safe_run
 from app.tools.process import process_query_tool
 
 
 TOOL_NAME = "memory_usage_tool"
 MAX_LIMIT = 50
 DEFAULT_LIMIT = 10
+MEMORY_TIMEOUT = 10
 
 
 def memory_usage_tool(executor: Any, limit: int = DEFAULT_LIMIT) -> ToolResult:
@@ -17,14 +19,14 @@ def memory_usage_tool(executor: Any, limit: int = DEFAULT_LIMIT) -> ToolResult:
 
     effective_limit = _bounded_limit(limit)
 
-    linux_result = executor.run(["cat", "/proc/meminfo"], timeout=10)
+    linux_result = safe_run(executor, ["cat", "/proc/meminfo"], timeout=MEMORY_TIMEOUT)
     if linux_result.success:
         linux_payload = _parse_linux_meminfo(linux_result.stdout)
         if linux_payload is not None:
             _attach_linux_process_ranking(executor, linux_payload, effective_limit)
             return _success(linux_payload)
 
-    windows_result = executor.run(_windows_memory_argv(), timeout=10)
+    windows_result = safe_run(executor, _windows_memory_argv(), timeout=MEMORY_TIMEOUT)
     if windows_result.success:
         windows_payload = _parse_windows_memory_json(windows_result.stdout)
         if windows_payload is not None:
@@ -123,17 +125,22 @@ def _attach_linux_process_ranking(executor: Any, payload: dict[str, Any], limit:
         payload["process_source"] = str(result.data.get("source") or "ps")
         payload["process_error"] = ""
         return
-    if _should_try_windows_process_ranking(result.error):
-        _attach_windows_process_ranking(executor, payload, limit)
-        if payload.get("process_error") == "":
-            return
+
     payload["top_processes"] = []
-    payload["process_source"] = "ps"
+    payload["process_source"] = _failed_process_source(result)
     payload["process_error"] = result.error or "process ranking unavailable"
 
 
+def _failed_process_source(result: ToolResult) -> str:
+    if isinstance(result.data, dict):
+        source = result.data.get("source")
+        if isinstance(source, str) and source and source != "none":
+            return source
+    return "ps"
+
+
 def _attach_windows_process_ranking(executor: Any, payload: dict[str, Any], limit: int) -> None:
-    result = executor.run(_windows_process_argv(limit), timeout=10)
+    result = safe_run(executor, _windows_process_argv(limit), timeout=MEMORY_TIMEOUT)
     payload["process_source"] = "Get-Process"
     if not result.success:
         payload["top_processes"] = []
@@ -165,16 +172,6 @@ def _parse_windows_process_json(stdout: str) -> list[dict[str, Any]]:
             }
         )
     return processes
-
-
-def _should_try_windows_process_ranking(error: str | None) -> bool:
-    text = str(error or "").lower()
-    return (
-        "unknown option" in text
-        or "not recognized" in text
-        or "parameter cannot" in text
-        or "invalid option" in text
-    )
 
 
 def _number_from_payload(payload: dict[str, Any], *keys: str) -> float | None:

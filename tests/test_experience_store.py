@@ -60,11 +60,13 @@ def test_search_by_tags_returns_matching_records(tmp_path) -> None:
         tags=["semantic", "host"],
         created_at=datetime(2026, 4, 22, tzinfo=timezone.utc),
         memory_type=ExperienceMemoryType.SEMANTIC,
+        summary="Recorded host capability facts after env probe.",
     )
     newer = make_record(
         "mem-new",
         tags=["policy", "confirmation"],
         created_at=datetime(2026, 4, 23, tzinfo=timezone.utc),
+        summary="Refused unsafe request after risk evaluation.",
     )
     store.add(older)
     store.add(newer)
@@ -77,9 +79,13 @@ def test_search_by_tags_returns_matching_records(tmp_path) -> None:
 def test_recent_returns_newest_records_first_and_honors_limit(tmp_path) -> None:
     store = ExperienceStore(tmp_path / "experience.sqlite3")
     base = datetime(2026, 4, 23, tzinfo=timezone.utc)
-    store.add(make_record("mem-1", created_at=base))
-    store.add(make_record("mem-2", created_at=base + timedelta(minutes=1)))
-    store.add(make_record("mem-3", created_at=base + timedelta(minutes=2)))
+    store.add(make_record("mem-1", created_at=base, summary="Refused first unsafe request."))
+    store.add(
+        make_record("mem-2", created_at=base + timedelta(minutes=1), summary="Refused second unsafe request.")
+    )
+    store.add(
+        make_record("mem-3", created_at=base + timedelta(minutes=2), summary="Refused third unsafe request.")
+    )
 
     recent = store.recent(limit=2)
 

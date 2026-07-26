@@ -1,0 +1,18 @@
+# Store everything as LF in the repository and check it out as LF, so a
+# Windows clone with core.autocrlf=true cannot rewrite the tree.
+* text=auto eol=lf
+
+# The sudo wrapper scripts run on Linux targets. A CRLF checkout breaks them
+# with "bad interpreter: /usr/bin/env bash^M", so pin LF explicitly.
+*.sh text eol=lf
+
+# The PowerShell helpers are Windows-only.
+*.ps1 text eol=crlf
+
+# Never line-ending convert binary artefacts.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.sqlite3 binary

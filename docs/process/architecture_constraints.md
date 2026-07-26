@@ -66,6 +66,8 @@ Web 是主演示入口，CLI 是调试入口。
 - JSONL 审计；
 - 可查看最近操作记录。
 
+> **实现状态：未实现。** `app/audit/` 目前是空包，没有任何落盘或跨请求查询能力。当前每次请求的可审计信息只体现为响应内的证据链（`evidence_chain`，见 `app/models/evidence.py`），进程重启即丢失。本节是**目标**约束，不是既有架构，属于 P4-T01 / P4-T02 范围。任何提交材料都不得把它描述为已交付。
+
 ---
 
 ## 3. 必须做
@@ -142,18 +144,21 @@ MVP 必须完成：
 
 执行层只允许以下工具：
 
-| 工具名 | 类型 | 风险等级 | 说明 |
-|---|---|---|---|
-| env_probe_tool | 只读 | S0 | 探测系统环境 |
-| disk_usage_tool | 只读 | S0 | 查询磁盘 |
-| file_search_tool | 只读 | S0/S1 | 搜索文件，必须限制范围 |
-| process_query_tool | 只读 | S0 | 查询进程 |
-| port_query_tool | 只读 | S0 | 查询端口 |
-| create_user_tool | 写操作 | S1 | 创建普通用户，需确认 |
-| delete_user_tool | 写操作 | S2 | 删除普通用户，需强确认 |
-| audit_query_tool | 只读 | S0 | 查询审计日志 |
+| 工具名 | 类型 | 风险等级 | 说明 | 实现状态 |
+|---|---|---|---|---|
+| env_probe_tool | 只读 | S0 | 探测系统环境 | 已实现 `app/tools/env_probe.py` |
+| disk_usage_tool | 只读 | S0 | 查询磁盘 | 已实现 `app/tools/disk.py` |
+| memory_usage_tool | 只读 | S0 | 查询内存与进程内存占用 | 已实现 `app/tools/memory.py` |
+| file_search_tool | 只读 | S0/S1 | 搜索文件，必须限制范围 | 已实现 `app/tools/file_search.py` |
+| process_query_tool | 只读 | S0 | 查询进程 | 已实现 `app/tools/process.py` |
+| port_query_tool | 只读 | S0 | 查询端口 | 已实现 `app/tools/port.py` |
+| create_user_tool | 写操作 | S1 | 创建普通用户，需确认 | 已实现 `app/tools/user.py` |
+| delete_user_tool | 写操作 | S2 | 删除普通用户，需强确认 | 已实现 `app/tools/user.py` |
+| audit_query_tool | 只读 | S0 | 查询审计日志 | **未实现**：`app/policy/rules.py` 的 `READ_ONLY_INTENTS` 收录了 `audit_query_tool` / `query_audit` 意图，但 `app/tools/` 下没有对应模块。依赖尚未实现的审计层，属于 P4-T02 |
 
 不允许添加 `run_shell_tool`、`execute_command_tool`、`bash_tool` 等通用执行工具。
+
+白名单里出现但没有实现的条目不构成安全风险（调不到），但会让文档看起来夸大实现范围。新增或移除白名单条目时必须同步更新 `validation_matrix.md`。
 
 ---
 
@@ -422,9 +427,16 @@ Phase 3.6 的可信控制面、证据层与鲁棒闭环必须在既有安全边�
 
 ## 19. 待确认项
 
-- 是否统一使用 sudo wrapper；
-- SSH 密钥路径配置格式；
-- 是否启用真实 LLM；
-- 最终演示环境发行版；
-- 测试用户名前缀；
-- 是否允许在演示机器上真实 useradd/userdel。
+### 19.1 已确认（不要再当作待办）
+
+| 原待确认项 | 结论 | 依据 |
+|---|---|---|
+| 是否统一使用 sudo wrapper | 是。写操作只经 `scripts/guardedops_create_user.sh` / `scripts/guardedops_delete_user.sh`，wrapper 会用独立实现重做一遍用户名、保留名、UID 与当前登录用户校验 | `app/tools/user.py`；部署模型见 `../sudo_wrapper_deployment.md` |
+| 是否启用真实 LLM | 启用，但默认关闭且只作为意图候选来源。provider 为阿里云百炼 / DashScope Qwen3.6-Plus，OpenAI 兼容接口 | `app/llm/qwen_provider.py`、`app/config.py`；`../llm_provider_qwen.md` |
+| 是否允许在演示机器上真实 useradd/userdel | 允许，但只在可丢弃的测试机或容器上，且必须先满足 wrapper 权限前置条件 | `../local_smoke_test_linux.md` 第 7 节 |
+| 测试用户名前缀 | 演示统一使用 `demo_` 前缀（`demo_guest`、`demo_temp`） | `validation_matrix.md` 第 5 节 |
+
+### 19.2 仍待确认
+
+- SSH 密钥路径配置格式（`SSHConnectionConfig.key_filename` 目前只是一个字段，没有任何入口能填它）；
+- 最终演示环境发行版（建议 Ubuntu 22.04 / 24.04 或 openEuler）。

@@ -12,9 +12,23 @@ DEFAULT_LLM_TIMEOUT_SECONDS = 30
 DEFAULT_LLM_MAX_TOKENS = 1024
 DEFAULT_LLM_TEMPERATURE = 0.0
 
+MIN_LLM_TIMEOUT_SECONDS = 1
+MAX_LLM_TIMEOUT_SECONDS = 120
+MIN_LLM_MAX_TOKENS = 1
+MAX_LLM_MAX_TOKENS = 4096
+MIN_LLM_TEMPERATURE = 0.0
+MAX_LLM_TEMPERATURE = 1.0
+
 
 @dataclass(frozen=True)
 class AppConfig:
+    """Runtime configuration for the optional LLM intent-candidate path.
+
+    ``llm_allow_write_intents`` is an explicit opt-in. While it stays False the
+    LLM may only propose read-only intents; any write candidate it produces is
+    downgraded to an unknown write and refused at S3 by the policy engine.
+    """
+
     llm_enable: bool = False
     llm_provider: str = DEFAULT_LLM_PROVIDER
     llm_model: str = DEFAULT_LLM_MODEL
@@ -22,6 +36,7 @@ class AppConfig:
     llm_timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
     llm_max_tokens: int = DEFAULT_LLM_MAX_TOKENS
     llm_temperature: float = DEFAULT_LLM_TEMPERATURE
+    llm_allow_write_intents: bool = False
     dashscope_api_key_present: bool = False
 
 
@@ -35,17 +50,24 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         llm_timeout_seconds=_parse_int(
             source.get("GUARDEDOPS_LLM_TIMEOUT_SECONDS"),
             default=DEFAULT_LLM_TIMEOUT_SECONDS,
-            minimum=1,
+            minimum=MIN_LLM_TIMEOUT_SECONDS,
+            maximum=MAX_LLM_TIMEOUT_SECONDS,
         ),
         llm_max_tokens=_parse_int(
             source.get("GUARDEDOPS_LLM_MAX_TOKENS"),
             default=DEFAULT_LLM_MAX_TOKENS,
-            minimum=1,
+            minimum=MIN_LLM_MAX_TOKENS,
+            maximum=MAX_LLM_MAX_TOKENS,
         ),
         llm_temperature=_parse_float(
             source.get("GUARDEDOPS_LLM_TEMPERATURE"),
             default=DEFAULT_LLM_TEMPERATURE,
-            minimum=0.0,
+            minimum=MIN_LLM_TEMPERATURE,
+            maximum=MAX_LLM_TEMPERATURE,
+        ),
+        llm_allow_write_intents=_parse_bool(
+            source.get("GUARDEDOPS_LLM_ALLOW_WRITE_INTENTS"),
+            default=False,
         ),
         dashscope_api_key_present=bool(str(source.get("DASHSCOPE_API_KEY") or "").strip()),
     )
@@ -73,17 +95,19 @@ def _parse_bool(value: str | None, *, default: bool) -> bool:
     return default
 
 
-def _parse_int(value: str | None, *, default: int, minimum: int) -> int:
+def _parse_int(value: str | None, *, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(str(value).strip()) if value is not None else default
     except (TypeError, ValueError):
         return default
-    return parsed if parsed >= minimum else default
+    return parsed if minimum <= parsed <= maximum else default
 
 
-def _parse_float(value: str | None, *, default: float, minimum: float) -> float:
+def _parse_float(value: str | None, *, default: float, minimum: float, maximum: float) -> float:
     try:
         parsed = float(str(value).strip()) if value is not None else default
     except (TypeError, ValueError):
         return default
-    return parsed if parsed >= minimum else default
+    if parsed != parsed:
+        return default
+    return parsed if minimum <= parsed <= maximum else default

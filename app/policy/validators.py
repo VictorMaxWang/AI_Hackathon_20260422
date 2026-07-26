@@ -8,30 +8,6 @@ from app.policy.rules import SYSTEM_USERNAMES
 
 
 USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{2,31}$")
-DANGEROUS_USERNAME_TOKENS = (
-    " ",
-    "\t",
-    "\n",
-    "\r",
-    ";",
-    "/",
-    "\\",
-    "`",
-    "$(",
-    ")",
-    "*",
-    "?",
-    "[",
-    "]",
-    "{",
-    "}",
-    "|",
-    "&",
-    "<",
-    ">",
-    ",",
-    ":",
-)
 
 
 @dataclass(frozen=True)
@@ -63,14 +39,6 @@ def validate_username_with_reasons(username: Any) -> ValidationResult:
 
     if lowered in SYSTEM_USERNAMES:
         reasons.append(f"username {lowered} is reserved for system or privileged accounts")
-
-    if any(token in username for token in DANGEROUS_USERNAME_TOKENS):
-        reasons.append("username contains shell metacharacters or separators")
-
-    try:
-        username.encode("ascii")
-    except UnicodeEncodeError:
-        reasons.append("username must contain ASCII lowercase letters, digits, underscore, or hyphen only")
 
     if not USERNAME_PATTERN.fullmatch(stripped):
         reasons.append("username must match ^[a-z_][a-z0-9_-]{2,31}$")

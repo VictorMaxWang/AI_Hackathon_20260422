@@ -5,6 +5,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.agent.confirmation import (
+    CREATE_USER_CONFIRMATION_TEMPLATE,
+    DELETE_USER_CONFIRMATION_TEMPLATE,
+)
 from app.models import IntentTarget, ParsedIntent, RiskLevel
 from app.policy import evaluate
 
@@ -38,7 +42,7 @@ def test_create_user_requires_confirmation() -> None:
     assert decision.risk_level == RiskLevel.S1
     assert decision.allow is True
     assert decision.requires_confirmation is True
-    assert decision.confirmation_text == "Confirm creating normal user demo_guest"
+    assert decision.confirmation_text == CREATE_USER_CONFIRMATION_TEMPLATE.format(username="demo_guest")
     assert decision.safe_alternative is None
 
 
@@ -54,7 +58,7 @@ def test_delete_user_requires_strong_confirmation() -> None:
     assert decision.risk_level == RiskLevel.S2
     assert decision.allow is True
     assert decision.requires_confirmation is True
-    assert decision.confirmation_text == "Confirm deleting normal user demo_guest"
+    assert decision.confirmation_text == DELETE_USER_CONFIRMATION_TEMPLATE.format(username="demo_guest")
 
 
 def test_unknown_write_operation_denied() -> None:

@@ -38,11 +38,10 @@ class LocalExecutor(BaseExecutor):
                 duration_ms=self._duration_ms(started_at),
             )
         except subprocess.TimeoutExpired as exc:
-            stderr = exc.stderr or f"command timed out after {safe_timeout} seconds"
             return self._result(
                 argv=safe_argv,
                 stdout=exc.stdout,
-                stderr=stderr,
+                stderr=_timeout_stderr(exc.stderr, safe_timeout),
                 duration_ms=self._duration_ms(started_at),
                 timed_out=True,
             )
@@ -58,3 +57,14 @@ class LocalExecutor(BaseExecutor):
                 stderr=f"failed to execute command: {exc}",
                 duration_ms=self._duration_ms(started_at),
             )
+
+
+def _timeout_stderr(partial_stderr: str | bytes | None, timeout: int) -> str:
+    message = f"command timed out after {timeout} seconds"
+    if isinstance(partial_stderr, bytes):
+        text = partial_stderr.decode(errors="replace").strip()
+    else:
+        text = str(partial_stderr or "").strip()
+    if not text:
+        return message
+    return f"{message}\n{text}"

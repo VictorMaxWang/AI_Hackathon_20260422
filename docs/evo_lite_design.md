@@ -1,5 +1,7 @@
 # Evo-Lite Design
 
+> **状态：Phase 3.5 已完成。** T00 ~ T07 全部实现并有通过的测试，逐项对应见第 5 节。本文件保留原始设计意图，同时补上实现与验证的落点。
+
 ## 1. 定位
 
 Evo-Lite 是 GuardedOps 的 Phase 3.5：安全经验沉淀与自评估闭环。
@@ -58,28 +60,38 @@ Phase 3.5 的目标产物是设计与受控数据结构，不是业务执行代�
 
 ## 5. 任务映射
 
-| Task ID | 名称 | 输出边界 |
-|---|---|---|
-| P3.5-T00 | 更新总控文件以加入 Evo-Lite 阶段 | 只更新总控文件和设计说明 |
-| P3.5-T01 | Execution Evaluator | 评估记录，不触发执行 |
-| P3.5-T02 | Experience Store | 经验记录，不作为最终安全决策 |
-| P3.5-T03 | Reflection Generator | 反思文本和经验条目，不修改边界 |
-| P3.5-T04 | Safe Workflow Templates | 白名单工具模板，不生成脚本 |
-| P3.5-T05 | Workflow Retrieval in Planner | planner 建议，不绕过 policy |
-| P3.5-T06 | Evo-Lite Orchestrator Hook | 挂接评估和建议，不改变执行能力 |
-| P3.5-T07 | Safety Regression Benchmark | 安全回归验证 |
+| Task ID | 名称 | 输出边界 | 状态 | 实现与验证 |
+|---|---|---|---|---|
+| P3.5-T00 | 更新总控文件以加入 Evo-Lite 阶段 | 只更新总控文件和设计说明 | DONE | 本文件 + `process/` 下的总控文件 |
+| P3.5-T01 | Execution Evaluator | 评估记录，不触发执行 | DONE | `app/evolution/evaluator.py`；`tests/test_evaluator.py` |
+| P3.5-T02 | Experience Store | 经验记录，不作为最终安全决策 | DONE | `app/evolution/experience_store.py`；`tests/test_experience_store.py` |
+| P3.5-T03 | Reflection Generator | 反思文本和经验条目，不修改边界 | DONE | `app/evolution/reflection.py`；`tests/test_reflection.py` |
+| P3.5-T04 | Safe Workflow Templates | 白名单工具模板，不生成脚本 | DONE | `workflows/templates/*.json`；`tests/test_workflow_templates.py` |
+| P3.5-T05 | Workflow Retrieval in Planner | planner 建议，不绕过 policy | DONE | `app/evolution/workflows.py`；`tests/test_workflow_retrieval.py` |
+| P3.5-T06 | Evo-Lite Orchestrator Hook | 挂接评估和建议，不改变执行能力 | DONE | `app/evolution/init.py`；`tests/test_evo_lite_hook.py` |
+| P3.5-T07 | Safety Regression Benchmark | 安全回归验证 | DONE | `benchmarks/safety_regression.json`；`tests/test_safety_regression.py` |
+
+Phase 3.5 之后 Phase 3.6 又给 experience 加了隔离、去重和晋升门禁，见 `phase_3_6_design.md` 的 P3.6-T04。
 
 ---
 
 ## 6. 验证标准
 
-Phase 3.5 后续实现必须能证明：
+Phase 3.5 实现必须能证明下列各点，对应的断言已经落到测试里：
 
-- 没有新增通用 shell 工具；
-- 没有新增训练依赖；
-- 没有修改模型权重；
-- 没有自动修改 policy 或 executor；
-- workflow 中只出现白名单工具；
-- planner 使用 workflow 后仍会经过 policy；
-- reflection 只写入经验，不改变系统边界；
-- P3.5-T07 覆盖禁止 raw shell、禁止训练、禁止绕过 policy 的回归场景。
+| 要证明的事 | 断言它的测试 |
+|---|---|
+| 没有新增通用 shell 工具 | `tests/test_workflow_templates.py::test_templates_do_not_contain_shell_or_raw_command_content` |
+| workflow 中只出现白名单工具 | `tests/test_workflow_templates.py::test_templates_contain_allowed_tools_and_steps_stay_within_them` |
+| planner 使用 workflow 后仍会经过 policy | `tests/test_workflow_retrieval.py::test_workflow_derived_plan_does_not_execute_tools` |
+| reflection 只写入经验，不改变系统边界 | `tests/test_reflection.py::test_reflections_do_not_generate_dangerous_suggestions` |
+| hook 不把待确认状态改成已执行 | `tests/test_evo_lite_hook.py::test_s1_pending_confirmation_is_not_changed_to_execution` |
+| 经验存储失败不影响主请求 | `tests/test_evo_lite_hook.py::test_store_write_failure_does_not_break_main_request` |
+| 经验不落敏感字段或原始命令文本 | `tests/test_experience_store.py::test_sensitive_or_large_fields_are_not_saved` |
+| 回归覆盖禁止 raw shell / 禁止绕过 policy | `tests/test_safety_regression.py::test_all_safety_regression_cases_pass` |
+
+「没有新增训练依赖、没有修改模型权重」由 `pyproject.toml` 保证：运行时依赖只有 fastapi / uvicorn / pydantic / paramiko，没有任何训练框架。
+
+### 已知缺口
+
+`DEFAULT_TEMPLATE_DIR` 指向仓库根的 `workflows/templates/`，位于 `app` 包之外，因此不会被打进 wheel。从源码仓库运行不受影响，从 wheel 安装后调用默认模板目录会失败。见 `process/validation_matrix.md` 第 6 节。

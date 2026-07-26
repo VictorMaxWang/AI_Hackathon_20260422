@@ -339,12 +339,15 @@ Gemini 不直接改代码，除非明确要求。
 
 ## 12. 待确认项
 
-以下内容当前仍为待确认，不得假设为已完成事实：
+### 12.1 已确认（不要再当作待办）
+
+- **是否优先演示本地模式还是 SSH 模式**：只能演示本地模式。`SSHExecutor` 是库级能力，`app/api/chat.py` 与 `app/cli.py` 都硬编码 `LocalExecutor`，没有入口能构造 `SSHConnectionConfig`。
+- **是否启用真实 LLM API**：启用但默认关闭。DashScope / Qwen3.6-Plus，只提供意图候选，不参与 allow/deny。
+- **是否使用 sudo wrapper 脚本**：使用。见 `../sudo_wrapper_deployment.md`。
+- **演示服务器是否允许创建和删除测试用户**：允许，仅限可丢弃的测试机或容器，且需满足 wrapper 权限前置条件。
+
+### 12.2 仍待确认
 
 - 最终运行目标系统发行版；
-- 是否优先演示本地模式还是 SSH 模式；
-- 是否启用真实 LLM API；
-- 是否使用 sudo wrapper 脚本；
-- 演示服务器是否允许创建和删除测试用户；
 - 最终视频时长要求；
 - 最终提交平台格式要求。

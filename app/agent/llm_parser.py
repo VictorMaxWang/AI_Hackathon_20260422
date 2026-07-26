@@ -2,37 +2,34 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Final, Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from pydantic import ValidationError
 
+from app.agent.parser import _looks_like_privilege_escalation as rule_privilege_escalation
 from app.config import AppConfig, load_config
 from app.llm import LLMProvider, LLMRequest, QwenProvider
 from app.llm.prompts import build_intent_candidate_messages
-from app.models import IntentTarget, ParsedIntent
+from app.models import IntentTarget, ParsedIntent, RiskLevel
 from app.policy import evaluate as evaluate_policy
+from app.policy.rules import normalize_path
 
-
-LLM_PARSER_ENABLED: Final[bool] = False
 
 ALLOWED_LLM_PROVIDER = "aliyun_bailian"
-SUPPORTED_LLM_INTENTS = {
+READONLY_LLM_INTENTS = {
     "disk_usage": "query_disk_usage",
     "memory_usage": "query_memory_usage",
     "file_search": "search_files",
     "process_query": "query_process",
     "port_query": "query_port",
+}
+WRITE_LLM_INTENTS = {
     "create_user": "create_user",
     "delete_user": "delete_user",
 }
-READONLY_INTENTS = {
-    "query_disk_usage",
-    "query_memory_usage",
-    "search_files",
-    "query_process",
-    "query_port",
-}
-WRITE_INTENTS = {"create_user", "delete_user"}
+SUPPORTED_LLM_INTENTS = {**READONLY_LLM_INTENTS, **WRITE_LLM_INTENTS}
+READONLY_INTENTS = set(READONLY_LLM_INTENTS.values())
+WRITE_INTENTS = set(WRITE_LLM_INTENTS.values())
 INTENT_TOOL_WHITELIST = {
     "query_disk_usage": "disk_usage_tool",
     "query_memory_usage": "memory_usage_tool",
@@ -71,10 +68,30 @@ COMMAND_TEXT_RE = re.compile(
     r"&&|\|\||`|\$\("
     r")"
 )
+PRIVILEGE_SIGNAL_RE = re.compile(
+    r"(?i)(?:"
+    r"sudo|wheel|\broot\b|\badmin(?:istrator)?s?\b|superuser|super\s+user|"
+    r"privileg|elevat|escalat|"
+    r"full\s+(?:system|server|machine|root)?\s*access|all\s+permissions|unrestricted|"
+    r"提权|提升权限|管理员|超级用户|特权|最高权限|完全访问|全部权限|所有权限"
+    r")"
+)
 
+MAX_PATH_LENGTH = 512
+MAX_BASE_PATHS = 8
+MAX_USERNAME_LENGTH = 64
+MAX_KEYWORD_LENGTH = 64
+MAX_CONSTRAINT_KEYS = 24
+MAX_CONSTRAINT_TEXT_LENGTH = 240
+MAX_RISK_HINT_LENGTH = 120
+MAX_EXPLANATION_LENGTH = 240
+MAX_CONTEXT_REFS = 8
+MAX_CONTEXT_REF_LENGTH = 120
 
-class LLMParserNotEnabled(RuntimeError):
-    """Raised by future integrations if the LLM parser is called while disabled."""
+PRIVILEGE_REFUSAL_REASON = "请求疑似涉及提权，已按未知写操作最高风险处理"
+WRITE_DISABLED_REASON = "LLM 写操作候选默认禁用，已按未知写操作处理"
+HIGH_RISK_REASON = "LLM 将该请求标记为高风险候选"
+RISK_HINT_REASON = "LLM 输出带有风险提示，已按未知写操作处理"
 
 
 class LLMParserResult(TypedDict):
@@ -94,6 +111,10 @@ def parse_with_llm(
 
     The default path remains disabled. When enabled, all provider output is
     validated and failures return an empty candidate list for rule fallback.
+    A candidate is never allowed to widen the policy outcome: write intents
+    require the ``llm_allow_write_intents`` opt-in, any privilege signal in the
+    original request forces an unknown write, and every path must already be
+    absolute and normalized.
     """
 
     resolved_config = config or load_config()
@@ -137,6 +158,27 @@ def parse_with_llm(
         "candidates": [candidate.model_dump(mode="json")],
         "reason": "llm_candidate_validated",
     }
+
+
+def candidate_target_is_safe(candidate: Any) -> bool:
+    """Re-check the target invariant of an already-built intent candidate.
+
+    Callers that accept candidates from an injected parser function can use
+    this to reject smuggled paths without importing the validator internals.
+    """
+
+    if not isinstance(candidate, dict):
+        return False
+    target = candidate.get("target")
+    if target is None:
+        return True
+    if not isinstance(target, dict):
+        return False
+    try:
+        _normalized_target(target)
+    except ValueError:
+        return False
+    return True
 
 
 def _fallback(reason: str) -> LLMParserResult:
@@ -183,40 +225,57 @@ def _validated_candidate(
     llm_intent = str(payload.get("intent") or "").strip().lower()
     if llm_intent == "unsupported":
         return None
-    if llm_intent == "high_risk_request":
-        canonical_intent = "unknown"
-        requires_write = True
-    else:
-        canonical_intent = SUPPORTED_LLM_INTENTS.get(llm_intent)
-        if canonical_intent is None:
-            raise ValueError("LLM output contains unsupported intent")
-        candidate_requires_write = bool(payload.get("requires_write", False))
-        if canonical_intent in READONLY_INTENTS and candidate_requires_write:
-            raise ValueError("LLM marked a read-only intent as write")
-        requires_write = canonical_intent in WRITE_INTENTS
 
-    target_payload = payload.get("target") or {}
+    canonical_intent, requires_write, unsupported_reason = _resolved_intent(
+        llm_intent,
+        payload,
+        config,
+    )
+
+    target_payload = payload.get("target")
+    if target_payload is None:
+        target_payload = {}
     if not isinstance(target_payload, dict):
         raise ValueError("LLM target must be an object")
     normalized_target = _normalized_target(target_payload)
 
-    constraints_payload = payload.get("constraints") or {}
+    constraints_payload = payload.get("constraints")
+    if constraints_payload is None:
+        constraints_payload = {}
     if not isinstance(constraints_payload, dict):
         raise ValueError("LLM constraints must be an object")
-    constraints = dict(constraints_payload)
+    if len(constraints_payload) > MAX_CONSTRAINT_KEYS:
+        raise ValueError("LLM constraints contains too many keys")
+    constraints = _capped_constraints(constraints_payload)
+
+    risk_hint = _optional_text(payload.get("risk_hint"), max_length=MAX_RISK_HINT_LENGTH)
+    if risk_hint:
+        constraints["llm_risk_hint"] = risk_hint
+        if canonical_intent != "unknown" or not requires_write:
+            canonical_intent = "unknown"
+            requires_write = True
+            unsupported_reason = RISK_HINT_REASON
+
+    privileged_request = _looks_like_privilege_request(raw_user_input)
+    if privileged_request and (requires_write or canonical_intent not in READONLY_INTENTS):
+        canonical_intent = "unknown"
+        requires_write = True
+        unsupported_reason = PRIVILEGE_REFUSAL_REASON
+
     constraints["source"] = "llm_fallback"
     constraints["llm_provider"] = config.llm_provider
     constraints["llm_model"] = config.llm_model
     constraints["llm_intent"] = llm_intent
 
-    risk_hint = _optional_text(payload.get("risk_hint"), max_length=120)
-    if risk_hint:
-        constraints["llm_risk_hint"] = risk_hint
-    explanation = _optional_text(payload.get("explanation"), max_length=240)
+    explanation = _optional_text(payload.get("explanation"), max_length=MAX_EXPLANATION_LENGTH)
     if explanation:
         constraints["llm_explanation"] = explanation
-    if llm_intent == "high_risk_request":
-        constraints.setdefault("unsupported_reason", "LLM marked request as high-risk candidate")
+    if unsupported_reason:
+        constraints["unsupported_reason"] = unsupported_reason
+    if privileged_request and canonical_intent == "unknown":
+        constraints["danger_category"] = "privilege_escalation"
+        constraints["groups"] = ["sudo"]
+        constraints["privilege"] = "sudo"
 
     try:
         parsed = ParsedIntent(
@@ -235,30 +294,149 @@ def _validated_candidate(
     return parsed
 
 
+def _resolved_intent(
+    llm_intent: str,
+    payload: dict[str, Any],
+    config: AppConfig,
+) -> tuple[str, bool, str | None]:
+    if llm_intent == "high_risk_request":
+        return "unknown", True, HIGH_RISK_REASON
+
+    canonical_intent = SUPPORTED_LLM_INTENTS.get(llm_intent)
+    if canonical_intent is None:
+        raise ValueError("LLM output contains unsupported intent")
+
+    if canonical_intent in WRITE_INTENTS:
+        if not config.llm_allow_write_intents:
+            return "unknown", True, WRITE_DISABLED_REASON
+        return canonical_intent, True, None
+
+    if bool(payload.get("requires_write", False)):
+        raise ValueError("LLM marked a read-only intent as write")
+    return canonical_intent, False, None
+
+
+def _looks_like_privilege_request(raw_user_input: str) -> bool:
+    text = str(raw_user_input or "")
+    if not text:
+        return False
+    return bool(PRIVILEGE_SIGNAL_RE.search(text) or rule_privilege_escalation(text))
+
+
 def _normalized_target(target: dict[str, Any]) -> dict[str, Any]:
-    normalized = {
-        "username": target.get("username"),
-        "path": target.get("path"),
+    base_paths_payload = target.get("base_paths")
+    if base_paths_payload is None:
+        base_paths_payload = []
+    if not isinstance(base_paths_payload, list):
+        raise ValueError("LLM target.base_paths must be a list")
+    if len(base_paths_payload) > MAX_BASE_PATHS:
+        raise ValueError("LLM target.base_paths contains too many entries")
+
+    return {
+        "username": _guarded_text(
+            target.get("username"),
+            field="target.username",
+            max_length=MAX_USERNAME_LENGTH,
+        ),
+        "path": _guarded_path(target.get("path"), field="target.path", required=False),
         "port": target.get("port"),
         "pid": target.get("pid"),
-        "keyword": target.get("keyword"),
-        "base_paths": target.get("base_paths") or [],
+        "keyword": _guarded_text(
+            target.get("keyword"),
+            field="target.keyword",
+            max_length=MAX_KEYWORD_LENGTH,
+        ),
+        "base_paths": [
+            _guarded_path(item, field=f"target.base_paths[{index}]", required=True)
+            for index, item in enumerate(base_paths_payload)
+        ],
     }
-    if not isinstance(normalized["base_paths"], list):
-        raise ValueError("LLM target.base_paths must be a list")
-    return normalized
+
+
+def _guarded_path(value: Any, *, field: str, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise ValueError(f"LLM {field} must not be null")
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"LLM {field} must be a string")
+    if not value.strip():
+        raise ValueError(f"LLM {field} must not be empty")
+    if len(value) > MAX_PATH_LENGTH:
+        raise ValueError(f"LLM {field} is longer than {MAX_PATH_LENGTH} characters")
+    if value != value.strip():
+        raise ValueError(f"LLM {field} has surrounding whitespace")
+    if _has_control_characters(value):
+        raise ValueError(f"LLM {field} contains control characters")
+    if value.startswith("-"):
+        raise ValueError(f"LLM {field} must not start with an option dash")
+    if not value.startswith("/"):
+        raise ValueError(f"LLM {field} must be an absolute path")
+    if "//" in value:
+        raise ValueError(f"LLM {field} contains an empty path segment")
+    if normalize_path(value) != value:
+        raise ValueError(f"LLM {field} is not in normalized form")
+    return value
+
+
+def _guarded_text(value: Any, *, field: str, max_length: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"LLM {field} must be a string")
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > max_length:
+        raise ValueError(f"LLM {field} is longer than {max_length} characters")
+    if _has_control_characters(text):
+        raise ValueError(f"LLM {field} contains control characters")
+    return text
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(ord(char) < 32 or ord(char) == 127 for char in value)
+
+
+def _capped_constraints(constraints: dict[str, Any]) -> dict[str, Any]:
+    capped: dict[str, Any] = {}
+    for key, value in constraints.items():
+        capped[str(key)[:MAX_CONSTRAINT_TEXT_LENGTH]] = _capped_constraint_value(value)
+    return capped
+
+
+def _capped_constraint_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value[:MAX_CONSTRAINT_TEXT_LENGTH]
+    if isinstance(value, list):
+        return [_capped_constraint_value(item) for item in value[:MAX_BASE_PATHS]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:MAX_CONSTRAINT_TEXT_LENGTH]: _capped_constraint_value(item)
+            for key, item in list(value.items())[:MAX_CONSTRAINT_KEYS]
+        }
+    return value
 
 
 def _validate_policy_and_tool_boundary(parsed: ParsedIntent) -> None:
-    _ = evaluate_policy(parsed)
     if parsed.intent in READONLY_INTENTS and parsed.intent not in INTENT_TOOL_WHITELIST:
         raise ValueError("LLM candidate maps to no whitelisted read-only tool")
-    if parsed.intent in WRITE_INTENTS:
-        return
-    if parsed.intent == "unknown":
-        return
-    if parsed.intent not in READONLY_INTENTS:
+    if (
+        parsed.intent not in READONLY_INTENTS
+        and parsed.intent not in WRITE_INTENTS
+        and parsed.intent != "unknown"
+    ):
         raise ValueError("LLM candidate intent is outside the whitelist")
+
+    decision = evaluate_policy(parsed)
+    if not decision.allow:
+        return
+    if parsed.requires_write and not decision.requires_confirmation:
+        raise ValueError("LLM candidate is an allowed write without confirmation")
+    if decision.risk_level != RiskLevel.S0 and not decision.requires_confirmation:
+        raise ValueError("LLM candidate is allowed above S0 without confirmation")
+    if decision.risk_level == RiskLevel.S0 and parsed.intent not in INTENT_TOOL_WHITELIST:
+        raise ValueError("LLM candidate is S0-allowed outside the tool whitelist")
 
 
 def _reject_forbidden_content(value: Any, path: str = "$") -> None:
@@ -289,15 +467,23 @@ def _optional_text(value: Any, *, max_length: int) -> str | None:
 def _string_list(value: Any) -> list[str]:
     if value is None:
         return []
-    if not isinstance(value, list):
-        value = [value]
-    return [str(item).strip() for item in value if str(item).strip()]
+    items = value if isinstance(value, list) else [value]
+    result: list[str] = []
+    for item in items[:MAX_CONTEXT_REFS]:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            result.append(text[:MAX_CONTEXT_REF_LENGTH])
+    return result
 
 
 def _confidence(value: Any) -> float:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
+        return 0.0
+    if parsed != parsed:
         return 0.0
     if parsed < 0.0:
         return 0.0

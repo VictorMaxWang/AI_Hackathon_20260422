@@ -2,6 +2,18 @@
 
 GuardedOps can optionally use Alibaba Cloud Bailian / DashScope Qwen3.6-Plus through the OpenAI-compatible API. The provider is disabled by default and is only used as a fallback intent-candidate parser when the rule-based parser returns `unknown`.
 
+## Install the optional dependency
+
+The OpenAI SDK is **not** a default dependency. `app/llm/qwen_provider.py` imports it lazily and returns an `openai_dependency_missing` error if it is absent, so GuardedOps runs fine without it. Install it only when you actually want the LLM path:
+
+```bash
+pip install -e ".[llm]"
+```
+
+```powershell
+py -3.11 -m pip install -e ".[llm]"
+```
+
 ## Enable Qwen3.6-Plus
 
 ```bash
@@ -74,16 +86,25 @@ Expected behavior: even if LLM helps interpret the request, final policy must re
 
 ## Mock-Only Tests
 
-Default tests must not call the real DashScope API:
+Default tests must not call the real DashScope API. They pass without the `[llm]` extra installed, because the provider is exercised through an injected client:
 
 ```bash
-pytest tests/test_llm_config.py
-pytest tests/test_qwen_provider.py
-pytest tests/test_llm_parser_integration.py
+pip install -e ".[test]"
+pytest tests/test_llm_config.py tests/test_qwen_provider.py tests/test_llm_parser_integration.py -q
 ```
 
 Run the full suite:
 
 ```bash
-pytest
+pytest -q
 ```
+
+```powershell
+py -3.11 -m pytest -q
+```
+
+CI never calls the real API — see `.github/workflows/ci.yml`. There is deliberately no automated integration test against live DashScope; the smoke commands above are the manual substitute.
+
+## Prompt Contract
+
+The exact system prompt shipped to the model, and the JSON contract it must satisfy, are in [`core_prompt.md`](core_prompt.md). That document quotes `app/llm/prompts.py` verbatim so the two cannot drift.

@@ -1,12 +1,33 @@
+# Python bytecode
 __pycache__/
 *.pyc
-.venv/
-.env
-.pytest_cache/
-.DS_Store
-
 *.pyo
 *.pyd
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Build and packaging output
 build/
 dist/
 *.egg-info/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Scratch and replay output (never a submission artifact)
+tmp/
+*.sqlite3
+*.sqlite3-journal
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+IFS=$' \t\n'
+umask 022
+
 if [[ "$#" -ne 2 ]]; then
   echo "usage: guardedops_create_user.sh (--create-home|--no-create-home) <username>" >&2
   exit 64

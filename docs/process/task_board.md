@@ -26,7 +26,7 @@
 | Task ID | Phase | 任务名 | 目标 | 前置依赖 | 并行标记 | 并行组 | 状态 | 完成标准 |
 |---|---|---|---|---|---|---|---|---|
 | P0-T01 | Phase 0 | 初始化总控文件 | 创建管理文件体系 | 无 | SERIAL | G0 | DONE | 所有管理文件落盘 |
-| P0-T02 | Phase 0 | 初始化仓库骨架 | 创建基础目录、README、依赖文件 | P0-T01 | SERIAL | G0 | DONE | repo 可安装、结构清晰 |
+| P0-T02 | Phase 0 | 初始化仓库骨架 | 创建基础目录、README、依赖文件 | P0-T01 | SERIAL | G0 | DONE | repo 可安装：`pip install -e ".[test]"` 成功，`.github/workflows/ci.yml` 的 `package` job 会构建 wheel 并断言 `app/ui/*` 已打包 |
 | P0-T03 | Phase 0 | 建立任务执行规范 | 建立 Codex 执行和状态更新规范 | P0-T01 | PARALLEL | G0-DOC | DEFERRED | prompt 模板与状态更新规则可用；Phase 3.6 期间暂缓或低优先级 |
 | P1-T01 | Phase 1 | 核心数据模型 | 定义 Intent、PolicyDecision、CommandResult 等模型 | P0-T02 | SERIAL | G1-CORE | DONE | 模型可被导入，测试通过 |
 | P1-T02 | Phase 1 | Executor 底座 | 实现 BaseExecutor、LocalExecutor、SSHExecutor 骨架 | P1-T01 | SERIAL | G1-CORE | DONE | 本地 whoami/hostname 可执行 |
@@ -56,14 +56,14 @@
 | P3.5-T06 | Phase 3.5 | Evo-Lite Orchestrator Hook | 在 orchestrator 边界内挂接评估、经验和 workflow 建议 | P3.5-T01,P3.5-T02,P3.5-T03,P3.5-T05 | SERIAL | G3.5-ORCH | DONE | hook 不绕过确认、policy、executor 或审计流程 |
 | P3.5-T07 | Phase 3.5 | Safety Regression Benchmark | 建立 Evo-Lite 安全回归基准 | P3.5-T06 | SERIAL | G3.5-QA | DONE | 覆盖禁止训练、禁止 raw shell、禁止绕过 policy 的回归用例 |
 | P3.6-T00 | Phase 3.6 | 更新总控文件并加入 Phase 3.6 | 在总控体系中正式插入 Phase 3.6 及其任务链 | Phase 3.5 已完成 | SERIAL | G3.6-CONTROL | DONE | task_board、current_status、architecture_constraints、parallel_workstreams、decision_log、validation_matrix 已写入 Phase 3.6；docs/phase_3_6_design.md 可新增 |
-| P3.6-T01 | Phase 3.6 | Evidence Layer Schema & Explanation Card Backend | 建立解释卡与证据层统一 schema，并约束证据来源 | P3.6-T00 | SERIAL | G3.6-EVIDENCE | NOT_STARTED | 解释卡与证据层有统一 schema，证据优先来自 trace / state assertion / policy events |
-| P3.6-T02 | Phase 3.6 | Guarded Confirmation Token & Scope Binding | 让确认令牌与执行闭包、作用域和风险等级绑定 | P3.6-T01 | PARALLEL | G3.6-CONFIRM | NOT_STARTED | confirmation token 与执行闭包、作用域、风险等级绑定，不能脱离闭包复用 |
-| P3.6-T03 | Phase 3.6 | Step Contracts, Drift Revalidation & Checkpoint Resume | 为连续任务建立 step contract、漂移重校验与断点续跑约束 | P3.6-T01,P3.6-T02 | SERIAL | G3.6-RESUME | NOT_STARTED | 多步任务具备 step contract、漂移重校验、断点续跑与检查点恢复约束 |
-| P3.6-T04 | Phase 3.6 | Experience Governance Guardrails | 为 experience 建立隔离、去重和晋升门禁 | P3.6-T01 | PARALLEL | G3.6-GOVERN | NOT_STARTED | experience 具备隔离、去重、晋升门禁，不能直接成为 allow/deny 来源 |
-| P3.6-T05 | Phase 3.6 | Failure Recovery Taxonomy & Suggestion Engine | 将失败归类并输出受控恢复建议 | P3.6-T03,P3.6-T04 | SERIAL | G3.6-RECOVERY | NOT_STARTED | 失败被归类并给出受控恢复建议，不生成可执行 shell 脚本 |
-| P3.6-T06 | Phase 3.6 | Replayable Safety Regression & Red-Team Harness | 建立可重放的安全回归与红队验证框架 | P3.6-T05 | PARALLEL | G3.6-QA | NOT_STARTED | 安全回归可重放、可复现，覆盖 evidence / confirmation / drift / recovery 关键路径 |
-| P3.6-T07 | Phase 3.6 | Operator Control Panel UX I | 建设第一阶段可信控制面展示解释、证据与恢复信息 | P3.6-T05 | PARALLEL | G3.6-UX1 | NOT_STARTED | 控制面第一阶段可展示解释卡、证据来源、确认绑定、恢复建议 |
-| P3.6-T08 | Phase 3.6 | Operator Control Panel UX II | 建设第二阶段可信控制面展示 replay、blast radius 与 simulator | P3.6-T06,P3.6-T07 | SERIAL | G3.6-UX2 | NOT_STARTED | 控制面第二阶段补齐 replay、blast radius、policy simulator 等可信展示能力 |
+| P3.6-T01 | Phase 3.6 | Evidence Layer Schema & Explanation Card Backend | 建立解释卡与证据层统一 schema，并约束证据来源 | P3.6-T00 | SERIAL | G3.6-EVIDENCE | DONE | `app/models/evidence.py`；`tests/test_evidence_layer.py`全绿，其中 `test_explanation_card_key_sections_are_backed_by_valid_evidence_refs` 断言每个解释卡分节的 evidence_refs 都能在证据链中解析 |
+| P3.6-T02 | Phase 3.6 | Guarded Confirmation Token & Scope Binding | 让确认令牌与执行闭包、作用域和风险等级绑定 | P3.6-T01 | PARALLEL | G3.6-CONFIRM | DONE | `app/agent/confirmation.py`；`tests/test_confirmation_token.py`覆盖 host / target / policy_version / plan_hash / TTL 五类失配，全部不执行 |
+| P3.6-T03 | Phase 3.6 | Step Contracts, Drift Revalidation & Checkpoint Resume | 为连续任务建立 step contract、漂移重校验与断点续跑约束 | P3.6-T01,P3.6-T02 | SERIAL | G3.6-RESUME | DONE | `tests/test_step_contracts.py` + `tests/test_continuous_tasks.py`；`test_resume_fails_closed_when_revalidation_env_probe_is_unavailable` 断言重校验不可用时 fail-closed |
+| P3.6-T04 | Phase 3.6 | Experience Governance Guardrails | 为 experience 建立隔离、去重和晋升门禁 | P3.6-T01 | PARALLEL | G3.6-GOVERN | DONE | `app/evolution/experience_store.py`；`tests/test_experience_governance.py`，含 `test_new_experience_starts_in_quarantine` 与 `test_single_success_does_not_auto_promote` |
+| P3.6-T05 | Phase 3.6 | Failure Recovery Taxonomy & Suggestion Engine | 将失败归类并输出受控恢复建议 | P3.6-T03,P3.6-T04 | SERIAL | G3.6-RECOVERY | DONE | `app/agent/recovery.py`；`tests/test_recovery_engine.py`，含 `test_recovery_suggestions_never_cross_boundaries`（建议中不得出现可执行脚本） |
+| P3.6-T06 | Phase 3.6 | Replayable Safety Regression & Red-Team Harness | 建立可重放的安全回归与红队验证框架 | P3.6-T05 | PARALLEL | G3.6-QA | DONE | `benchmarks/safety_regression_v2.json` + `benchmarks/redteam_mutations.json`；`tests/test_replayable_regression.py::test_replayable_regression_cases_pass` 对 benchmark 里的每个 case_id 逐条参数化重放 |
+| P3.6-T07 | Phase 3.6 | Operator Control Panel UX I | 建设第一阶段可信控制面展示解释、证据与恢复信息 | P3.6-T05 | PARALLEL | G3.6-UX1 | DONE | `app/api/chat.py` 的 `operator_panel` 投影 + `app/ui/`；`tests/test_operator_panel_core.py`，含 `test_page_has_no_raw_shell_input_and_keeps_natural_language_entry` |
+| P3.6-T08 | Phase 3.6 | Operator Control Panel UX II | 建设第二阶段可信控制面展示 replay、blast radius 与 simulator | P3.6-T06,P3.6-T07 | SERIAL | G3.6-UX2 | DONE | `tests/test_operator_panel_preview.py`，含 `test_dangerous_refusal_exposes_policy_simulator_details` 与 `test_frontend_does_not_participate_in_allow_or_deny_decisions` |
 | P4-T01 | Phase 4 | 审计存储 | 实现 SQLite + JSONL 审计 | P1-T05,P2-T03 | SERIAL | G4-AUDIT | DEFERRED | 每次请求有完整审计；Phase 3.6 期间暂缓 |
 | P4-T02 | Phase 4 | 审计查询与导出 | 实现审计 API/UI 和导出 | P4-T01,P1-T07 | CONDITIONAL | G4-AUDIT | DEFERRED | 可查看和导出审计；Phase 3.6 期间暂缓 |
 | P4-T03 | Phase 4 | Demo 场景脚本 | 编写 6 个演示场景和验证步骤 | P3-T03,P4-T01 | PARALLEL | G4-DEMO | DEFERRED | demo_scenarios 可直接照录；Phase 3.6 期间暂缓 |
@@ -80,11 +80,11 @@
 
 ## 当前活跃任务
 
-- 当前阶段：Phase 3.6
-- 当前任务：P3.6-T00（已完成）
-- 当前主线：可信控制面、证据层与鲁棒闭环
-- 下一步建议：P3.6-T01
-- 当前阻塞：无业务实现阻塞；P4/P5 暂缓；P0-T03 暂缓或低优先级；不扩大系统能力边界
+- 当前阶段：Phase 3.6 已全部完成（P3.6-T00 ~ P3.6-T08 均为 DONE）
+- 当前任务：工程化收口——可安装性、CI、文档与实现一致性
+- 当前主线：让提交材料与真实实现完全对齐，不再扩大能力边界
+- 下一步建议：按 `docs/process/validation_matrix.md` 第 6 节的“未交付能力”逐项决定是实现还是明确放弃；P4/P5 是否恢复由总控决定
+- 当前阻塞：无业务实现阻塞；P4/P5 暂缓；P0-T03 暂缓或低优先级
 - 最新决策：DEC-P36-01 新增 Phase 3.6，优先建设可信控制面与证据层
 
 ---
@@ -94,6 +94,8 @@
 | 日期 | 更新人 | 更新内容 |
 |---|---|---|
 | 2026-04-22 | ChatGPT | 完成 P0-T01 总控管理文件体系初始化 |
-| 2026-04-22 | Codex | 完成 P0-T02 仓库骨架初始化；当前目录不是 Git 工作区，未提交或推送 |
+| 2026-04-22 | Codex | 完成 P0-T02 仓库骨架初始化 |
 | 2026-04-23 | Codex | 完成 P3.5-T00 总控文件更新，加入 Evo-Lite 阶段与任务编号 |
 | 2026-04-23 | Codex | 完成 P3.6-T00 总控文件更新，加入 Phase 3.6 阶段、任务链与设计说明 |
+| 2026-04-24 | Codex | 完成 P3.6-T01 ~ P3.6-T08 的实现与测试；仓库已初始化为 Git 工作区并推送到 `https://github.com/VictorMaxWang/AI_Hackathon_20260422` |
+| 2026-04-24 | Codex | 工程化收口：修复 `pyproject.toml` 打包发现、新增 `[test]`/`[llm]` extras、新增 LICENSE 与 GitHub Actions CI；管理文档迁入 `docs/process/`；任务状态按真实测试结果回填 |

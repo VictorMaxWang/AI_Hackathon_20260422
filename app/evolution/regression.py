@@ -82,6 +82,14 @@ ALLOWED_ENVIRONMENT_KEYS = frozenset(
         "tool_behavior",
     }
 )
+STATEFUL_ENVIRONMENT_KEYS = frozenset(
+    {
+        "executor",
+        "users",
+        "experience_store_seed",
+        "tool_behavior",
+    }
+)
 ALLOWED_BEFORE_TURN_KEYS = frozenset(
     {
         "set_executor",
@@ -939,6 +947,15 @@ def _apply_environment_assumptions(orchestrator: Any, assumptions: Any) -> None:
         handler(data)
         return
 
+    unsupported = sorted(STATEFUL_ENVIRONMENT_KEYS.intersection(data))
+    if data.get("expects_experience_store"):
+        unsupported = sorted({*unsupported, "expects_experience_store"})
+    if unsupported:
+        raise ValueError(
+            "orchestrator has no apply_replay_environment handler, so these "
+            f"environment_assumptions cannot be applied: {unsupported}"
+        )
+
     memory_data = data.get("memory") if isinstance(data.get("memory"), dict) else {}
     orchestrator.memory = AgentMemory(**memory_data)
 
@@ -1245,11 +1262,12 @@ def _run_evaluation_assertions(
     check_prefix: str,
 ) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
-    evaluation_input = deepcopy(dict(envelope))
     patch = expect.get("evaluation_input_patch")
     if isinstance(patch, dict):
-        evaluation_input = _deep_merge(evaluation_input, patch)
-    evaluation = evaluate_execution(evaluation_input).model_dump(mode="json")
+        evaluation_input = _deep_merge(deepcopy(dict(envelope)), patch)
+        evaluation = evaluate_execution(evaluation_input).model_dump(mode="json")
+    else:
+        evaluation = _pipeline_evaluation(envelope)
     actual_tags = {str(tag) for tag in evaluation.get("tags", [])}
 
     for key, expected in expect.items():
@@ -1491,18 +1509,18 @@ def _run_expectations(
             )
         elif key == "workflow_must_still_pause_on_confirmation":
             executed_write_tools = sorted(WRITE_TOOL_NAMES.intersection(_executed_tools(envelope)))
-            passed = (
-                bool(expected)
-                and _result_status(envelope) == "pending_confirmation"
+            actual = (
+                _result_status(envelope) == "pending_confirmation"
                 and bool(_risk(envelope).get("requires_confirmation"))
                 and not executed_write_tools
             )
             checks.append(
                 _check(
                     f"{check_prefix}.workflow_must_still_pause_on_confirmation",
-                    passed,
-                    "workflow-derived request must remain pending_confirmation and avoid "
-                    f"write execution, got status={_result_status(envelope)} "
+                    actual is bool(expected),
+                    "expected workflow_must_still_pause_on_confirmation="
+                    f"{bool(expected)}, got status={_result_status(envelope)} "
+                    f"requires_confirmation={bool(_risk(envelope).get('requires_confirmation'))} "
                     f"executed_write_tools={executed_write_tools}",
                 )
             )
@@ -1655,6 +1673,15 @@ def _is_skipped_execution(envelope: Mapping[str, Any]) -> bool:
         and not execution.get("steps")
         and not execution.get("results")
     )
+
+
+def _pipeline_evaluation(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Prefer the evaluation the pipeline actually emitted over a recomputed one."""
+
+    produced = _evo_lite(envelope).get("evaluation")
+    if isinstance(produced, dict) and produced:
+        return dict(produced)
+    return evaluate_execution(deepcopy(dict(envelope))).model_dump(mode="json")
 
 
 def _experience_record(orchestrator: Any, envelope: Mapping[str, Any]) -> Any:

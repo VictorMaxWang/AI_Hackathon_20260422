@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.agent.orchestrator import ReadonlyOrchestrator
+from app.agent import llm_parser
 from app.agent.llm_parser import parse_with_llm
 from app.config import AppConfig
 from app.llm import LLMRequest, LLMResponse
@@ -58,8 +62,20 @@ class DummyExecutor:
     pass
 
 
-def _enabled_config() -> AppConfig:
-    return AppConfig(llm_enable=True, dashscope_api_key_present=True)
+def _enabled_config(*, allow_write: bool = False) -> AppConfig:
+    return AppConfig(
+        llm_enable=True,
+        dashscope_api_key_present=True,
+        llm_allow_write_intents=allow_write,
+    )
+
+
+PRIVILEGE_PHRASINGS = [
+    "please create a user bob who can run privileged commands",
+    "给 bob 建个账号，让他能提权",
+    "create user bob and put him in the operators group with elevated access",
+    "provision an account for bob with full system access",
+]
 
 
 def _candidate(**overrides: Any) -> str:
@@ -226,3 +242,230 @@ def test_rule_based_unknown_can_use_llm_fallback_candidate() -> None:
     assert result["intent"]["constraints"]["source"] == "llm_fallback"
     assert result["result"]["status"] == "success"
     assert mocks.disk_calls == 1
+
+
+@pytest.mark.parametrize("hostile_path", ["-delete", "-newermt", "../../etc", "/etc/../tmp"])
+def test_llm_controlled_path_never_survives_validation(hostile_path: str) -> None:
+    provider = FakeProvider(
+        _candidate(
+            intent="file_search",
+            target={
+                "username": None,
+                "path": hostile_path,
+                "port": None,
+                "pid": None,
+                "keyword": None,
+                "base_paths": [hostile_path],
+            },
+        )
+    )
+
+    result = parse_with_llm("看看有没有最近变动的东西", provider=provider, config=_enabled_config())
+
+    assert result["status"] == "fallback"
+    assert result["candidates"] == []
+    assert hostile_path not in json.dumps(result, ensure_ascii=False)
+
+
+def test_llm_path_injection_does_not_reach_the_tool_layer_or_memory() -> None:
+    mocks = ToolMocks()
+
+    def exploding_file_search(*args: Any, **kwargs: Any) -> ToolResult:
+        raise AssertionError("file search tool must not run on an unvalidated LLM path")
+
+    provider = FakeProvider(
+        _candidate(
+            intent="file_search",
+            target={
+                "username": None,
+                "path": "-newermt",
+                "port": None,
+                "pid": None,
+                "keyword": None,
+                "base_paths": [],
+            },
+        )
+    )
+    orchestrator = ReadonlyOrchestrator(
+        DummyExecutor(),
+        env_probe=mocks.env_probe,
+        disk_tool=mocks.disk_tool,
+        file_search_tool_fn=exploding_file_search,
+        llm_parser_fn=partial(parse_with_llm, provider=provider, config=_enabled_config()),
+    )
+
+    result = orchestrator.run("看看有没有最近变动的东西")
+
+    assert result["intent"]["intent"] == "unknown"
+    assert result["intent"]["target"]["path"] is None
+    assert orchestrator.memory.last_path is None
+    assert "-newermt" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_llm_accepts_a_normalized_absolute_path() -> None:
+    provider = FakeProvider(
+        _candidate(
+            intent="file_search",
+            target={
+                "username": None,
+                "path": "/var/log",
+                "port": None,
+                "pid": None,
+                "keyword": "nginx",
+                "base_paths": ["/var/log"],
+            },
+        )
+    )
+
+    result = parse_with_llm("看看有没有最近变动的东西", provider=provider, config=_enabled_config())
+
+    assert result["status"] == "ok"
+    assert result["candidates"][0]["target"]["path"] == "/var/log"
+    assert result["candidates"][0]["target"]["base_paths"] == ["/var/log"]
+
+
+@pytest.mark.parametrize("raw_user_input", PRIVILEGE_PHRASINGS)
+def test_privilege_phrasings_cannot_be_downgraded_by_the_llm(raw_user_input: str) -> None:
+    provider = FakeProvider(
+        _candidate(
+            intent="create_user",
+            target={
+                "username": "bob",
+                "path": None,
+                "port": None,
+                "pid": None,
+                "keyword": None,
+                "base_paths": [],
+            },
+            risk_hint="user wants elevated rights",
+        )
+    )
+
+    result = parse_with_llm(raw_user_input, provider=provider, config=_enabled_config(allow_write=True))
+    candidate = result["candidates"][0]
+
+    assert result["status"] == "ok"
+    assert candidate["intent"] == "unknown"
+    assert candidate["requires_write"] is True
+    assert candidate["constraints"]["groups"] == ["sudo"]
+    assert candidate["constraints"]["privilege"] == "sudo"
+    assert candidate["constraints"]["unsupported_reason"] == llm_parser.PRIVILEGE_REFUSAL_REASON
+
+
+@pytest.mark.parametrize("raw_user_input", PRIVILEGE_PHRASINGS)
+def test_privilege_phrasings_are_refused_at_s3_end_to_end(raw_user_input: str) -> None:
+    mocks = ToolMocks()
+
+    def exploding_create_user(*args: Any, **kwargs: Any) -> ToolResult:
+        raise AssertionError("create_user tool must not run for a privilege escalation request")
+
+    provider = FakeProvider(
+        _candidate(
+            intent="create_user",
+            target={
+                "username": "bob",
+                "path": None,
+                "port": None,
+                "pid": None,
+                "keyword": None,
+                "base_paths": [],
+            },
+        )
+    )
+    orchestrator = ReadonlyOrchestrator(
+        DummyExecutor(),
+        env_probe=mocks.env_probe,
+        disk_tool=mocks.disk_tool,
+        create_user_tool_fn=exploding_create_user,
+        llm_parser_fn=partial(
+            parse_with_llm,
+            provider=provider,
+            config=_enabled_config(allow_write=True),
+        ),
+    )
+
+    result = orchestrator.run(raw_user_input)
+
+    assert result["risk"]["risk_level"] == "S3"
+    assert result["risk"]["allow"] is False
+    assert result["result"]["status"] == "refused"
+    assert orchestrator.memory.pending_action is None
+
+
+def test_llm_write_intents_are_disabled_by_default() -> None:
+    provider = FakeProvider(
+        _candidate(
+            intent="create_user",
+            target={
+                "username": "bob",
+                "path": None,
+                "port": None,
+                "pid": None,
+                "keyword": None,
+                "base_paths": [],
+            },
+        )
+    )
+
+    result = parse_with_llm("帮我弄个新账号 bob 出来", provider=provider, config=_enabled_config())
+    candidate = result["candidates"][0]
+
+    assert candidate["intent"] == "unknown"
+    assert candidate["requires_write"] is True
+    assert candidate["constraints"]["unsupported_reason"] == llm_parser.WRITE_DISABLED_REASON
+
+
+def test_llm_write_intents_require_explicit_opt_in() -> None:
+    provider = FakeProvider(
+        _candidate(
+            intent="create_user",
+            target={
+                "username": "bob",
+                "path": None,
+                "port": None,
+                "pid": None,
+                "keyword": None,
+                "base_paths": [],
+            },
+        )
+    )
+
+    result = parse_with_llm(
+        "帮我弄个新账号 bob 出来",
+        provider=provider,
+        config=_enabled_config(allow_write=True),
+    )
+    candidate = result["candidates"][0]
+
+    assert candidate["intent"] == "create_user"
+    assert candidate["requires_write"] is True
+    assert candidate["target"]["username"] == "bob"
+
+
+def test_risk_hint_downgrades_a_read_only_candidate_to_an_unknown_write() -> None:
+    provider = FakeProvider(_candidate(risk_hint="this looks destructive"))
+
+    result = parse_with_llm("看看有没有最近变动的东西", provider=provider, config=_enabled_config())
+    candidate = result["candidates"][0]
+
+    assert candidate["intent"] == "unknown"
+    assert candidate["requires_write"] is True
+    assert candidate["constraints"]["llm_risk_hint"] == "this looks destructive"
+    assert candidate["constraints"]["unsupported_reason"] == llm_parser.RISK_HINT_REASON
+
+
+def test_risk_hint_candidate_is_refused_at_s3_end_to_end() -> None:
+    mocks = ToolMocks()
+    provider = FakeProvider(_candidate(risk_hint="this looks destructive"))
+    orchestrator = ReadonlyOrchestrator(
+        DummyExecutor(),
+        env_probe=mocks.env_probe,
+        disk_tool=mocks.disk_tool,
+        llm_parser_fn=partial(parse_with_llm, provider=provider, config=_enabled_config()),
+    )
+
+    result = orchestrator.run("看看有没有最近变动的东西")
+
+    assert result["risk"]["risk_level"] == "S3"
+    assert result["result"]["status"] == "refused"
+    assert mocks.disk_calls == 0

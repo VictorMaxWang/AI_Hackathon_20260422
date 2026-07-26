@@ -20,12 +20,13 @@
 - 不允许绕过 policy engine
 - 不允许写未要求的业务能力
 
-必须读取的上下文文件：
+必须读取的上下文文件（都在 docs/process/）：
 - agent.md
 - project_context.md
 - architecture_constraints.md
 - current_status.md
 - task_board.md
+- validation_matrix.md（第 6 节：未交付能力）
 
 允许修改/新增文件：
 -
@@ -190,11 +191,12 @@
 - 执行层只允许白名单工具
 - 写操作必须确认和审计
 
-请先读取：
+请先读取 docs/process/ 下的：
 - agent.md
 - project_context.md
 - architecture_constraints.md
 - current_status.md
 - task_board.md
+- validation_matrix.md（第 6 节：未交付能力）
 然后只处理当前 Task，不要扩展 scope。
 ```

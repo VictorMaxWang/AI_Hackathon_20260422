@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import os
+import stat
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from app.models import CommandResult, ToolResult
 from app.policy.validators import validate_username_with_reasons
+from app.tools import safe_run
 
 
 CREATE_USER_TOOL_NAME = "create_user_tool"
 DELETE_USER_TOOL_NAME = "delete_user_tool"
 
-CREATE_USER_WRAPPER = "scripts/guardedops_create_user.sh"
-DELETE_USER_WRAPPER = "scripts/guardedops_delete_user.sh"
+WRAPPER_DIR = Path(__file__).resolve().parents[2] / "scripts"
+CREATE_USER_WRAPPER = (WRAPPER_DIR / "guardedops_create_user.sh").as_posix()
+DELETE_USER_WRAPPER = (WRAPPER_DIR / "guardedops_delete_user.sh").as_posix()
+GROUP_WORLD_WRITABLE = stat.S_IWGRP | stat.S_IWOTH
 
 LOOKUP_TIMEOUT = 5
 CURRENT_USER_TIMEOUT = 5
@@ -95,8 +101,17 @@ def create_user_tool(
             },
         )
 
+    wrapper_error = _wrapper_preflight(CREATE_USER_WRAPPER)
+    if wrapper_error is not None:
+        return _refused(
+            CREATE_USER_TOOL_NAME,
+            wrapper_error,
+            username,
+            {"create_home": create_home, "no_sudo": no_sudo, "wrapper": CREATE_USER_WRAPPER},
+        )
+
     home_flag = "--create-home" if create_home else "--no-create-home"
-    create_result = _run(
+    create_result = safe_run(
         executor,
         ["bash", CREATE_USER_WRAPPER, home_flag, username],
         timeout=USER_CHANGE_TIMEOUT,
@@ -186,7 +201,7 @@ def delete_user_tool(
             },
         )
 
-    current_user_result = _run(executor, ["id", "-un"], timeout=CURRENT_USER_TIMEOUT)
+    current_user_result = safe_run(executor, ["id", "-un"], timeout=CURRENT_USER_TIMEOUT)
     if not current_user_result.success:
         return _command_error(
             DELETE_USER_TOOL_NAME,
@@ -209,8 +224,21 @@ def delete_user_tool(
             },
         )
 
+    wrapper_error = _wrapper_preflight(DELETE_USER_WRAPPER)
+    if wrapper_error is not None:
+        return _refused(
+            DELETE_USER_TOOL_NAME,
+            wrapper_error,
+            username,
+            {
+                "remove_home": remove_home,
+                "current_user": current_user,
+                "wrapper": DELETE_USER_WRAPPER,
+            },
+        )
+
     home_flag = "--remove-home" if remove_home else "--keep-home"
-    delete_result = _run(
+    delete_result = safe_run(
         executor,
         ["bash", DELETE_USER_WRAPPER, home_flag, username],
         timeout=USER_CHANGE_TIMEOUT,
@@ -289,7 +317,7 @@ def _validate_tool_inputs(
 
 
 def _lookup_user(executor: Any, username: str) -> UserLookup:
-    result = _run(executor, ["getent", "passwd", username], timeout=LOOKUP_TIMEOUT)
+    result = safe_run(executor, ["getent", "passwd", username], timeout=LOOKUP_TIMEOUT)
     if result.success:
         record, parse_error = _parse_passwd_record(username, result.stdout)
         if parse_error is not None:
@@ -344,24 +372,25 @@ def _parse_int(value: str) -> int | None:
         return None
 
 
-def _run(executor: Any, argv: list[str], *, timeout: int) -> CommandResult:
-    try:
-        result = executor.run(argv, timeout=timeout)
-    except Exception as exc:
-        return CommandResult(
-            argv=argv,
-            stderr=f"executor failed: {exc}",
-            success=False,
-        )
+def _wrapper_preflight(wrapper_path: str) -> str | None:
+    candidate = Path(wrapper_path)
+    if not candidate.is_absolute():
+        return f"wrapper script path must be absolute: {wrapper_path}"
+    if not candidate.is_file():
+        return f"wrapper script is missing: {wrapper_path}"
 
-    if isinstance(result, CommandResult):
-        return result
+    if os.name != "posix":
+        return None
 
-    return CommandResult(
-        argv=argv,
-        stderr=f"executor returned unsupported result type: {type(result).__name__}",
-        success=False,
-    )
+    for target in (candidate, candidate.parent):
+        try:
+            mode = target.stat().st_mode
+        except OSError as exc:
+            return f"wrapper script could not be inspected: {exc}"
+        if mode & GROUP_WORLD_WRITABLE:
+            return f"wrapper script path {target} is group- or world-writable; refusing to run it"
+
+    return None
 
 
 def _first_nonempty_line(stdout: str) -> str:

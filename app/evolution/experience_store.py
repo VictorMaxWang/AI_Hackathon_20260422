@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import warnings
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -19,12 +20,79 @@ from app.models.policy import RiskLevel
 from app.models.result import ExecutionStatus
 
 
+EVIDENCE_REF_RE = re.compile(r"^(?:ev|as)-[A-Za-z0-9][A-Za-z0-9_.:-]{0,62}$")
+PROMOTION_MIN_EVIDENCE_REFS = 2
+PROMOTION_MIN_REQUEST_IDS = 2
+PROMOTION_RISK_ALLOWLIST: frozenset[RiskLevel] = frozenset({RiskLevel.S0, RiskLevel.S1})
+PROMOTION_BLOCKING_TAGS: frozenset[str] = frozenset({"high_risk_refusal"})
+
+
 class SensitiveExperienceError(ValueError):
     """Raised when an experience record contains data this store must not keep."""
 
 
 class GovernanceTransitionError(ValueError):
     """Raised when a governance transition violates deterministic guardrails."""
+
+
+def is_valid_evidence_ref(value: Any) -> bool:
+    """Return True when a string looks like a real evidence-chain reference.
+
+    The evidence chain only ever mints ``ev-*`` event ids and ``as-*`` state
+    assertion ids, so anything else cannot be traced back to recorded evidence
+    and must never count towards a governance transition.
+    """
+
+    return isinstance(value, str) and bool(EVIDENCE_REF_RE.match(value.strip()))
+
+
+def valid_evidence_refs(values: Iterable[str]) -> list[str]:
+    """Return the subset of refs that resolve to the evidence-chain id shape."""
+
+    return [str(value).strip() for value in values if is_valid_evidence_ref(value)]
+
+
+def provenance_request_ids(provenance: dict[str, Any]) -> list[str]:
+    """Return the deduplicated request ids recorded in a provenance payload."""
+
+    request_ids = provenance.get("request_ids")
+    if not isinstance(request_ids, list):
+        return []
+    merged: list[str] = []
+    for item in request_ids:
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in merged:
+            merged.append(cleaned)
+    return merged
+
+
+def passes_promotion_gate(record: ExperienceRecord) -> bool:
+    """Deterministic promotion gate for one experience record.
+
+    Kept as a module-level pure function so every policy condition can be
+    tested directly without a database.
+    """
+
+    if record.governance_status not in {
+        GovernanceStatus.VERIFIED,
+        GovernanceStatus.PROMOTED,
+    }:
+        return False
+    if record.memory_type != MemoryType.PROCEDURAL:
+        return False
+    if record.status != ExecutionStatus.SUCCESS:
+        return False
+    if record.risk_level not in PROMOTION_RISK_ALLOWLIST:
+        return False
+    if record.decay_score >= 1.0:
+        return False
+    if len(valid_evidence_refs(record.evidence_refs)) < PROMOTION_MIN_EVIDENCE_REFS:
+        return False
+    if len(provenance_request_ids(record.provenance)) < PROMOTION_MIN_REQUEST_IDS:
+        return False
+    if PROMOTION_BLOCKING_TAGS.intersection({tag.strip() for tag in record.tags}):
+        return False
+    return True
 
 
 class ExperienceStore:
@@ -45,7 +113,8 @@ class ExperienceStore:
         r"userdel\s+|curl\s+https?://|wget\s+https?://|bash\s+-c|sh\s+-c)\b"
     )
     _STREAM_MARKER_RE = re.compile(r"(?i)\b(stdout|stderr|command output|traceback)\b")
-    _PROMOTION_RISK_ALLOWLIST = {RiskLevel.S0, RiskLevel.S1}
+    _PROMOTION_RISK_ALLOWLIST = PROMOTION_RISK_ALLOWLIST
+    _SQLITE_TIMEOUT_SECONDS = 10.0
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -58,17 +127,15 @@ class ExperienceStore:
         self._reject_sensitive_record(candidate)
 
         with self._connect() as connection:
-            existing_row = None
-            if candidate.evidence_refs:
-                existing_row = connection.execute(
-                    """
-                    SELECT * FROM experience_records
-                    WHERE dedup_hash = ?
-                    ORDER BY created_at DESC, memory_id DESC
-                    LIMIT 1
-                    """,
-                    (candidate.dedup_hash,),
-                ).fetchone()
+            existing_row = connection.execute(
+                """
+                SELECT * FROM experience_records
+                WHERE dedup_hash = ?
+                ORDER BY created_at DESC, memory_id DESC
+                LIMIT 1
+                """,
+                (candidate.dedup_hash,),
+            ).fetchone()
 
             if existing_row is not None:
                 merged = self._merge_duplicate_records(self._row_to_record(existing_row), candidate)
@@ -78,13 +145,26 @@ class ExperienceStore:
             self._insert_record(connection, candidate)
         return candidate
 
-    def get(self, memory_id: str) -> ExperienceRecord | None:
+    def get(
+        self,
+        memory_id: str,
+        *,
+        include_expired: bool = False,
+    ) -> ExperienceRecord | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM experience_records WHERE memory_id = ?",
                 (memory_id,),
             ).fetchone()
-        return self._row_to_record(row) if row is not None else None
+        if row is None:
+            return None
+
+        record = self._safe_row_to_record(row)
+        if record is None:
+            return None
+        if not include_expired and self._is_expired(record):
+            return None
+        return record
 
     def search_by_tags(
         self,
@@ -92,24 +172,31 @@ class ExperienceStore:
         limit: int = 10,
         *,
         include_tombstoned: bool = False,
+        include_expired: bool = False,
     ) -> list[ExperienceRecord]:
         requested_tags = {tag.strip() for tag in tags if isinstance(tag, str) and tag.strip()}
         if not requested_tags or limit <= 0:
             return []
 
-        matches: list[ExperienceRecord] = []
-        query = "SELECT * FROM experience_records"
-        params: tuple[Any, ...] = ()
-        if not include_tombstoned:
-            query += " WHERE governance_status != ?"
-            params = (GovernanceStatus.TOMBSTONED.value,)
-        query += " ORDER BY created_at DESC, memory_id DESC"
+        conditions, params = self._read_filters(
+            include_tombstoned=include_tombstoned,
+            include_expired=include_expired,
+        )
+        tag_patterns = [f"%{json.dumps(tag, ensure_ascii=False)}%" for tag in sorted(requested_tags)]
+        conditions.append("(" + " OR ".join(["tags LIKE ?"] * len(tag_patterns)) + ")")
+        params.extend(tag_patterns)
+
+        query = (
+            "SELECT * FROM experience_records"
+            + self._where_clause(conditions)
+            + " ORDER BY created_at DESC, memory_id DESC"
+        )
 
         with self._connect() as connection:
-            rows = connection.execute(query, params).fetchall()
+            rows = connection.execute(query, tuple(params)).fetchall()
 
-        for row in rows:
-            record = self._row_to_record(row)
+        matches: list[ExperienceRecord] = []
+        for record in self._rows_to_records(rows):
             if requested_tags.intersection(record.tags):
                 matches.append(record)
                 if len(matches) >= limit:
@@ -121,21 +208,44 @@ class ExperienceStore:
         limit: int = 10,
         *,
         include_tombstoned: bool = False,
+        include_expired: bool = False,
     ) -> list[ExperienceRecord]:
         if limit <= 0:
             return []
 
-        query = "SELECT * FROM experience_records"
-        params: tuple[Any, ...] = ()
-        if not include_tombstoned:
-            query += " WHERE governance_status != ?"
-            params = (GovernanceStatus.TOMBSTONED.value,)
-        query += " ORDER BY created_at DESC, memory_id DESC LIMIT ?"
-        params = (*params, limit)
+        conditions, params = self._read_filters(
+            include_tombstoned=include_tombstoned,
+            include_expired=include_expired,
+        )
+        query = (
+            "SELECT * FROM experience_records"
+            + self._where_clause(conditions)
+            + " ORDER BY created_at DESC, memory_id DESC LIMIT ?"
+        )
+        params.append(limit)
 
         with self._connect() as connection:
-            rows = connection.execute(query, params).fetchall()
-        return [self._row_to_record(row) for row in rows]
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return self._rows_to_records(rows)
+
+    def purge_expired(self, *, now: datetime | None = None) -> list[str]:
+        """Delete every record whose retention window has elapsed."""
+
+        cutoff = self._utc_isoformat(now or datetime.now(timezone.utc))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT memory_id FROM experience_records "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (cutoff,),
+            ).fetchall()
+            expired_ids = [str(row["memory_id"]) for row in rows]
+            if expired_ids:
+                connection.execute(
+                    "DELETE FROM experience_records "
+                    "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                    (cutoff,),
+                )
+        return expired_ids
 
     def verify(
         self,
@@ -155,7 +265,14 @@ class ExperienceStore:
             if record.governance_status == GovernanceStatus.TOMBSTONED:
                 raise GovernanceTransitionError("tombstoned experiences cannot be verified")
 
-            merged_refs = self._merge_string_lists(record.evidence_refs, list(evidence_refs or []))
+            supplied_refs = [str(item).strip() for item in (evidence_refs or []) if str(item).strip()]
+            unverifiable = [item for item in supplied_refs if not is_valid_evidence_ref(item)]
+            if unverifiable:
+                raise GovernanceTransitionError(
+                    f"evidence_refs must reference evidence-chain ids, got {sorted(unverifiable)}"
+                )
+
+            merged_refs = self._merge_string_lists(record.evidence_refs, supplied_refs)
             if not merged_refs:
                 raise GovernanceTransitionError("verified experience requires evidence_refs")
 
@@ -174,6 +291,7 @@ class ExperienceStore:
                 }
             )
             updated = self._recompute_governance(updated)
+            self._reject_sensitive_record(updated)
             self._update_record(connection, updated)
             return updated
 
@@ -201,6 +319,7 @@ class ExperienceStore:
                 }
             )
             promoted = self._recompute_governance(promoted)
+            self._reject_sensitive_record(promoted)
             self._update_record(connection, promoted)
             return promoted
 
@@ -251,6 +370,9 @@ class ExperienceStore:
         return updated_records
 
     def tombstone(self, memory_id: str, *, reason: str | None = None) -> ExperienceRecord | None:
+        if reason:
+            self._reject_sensitive_text(reason)
+
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM experience_records WHERE memory_id = ?",
@@ -349,8 +471,26 @@ class ExperienceStore:
 
             rows = connection.execute("SELECT * FROM experience_records").fetchall()
             for row in rows:
-                normalized = self._prepare_loaded_record(self._row_to_record(row))
-                self._update_record(connection, normalized)
+                record = self._safe_row_to_record(row)
+                if record is None:
+                    self._quarantine_unreadable_row(connection, row)
+                    continue
+                normalized = self._prepare_loaded_record(record)
+                if normalized != record:
+                    self._update_record(connection, normalized)
+
+    def _quarantine_unreadable_row(self, connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+        memory_id = row["memory_id"] if "memory_id" in row.keys() else None
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            return
+        connection.execute(
+            """
+            UPDATE experience_records
+            SET governance_status = ?, promotion_gate_passed = 0, promoted_to_workflow = 0
+            WHERE memory_id = ?
+            """,
+            (GovernanceStatus.TOMBSTONED.value, memory_id),
+        )
 
     @staticmethod
     def _required_columns() -> dict[str, str]:
@@ -367,16 +507,69 @@ class ExperienceStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(
+            self.db_path,
+            timeout=self._SQLITE_TIMEOUT_SECONDS,
+            isolation_level=None,
+        )
         connection.row_factory = sqlite3.Row
         try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            connection.execute("COMMIT")
         finally:
             connection.close()
+
+    @staticmethod
+    def _where_clause(conditions: list[str]) -> str:
+        return " WHERE " + " AND ".join(conditions) if conditions else ""
+
+    def _read_filters(
+        self,
+        *,
+        include_tombstoned: bool,
+        include_expired: bool,
+        now: datetime | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if not include_tombstoned:
+            conditions.append("governance_status != ?")
+            params.append(GovernanceStatus.TOMBSTONED.value)
+        if not include_expired:
+            conditions.append("(expires_at IS NULL OR expires_at > ?)")
+            params.append(self._utc_isoformat(now or datetime.now(timezone.utc)))
+        return conditions, params
+
+    @staticmethod
+    def _is_expired(record: ExperienceRecord, *, now: datetime | None = None) -> bool:
+        if record.expires_at is None:
+            return False
+        return record.expires_at <= (now or datetime.now(timezone.utc))
+
+    def _rows_to_records(self, rows: Iterable[sqlite3.Row]) -> list[ExperienceRecord]:
+        records: list[ExperienceRecord] = []
+        for row in rows:
+            record = self._safe_row_to_record(row)
+            if record is not None:
+                records.append(record)
+        return records
+
+    @classmethod
+    def _safe_row_to_record(cls, row: sqlite3.Row) -> ExperienceRecord | None:
+        try:
+            return cls._row_to_record(row)
+        except Exception as exc:
+            warnings.warn(
+                f"experience store skipped an unreadable row: {exc}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
 
     def _insert_record(self, connection: sqlite3.Connection, record: ExperienceRecord) -> None:
         connection.execute(
@@ -544,35 +737,13 @@ class ExperienceStore:
             }
         )
 
-    def _passes_promotion_gate(self, record: ExperienceRecord) -> bool:
-        if record.governance_status not in {
-            GovernanceStatus.VERIFIED,
-            GovernanceStatus.PROMOTED,
-        }:
-            return False
-        if record.governance_status == GovernanceStatus.TOMBSTONED:
-            return False
-        if record.memory_type != MemoryType.PROCEDURAL:
-            return False
-        if record.status != ExecutionStatus.SUCCESS:
-            return False
-        if record.risk_level not in self._PROMOTION_RISK_ALLOWLIST:
-            return False
-        if record.decay_score >= 1.0:
-            return False
-        if len(record.evidence_refs) < 2:
-            return False
-        if len(self._provenance_request_ids(record.provenance)) < 2:
-            return False
-        if "high_risk_refusal" in {tag.strip() for tag in record.tags}:
-            return False
-        return True
+    @staticmethod
+    def _passes_promotion_gate(record: ExperienceRecord) -> bool:
+        return passes_promotion_gate(record)
 
-    def _provenance_request_ids(self, provenance: dict[str, Any]) -> list[str]:
-        request_ids = provenance.get("request_ids")
-        if not isinstance(request_ids, list):
-            return []
-        return self._merge_string_lists(request_ids, [])
+    @staticmethod
+    def _provenance_request_ids(provenance: dict[str, Any]) -> list[str]:
+        return provenance_request_ids(provenance)
 
     @classmethod
     def _row_to_record(cls, row: sqlite3.Row) -> ExperienceRecord:
@@ -601,9 +772,14 @@ class ExperienceStore:
             expires_at=cls._parse_datetime(row["expires_at"]),
         )
 
+    @classmethod
+    def _serialize_datetime(cls, value: datetime | None) -> str | None:
+        return cls._utc_isoformat(value) if value is not None else None
+
     @staticmethod
-    def _serialize_datetime(value: datetime | None) -> str | None:
-        return value.isoformat() if value is not None else None
+    def _utc_isoformat(value: datetime) -> str:
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return aware.astimezone(timezone.utc).isoformat()
 
     @staticmethod
     def _parse_datetime(value: str | None) -> datetime | None:

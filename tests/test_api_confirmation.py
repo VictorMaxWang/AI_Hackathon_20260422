@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.api.chat import get_executor
 from app.main import create_app
 from app.models import CommandResult
+from app.tools.user import CREATE_USER_WRAPPER
 
 
 def _result(
@@ -50,7 +51,7 @@ class MockExecutor:
 
         if argv == [
             "bash",
-            "scripts/guardedops_create_user.sh",
+            CREATE_USER_WRAPPER,
             "--create-home",
             "demo_guest",
         ]:
@@ -62,7 +63,7 @@ class MockExecutor:
 CREATE_USER_LOOKUP = ["getent", "passwd", "demo_guest"]
 CREATE_USER_COMMAND = [
     "bash",
-    "scripts/guardedops_create_user.sh",
+    CREATE_USER_WRAPPER,
     "--create-home",
     "demo_guest",
 ]
@@ -130,7 +131,7 @@ def test_api_no_sudo_create_user_pending_confirmation(raw_user_input: str) -> No
     assert "guardedops_demo" in payload["result"]["confirmation_text"]
     assert ["getent", "passwd", "guardedops_demo"] not in executor.calls
     assert not any(
-        call[:2] == ["bash", "scripts/guardedops_create_user.sh"]
+        call[:2] == ["bash", CREATE_USER_WRAPPER]
         for call in executor.calls
     )
 

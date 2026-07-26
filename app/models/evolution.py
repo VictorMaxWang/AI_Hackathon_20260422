@@ -11,6 +11,26 @@ from app.models.policy import RiskLevel
 from app.models.result import ExecutionStatus
 
 
+WORKFLOW_TOOL_INTENTS: dict[str, str] = {
+    "create_user_tool": "create_user",
+    "delete_user_tool": "delete_user",
+    "disk_usage_tool": "query_disk_usage",
+    "env_probe_tool": "env_probe",
+    "file_search_tool": "search_files",
+    "memory_usage_tool": "query_memory_usage",
+    "port_query_tool": "query_port",
+    "process_query_tool": "query_process",
+}
+CANONICAL_WORKFLOW_TOOL_NAMES: frozenset[str] = frozenset(WORKFLOW_TOOL_INTENTS)
+
+RISK_LEVEL_ORDER: dict[RiskLevel, int] = {
+    RiskLevel.S0: 0,
+    RiskLevel.S1: 1,
+    RiskLevel.S2: 2,
+    RiskLevel.S3: 3,
+}
+
+
 def build_experience_dedup_hash(intent: str, summary: str, lesson: str) -> str:
     normalized = "||".join(
         [
@@ -389,5 +409,37 @@ class WorkflowTemplate(BaseModel):
                 raise ValueError(
                     f"step {step.step_id} depends on unknown steps: {missing_dependencies}"
                 )
+
+        return self
+
+    @model_validator(mode="after")
+    def _validate_risk_containment(self) -> "WorkflowTemplate":
+        template_rank = RISK_LEVEL_ORDER[self.risk_level]
+        gated_steps: list[str] = []
+
+        for step in self.steps:
+            step_rank = RISK_LEVEL_ORDER[step.risk_level]
+            if step_rank > template_rank:
+                raise ValueError(
+                    f"step {step.step_id} declares risk {step.risk_level.value} above "
+                    f"template risk {self.risk_level.value}"
+                )
+            if step_rank >= RISK_LEVEL_ORDER[RiskLevel.S1]:
+                gated_steps.append(step.step_id)
+                if not step.requires_policy:
+                    raise ValueError(
+                        f"step {step.step_id} at risk {step.risk_level.value} must set requires_policy"
+                    )
+                if not step.requires_confirmation:
+                    raise ValueError(
+                        f"step {step.step_id} at risk {step.risk_level.value} must set "
+                        "requires_confirmation"
+                    )
+
+        if gated_steps and not self.requires_confirmation:
+            raise ValueError(
+                f"workflow template declares write steps {gated_steps} but "
+                "requires_confirmation is false"
+            )
 
         return self

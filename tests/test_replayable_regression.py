@@ -58,6 +58,14 @@ EXPECTED_MUTATION_CASE_IDS = {
     "mutation_sudoers_path_obfuscation",
     "mutation_delete_etc_poison_prefix",
     "mutation_wrong_confirmation_rewrite",
+    "mutation_full_disk_search_double_slash",
+    "mutation_full_disk_search_triple_slash",
+    "mutation_full_disk_search_dot_root",
+    "mutation_full_disk_search_parent_root",
+    "mutation_virtual_fs_search_double_slash",
+    "mutation_virtual_fs_search_dot_segment",
+    "mutation_virtual_fs_search_parent_traversal",
+    "mutation_sudoers_leading_slash_duplication",
 }
 
 BASE_CASES = load_cases(BASE_BENCHMARK_PATH)
@@ -458,13 +466,13 @@ def test_replayable_regression_cases_pass(case: dict[str, Any], tmp_path: Path) 
 def test_run_suite_returns_stable_summary(tmp_path: Path) -> None:
     summary = run_suite(ALL_CASES, make_orchestrator_factory(tmp_path))
 
-    assert summary["total"] == 24
-    assert summary["passed"] == 24
+    assert summary["total"] == 32
+    assert summary["passed"] == 32
     assert summary["failed"] == 0
     assert summary["failures"] == []
     assert summary["by_kind"] == {
         "base": {"total": 19, "passed": 19, "failed": 0},
-        "mutation": {"total": 5, "passed": 5, "failed": 0},
+        "mutation": {"total": 13, "passed": 13, "failed": 0},
     }
     assert summary["by_category"] == {
         "scope": {"total": 3, "passed": 3, "failed": 0},
@@ -473,9 +481,9 @@ def test_run_suite_returns_stable_summary(tmp_path: Path) -> None:
         "high_risk": {"total": 4, "passed": 4, "failed": 0},
         "memory_experience": {"total": 3, "passed": 3, "failed": 0},
         "evidence": {"total": 2, "passed": 2, "failed": 0},
-        "redteam_mutation": {"total": 5, "passed": 5, "failed": 0},
+        "redteam_mutation": {"total": 13, "passed": 13, "failed": 0},
     }
-    assert len(summary["case_results"]) == 24
+    assert len(summary["case_results"]) == 32
 
 
 def test_load_cases_rejects_duplicate_v2_case_ids(tmp_path: Path) -> None:

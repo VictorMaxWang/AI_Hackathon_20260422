@@ -55,7 +55,7 @@ def test_disk_usage_tool_returns_basic_structure() -> None:
     assert result.success is True
     assert result.tool_name == "disk_usage_tool"
     assert result.data["status"] == "ok"
-    assert result.data["count"] == 2
+    assert result.data["count"] == 1
     assert result.data["filesystems"][0] == {
         "filesystem": "/dev/sda1",
         "type": "ext4",
@@ -65,21 +65,21 @@ def test_disk_usage_tool_returns_basic_structure() -> None:
         "use_percent": "42%",
         "mounted_on": "/",
     }
+    assert result.data["pseudo_count"] == 1
+    assert result.data["pseudo_filesystems"][0]["mounted_on"] == "/run"
     assert executor.calls == [(["df", "-hT"], 10)]
 
 
-def test_file_search_tool_searches_temp_directory(tmp_path: Path) -> None:
-    base_path = tmp_path / "logs"
-    base_path.mkdir()
-    matched_file = base_path / "app.log"
-    matched_file.write_text("ok", encoding="utf-8")
+def test_file_search_tool_searches_bounded_directory() -> None:
+    base_path = "/var/log/demo"
+    matched_file = f"{base_path}/app.log"
 
     stdout = f"{matched_file}\tapp.log\t2\t1713772800.0\n"
     executor = MockExecutor([command_result(["find"], stdout=stdout)])
 
     result = file_search_tool(
         executor,
-        str(base_path),
+        base_path,
         name_contains="app",
         modified_within_days=7,
     )
@@ -88,12 +88,14 @@ def test_file_search_tool_searches_temp_directory(tmp_path: Path) -> None:
     assert result.data["status"] == "ok"
     assert result.data["count"] == 1
     assert result.data["truncated"] is False
-    assert result.data["results"][0]["path"] == str(matched_file)
+    assert result.data["partial"] is False
+    assert result.data["warnings"] == []
+    assert result.data["results"][0]["path"] == matched_file
     assert result.data["results"][0]["name"] == "app.log"
     argv, timeout = executor.calls[0]
     assert argv == [
         "find",
-        str(base_path),
+        base_path,
         "-maxdepth",
         "4",
         "-type",
@@ -108,18 +110,17 @@ def test_file_search_tool_searches_temp_directory(tmp_path: Path) -> None:
     assert timeout == 15
 
 
-def test_file_search_tool_enforces_max_results_and_max_depth(tmp_path: Path) -> None:
-    base_path = tmp_path / "data"
-    base_path.mkdir()
+def test_file_search_tool_enforces_max_results_and_max_depth() -> None:
+    base_path = "/var/log/data"
     stdout = "".join(
-        f"{base_path / f'file-{index}.txt'}\tfile-{index}.txt\t{index}\t17137728{index}.0\n"
+        f"{base_path}/file-{index}.txt\tfile-{index}.txt\t{index}\t17137728{index}.0\n"
         for index in range(52)
     )
     executor = MockExecutor([command_result(["find"], stdout=stdout)])
 
     result = file_search_tool(
         executor,
-        str(base_path),
+        base_path,
         max_results=500,
         max_depth=99,
     )
@@ -148,8 +149,8 @@ def test_file_search_tool_refuses_dangerous_ranges_without_executor_call() -> No
 def test_process_query_tool_returns_basic_structure() -> None:
     stdout = "\n".join(
         [
-            "123 root 12.5 1.0 python python app.py",
-            "456 app 2.0 8.5 postgres postgres: writer",
+            "123 root 12.5 1.0 524288 python python app.py",
+            "456 app 2.0 8.5 131072 postgres postgres: writer",
         ]
     )
     executor = MockExecutor([command_result(["ps"], stdout=stdout)])
@@ -166,11 +167,13 @@ def test_process_query_tool_returns_basic_structure() -> None:
         "user": "root",
         "cpu_percent": 12.5,
         "memory_percent": 1.0,
+        "memory_bytes": 524288 * 1024,
         "command": "python",
         "args": "python app.py",
     }
     argv, timeout = executor.calls[0]
     assert argv[:2] == ["ps", "-eo"]
+    assert "rss=" in argv
     assert "--sort=-pcpu" in argv
     assert timeout == 10
 
@@ -235,8 +238,8 @@ def test_memory_usage_tool_parses_linux_meminfo_and_process_ranking() -> None:
     )
     ps_output = "\n".join(
         [
-            "123 root 3.5 12.0 postgres postgres: writer",
-            "456 demo 2.0 7.5 python python app.py",
+            "123 root 3.5 12.0 2097152 postgres postgres: writer",
+            "456 demo 2.0 7.5 1048576 python python app.py",
         ]
     )
     executor = MockExecutor(
@@ -259,6 +262,7 @@ def test_memory_usage_tool_parses_linux_meminfo_and_process_ranking() -> None:
     assert result.data["process_error"] == ""
     assert result.data["top_processes"][0]["command"] == "postgres"
     assert result.data["top_processes"][0]["memory_percent"] == 12.0
+    assert result.data["top_processes"][0]["memory_bytes"] == 2097152 * 1024
     assert executor.calls[0] == (["cat", "/proc/meminfo"], 10)
     assert executor.calls[1][0][:2] == ["ps", "-eo"]
     assert "--sort=-pmem" in executor.calls[1][0]

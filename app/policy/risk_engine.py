@@ -6,31 +6,42 @@ from app.models import ParsedIntent, PolicyDecision, RiskLevel
 from app.policy.rules import (
     CONFIRM_CREATE_USER,
     CONFIRM_DELETE_USER,
-    CREATE_USER_INTENTS,
-    DELETE_USER_INTENTS,
-    PRIVILEGED_GROUPS,
-    READ_ONLY_INTENTS,
+    CREATE_USER_INTENT,
+    DELETE_USER_INTENT,
+    GROUP_CONSTRAINT_KEYS,
     SAFE_ALTERNATIVES,
     contains_destructive_word,
     contains_write_word,
+    has_privileged_group,
+    is_canonical_read_only_intent,
     is_deep_search_refused_path,
+    is_privileged_group,
     is_protected_path,
     is_same_or_child_path,
+    is_search_intent,
     is_sshd_config_path,
     is_sudoers_path,
     normalize_intent_name,
+    normalize_path,
 )
 from app.policy.validators import validate_username_with_reasons
 
 
-def evaluate(
-    intent: ParsedIntent | dict[str, Any],
-    env: Any | None = None,
-    memory: Any | None = None,
-) -> PolicyDecision:
-    """Evaluate a structured intent and return the code-level policy decision."""
+TARGET_LIFTED_KEYS = ("username", "path")
+CONSTRAINT_LIFTED_KEYS = (
+    *GROUP_CONSTRAINT_KEYS,
+    "base_path",
+    "base_paths",
+    "bulk",
+    "privilege",
+    "recursive",
+    "role",
+)
+TRUTHY_FLAG_VALUES = frozenset({"1", "true", "yes", "y", "on", "r", "-r", "--recursive", "recursive"})
 
-    del env, memory
+
+def evaluate(intent: ParsedIntent | dict[str, Any]) -> PolicyDecision:
+    """Evaluate a structured intent and return the code-level policy decision."""
 
     data = _IntentData.from_input(intent)
     intent_name = normalize_intent_name(data.intent)
@@ -40,7 +51,7 @@ def evaluate(
     if path_decision is not None:
         return path_decision
 
-    if _requests_privilege_escalation(data):
+    if _requests_privilege_escalation(data, intent_name):
         return _deny_s3(
             [
                 "request would grant sudo, wheel, admin, or root privileges",
@@ -58,7 +69,7 @@ def evaluate(
             SAFE_ALTERNATIVES["bulk_permission"],
         )
 
-    if intent_name in CREATE_USER_INTENTS:
+    if intent_name == CREATE_USER_INTENT:
         username = data.username
         validation = validate_username_with_reasons(username)
         if not validation.valid:
@@ -75,7 +86,7 @@ def evaluate(
             safe_alternative=None,
         )
 
-    if intent_name in DELETE_USER_INTENTS:
+    if intent_name == DELETE_USER_INTENT:
         username = data.username
         validation = validate_username_with_reasons(username)
         if not validation.valid:
@@ -96,7 +107,7 @@ def evaluate(
 
     if _is_read_only(data, intent_name):
         reasons.append("recognized read-only operation")
-        if intent_name == "search_files":
+        if is_search_intent(intent_name):
             reasons.append("file search must remain bounded by max_depth and max_results")
         return PolicyDecision(
             risk_level=RiskLevel.S0,
@@ -116,13 +127,12 @@ def evaluate(
             SAFE_ALTERNATIVES["unknown_write"],
         )
 
-    return PolicyDecision(
-        risk_level=RiskLevel.S0,
-        allow=False,
-        requires_confirmation=False,
-        confirmation_text=None,
-        reasons=_dedupe_reasons(["unsupported read-only operation"]),
-        safe_alternative=None,
+    return _deny_s3(
+        [
+            "operation is not on the read-only whitelist",
+            "unrecognized operations are denied by default",
+        ],
+        SAFE_ALTERNATIVES["unknown_operation"],
     )
 
 
@@ -174,11 +184,11 @@ class _IntentData:
             intent=str(value.get("intent") or value.get("operation") or value.get("action") or "unknown"),
             target={
                 **target,
-                **{key: value[key] for key in ("username", "path") if key in value},
+                **{key: value[key] for key in TARGET_LIFTED_KEYS if key in value},
             },
             constraints={
                 **constraints,
-                **{key: value[key] for key in ("groups", "recursive", "bulk", "base_path") if key in value},
+                **{key: value[key] for key in CONSTRAINT_LIFTED_KEYS if key in value},
             },
             requires_write=bool(value.get("requires_write", False)),
             raw_user_input=value.get("raw_user_input"),
@@ -196,12 +206,27 @@ class _IntentData:
 
     @property
     def base_paths(self) -> list[str]:
-        values = self.target.get("base_paths") or self.constraints.get("base_paths") or []
-        if isinstance(values, str):
-            return [values]
-        if not isinstance(values, list):
-            return []
-        return [value for value in values if isinstance(value, str)]
+        paths: list[str] = []
+        for source in (self.target.get("base_paths"), self.constraints.get("base_paths")):
+            paths.extend(_string_list(source))
+        return paths
+
+    @property
+    def group_values(self) -> list[Any]:
+        values: list[Any] = []
+        for container in (self.constraints, self.target):
+            for key in GROUP_CONSTRAINT_KEYS:
+                if key in container:
+                    values.append(container[key])
+        return values
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [item for item in value if isinstance(item, str)]
+    return []
 
 
 def _evaluate_path_rules(data: _IntentData, intent_name: str) -> PolicyDecision | None:
@@ -225,7 +250,18 @@ def _evaluate_path_rules(data: _IntentData, intent_name: str) -> PolicyDecision 
             SAFE_ALTERNATIVES["sshd_config"],
         )
 
-    if intent_name == "search_files":
+    if not paths:
+        return None
+
+    if _is_read_only(data, intent_name):
+        if any(not _is_absolute_path(path) for path in paths):
+            return _deny_s3(
+                [
+                    "read-only scope must be an absolute path",
+                    "relative paths cannot be bounded by policy",
+                ],
+                SAFE_ALTERNATIVES["full_disk_search"],
+            )
         if any(is_same_or_child_path(path, "/") for path in paths):
             return _deny_s3(
                 [
@@ -244,29 +280,34 @@ def _evaluate_path_rules(data: _IntentData, intent_name: str) -> PolicyDecision 
             )
         return None
 
-    if paths and (data.requires_write or contains_write_word(intent_name)):
-        if any(is_same_or_child_path(path, "/etc") and contains_destructive_word(intent_name) for path in paths):
-            return _deny_s3(
-                [
-                    "deleting or destructively modifying /etc is forbidden",
-                    "/etc contains core system configuration",
-                ],
-                SAFE_ALTERNATIVES["protected_path"],
-            )
-        if any(is_protected_path(path) for path in paths):
-            return _deny_s3(
-                [
-                    "write operation targets a protected system path",
-                    "core directories are denied by policy",
-                ],
-                SAFE_ALTERNATIVES["protected_path"],
-            )
+    if any(is_same_or_child_path(path, "/etc") and contains_destructive_word(intent_name) for path in paths):
+        return _deny_s3(
+            [
+                "deleting or destructively modifying /etc is forbidden",
+                "/etc contains core system configuration",
+            ],
+            SAFE_ALTERNATIVES["protected_path"],
+        )
+
+    if any(is_protected_path(path) for path in paths):
+        return _deny_s3(
+            [
+                "operation targets a protected system path",
+                "core directories are denied by policy",
+            ],
+            SAFE_ALTERNATIVES["protected_path"],
+        )
 
     return None
 
 
+def _is_absolute_path(path: str) -> bool:
+    normalized = normalize_path(path)
+    return bool(normalized and normalized.startswith("/"))
+
+
 def _paths_for_policy(data: _IntentData) -> list[str]:
-    paths = []
+    paths: list[str] = []
     if data.path:
         paths.append(data.path)
     paths.extend(data.base_paths)
@@ -274,27 +315,20 @@ def _paths_for_policy(data: _IntentData) -> list[str]:
 
 
 def _is_read_only(data: _IntentData, intent_name: str) -> bool:
-    return not data.requires_write and intent_name in READ_ONLY_INTENTS
+    return not data.requires_write and is_canonical_read_only_intent(intent_name)
 
 
-def _requests_privilege_escalation(data: _IntentData) -> bool:
-    raw_groups = data.constraints.get("groups") or data.constraints.get("add_groups") or []
-    if isinstance(raw_groups, str):
-        groups = {raw_groups.strip().lower()}
-    elif isinstance(raw_groups, list):
-        groups = {str(group).strip().lower() for group in raw_groups}
-    else:
-        groups = set()
+def _requests_privilege_escalation(data: _IntentData, intent_name: str) -> bool:
+    if any(has_privileged_group(value) for value in data.group_values):
+        return True
 
-    role = str(data.constraints.get("role") or "").strip().lower()
-    privilege = str(data.constraints.get("privilege") or "").strip().lower()
+    role = data.constraints.get("role")
+    privilege = data.constraints.get("privilege")
     username = str(data.username or "").strip().lower()
-    intent_name = normalize_intent_name(data.intent)
 
     return bool(
-        groups & PRIVILEGED_GROUPS
-        or role in PRIVILEGED_GROUPS
-        or privilege in PRIVILEGED_GROUPS
+        is_privileged_group(role)
+        or is_privileged_group(privilege)
         or username == "root"
         or "sudo" in intent_name
         or "root_permission" in intent_name
@@ -302,13 +336,28 @@ def _requests_privilege_escalation(data: _IntentData) -> bool:
     )
 
 
+def _is_truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in TRUTHY_FLAG_VALUES
+    return False
+
+
 def _is_bulk_permission_change(data: _IntentData, intent_name: str) -> bool:
-    is_permission_change = "chmod" in intent_name or "chown" in intent_name or "permission" in intent_name
+    is_permission_change = (
+        "chmod" in intent_name
+        or "chown" in intent_name
+        or "chgrp" in intent_name
+        or "permission" in intent_name
+    )
     return bool(
         is_permission_change
         and (
-            data.constraints.get("bulk") is True
-            or data.constraints.get("recursive") is True
+            _is_truthy_flag(data.constraints.get("bulk"))
+            or _is_truthy_flag(data.constraints.get("recursive"))
             or "bulk" in intent_name
             or "recursive" in intent_name
         )

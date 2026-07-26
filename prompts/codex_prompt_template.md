@@ -30,7 +30,7 @@ GuardedOps 是 AI Hackathon 2026《操作系统智能代理》的项目，目标
 本轮禁止做：
 - 不允许实现 arbitrary shell / raw command mode
 - 不允许新增未要求的业务能力
-- 不允许改变 architecture_constraints.md 中的边界
+- 不允许改变 docs/process/architecture_constraints.md 中的边界
 - 不允许让 Prompt 承担最终风控边界
 - 不允许使用 shell=True 执行用户可控字符串
 - 不允许修改未列出的文件
@@ -38,11 +38,12 @@ GuardedOps 是 AI Hackathon 2026《操作系统智能代理》的项目，目标
 - 不允许扩大任务范围
 
 必须读取的上下文：
-- agent.md
-- project_context.md
-- architecture_constraints.md
-- current_status.md
-- task_board.md
+- docs/process/agent.md
+- docs/process/project_context.md
+- docs/process/architecture_constraints.md
+- docs/process/current_status.md
+- docs/process/task_board.md
+- docs/process/validation_matrix.md（第 6 节：哪些能力还没实现，不要当它存在）
 
 允许新增/修改的文件：
 <列出文件或目录>

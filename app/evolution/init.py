@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from app.agent.memory import AgentMemory
 from app.evolution.evaluator import evaluate_execution
 from app.evolution.experience_store import ExperienceStore
 from app.evolution.reflection import generate_reflection
@@ -13,11 +12,14 @@ from app.models.evolution import EvaluationResult, ExperienceRecord, ReflectionR
 from app.models.policy import RiskLevel
 from app.models.result import ExecutionStatus
 
+if TYPE_CHECKING:
+    from app.agent.memory import AgentMemory
+
 
 def apply_evo_lite_hook(
     envelope: Mapping[str, Any],
     *,
-    memory: AgentMemory | None = None,
+    memory: "AgentMemory | None" = None,
     experience_store: ExperienceStore | None = None,
     enabled: bool = True,
 ) -> dict[str, Any]:
@@ -55,6 +57,8 @@ def apply_evo_lite_hook(
         return enriched
 
     evo_lite["reflection_summary"] = reflection.summary
+    evo_lite["evidence_refs"] = list(reflection.evidence_refs)
+    evo_lite["workflow_candidate"] = reflection.promote_to_workflow_candidate
     if experience_store is None:
         enriched["evo_lite"] = evo_lite
         return enriched
@@ -66,7 +70,7 @@ def apply_evo_lite_hook(
             evaluation=evaluation,
             memory=memory,
         )
-        experience_store.add(record)
+        stored = experience_store.add(record)
     except Exception as exc:
         _warn("experience_store_write_failed", exc)
         evo_lite["warning"] = "experience_store_write_failed"
@@ -74,7 +78,9 @@ def apply_evo_lite_hook(
         return enriched
 
     evo_lite["experience_saved"] = True
-    evo_lite["memory_id"] = record.memory_id
+    evo_lite["memory_id"] = stored.memory_id
+    evo_lite["experience_deduplicated"] = stored.memory_id != record.memory_id
+    evo_lite["evidence_refs"] = list(stored.evidence_refs)
     enriched["evo_lite"] = evo_lite
     return enriched
 
@@ -84,7 +90,7 @@ def _experience_record_from_reflection(
     *,
     envelope: Mapping[str, Any],
     evaluation: EvaluationResult,
-    memory: AgentMemory | None,
+    memory: "AgentMemory | None",
 ) -> ExperienceRecord:
     return ExperienceRecord(
         memory_id=f"memory-{uuid4().hex[:12]}",
@@ -98,10 +104,19 @@ def _experience_record_from_reflection(
         lesson=reflection.lesson,
         tags=reflection.tags,
         source_request_id=reflection.source_request_id,
-        promoted_to_workflow=reflection.promote_to_workflow_candidate,
+        promoted_to_workflow=False,
+        provenance=_experience_provenance(reflection),
+        evidence_refs=list(reflection.evidence_refs),
         created_at=reflection.created_at,
         expires_at=None,
     )
+
+
+def _experience_provenance(reflection: ReflectionRecord) -> dict[str, Any]:
+    provenance = dict(reflection.provenance)
+    if reflection.promote_to_workflow_candidate:
+        provenance["workflow_candidate"] = "true"
+    return provenance
 
 
 def _empty_evo_lite_payload() -> dict[str, Any]:
@@ -109,11 +124,14 @@ def _empty_evo_lite_payload() -> dict[str, Any]:
         "evaluation": None,
         "reflection_summary": None,
         "experience_saved": False,
+        "experience_deduplicated": False,
         "memory_id": None,
+        "evidence_refs": [],
+        "workflow_candidate": False,
     }
 
 
-def _session_id(memory: AgentMemory | None) -> str:
+def _session_id(memory: "AgentMemory | None") -> str:
     session_id = getattr(memory, "session_id", None)
     if isinstance(session_id, str) and session_id.strip():
         return session_id.strip()

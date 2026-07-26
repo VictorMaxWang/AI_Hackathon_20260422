@@ -134,8 +134,8 @@ P2-T01_policy_engine_v2.md
 - 修改了哪些文件；
 - 测试是否通过；
 - 有哪些偏离；
-- 是否需要更新 task_board.md；
-- 是否需要更新 decision_log.md。
+- 是否需要更新 docs/process/task_board.md；
+- 是否需要更新 docs/process/decision_log.md。
 
 ---
 
@@ -144,11 +144,11 @@ P2-T01_policy_engine_v2.md
 每次给 Codex 一个任务：
 
 1. 复制对应 Prompt；
-2. 确认 current_status.md 是最新；
+2. 确认 docs/process/current_status.md 是最新；
 3. 确认允许修改文件准确；
 4. 执行 Codex；
 5. 检查输出；
 6. 跑测试；
-7. 更新 task_board.md；
-8. 更新 current_status.md；
-9. 如有关键决策，更新 decision_log.md。
+7. 更新 docs/process/task_board.md；
+8. 更新 docs/process/current_status.md；
+9. 如有关键决策，更新 docs/process/decision_log.md。

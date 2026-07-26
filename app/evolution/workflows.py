@@ -2,16 +2,37 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from app.models.evolution import WorkflowTemplate
+from app.models.evolution import (
+    CANONICAL_WORKFLOW_TOOL_NAMES,
+    WORKFLOW_TOOL_INTENTS,
+    WorkflowTemplate,
+)
 
 
 DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "workflows" / "templates"
+
+__all__ = [
+    "BANNED_RAW_COMMAND_FIELDS",
+    "BANNED_TOOL_NAMES",
+    "CANONICAL_WORKFLOW_TOOL_NAMES",
+    "DEFAULT_TEMPLATE_DIR",
+    "WORKFLOW_TOOL_INTENTS",
+    "WorkflowTemplateLoadError",
+    "clear_workflow_template_cache",
+    "load_workflow_template",
+    "load_workflow_templates",
+    "match_workflow_template",
+    "reload_workflow_templates",
+    "try_match_workflow_template",
+    "warm_workflow_template_cache",
+]
 
 BANNED_TOOL_NAMES = frozenset(
     {
@@ -94,6 +115,10 @@ class WorkflowTemplateLoadError(ValueError):
     """Raised when a declarative workflow template cannot be loaded safely."""
 
 
+_TEMPLATE_CACHE: dict[str, dict[str, WorkflowTemplate]] = {}
+_TEMPLATE_CACHE_ERRORS: dict[str, WorkflowTemplateLoadError] = {}
+
+
 def load_workflow_template(
     workflow_id: str,
     templates_dir: str | Path | None = None,
@@ -116,9 +141,65 @@ def load_workflow_template(
 def load_workflow_templates(
     templates_dir: str | Path | None = None,
 ) -> dict[str, WorkflowTemplate]:
-    """Load all JSON workflow templates from the template directory."""
+    """Return every validated workflow template, reading and validating once.
+
+    Templates are parsed and validated one time per directory and then served
+    from a module-level cache. A malformed template therefore fails loudly at
+    the first load instead of turning every later request into a 500.
+    """
 
     template_dir = _resolve_template_dir(templates_dir)
+    cache_key = str(template_dir)
+
+    cached = _TEMPLATE_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    cached_error = _TEMPLATE_CACHE_ERRORS.get(cache_key)
+    if cached_error is not None:
+        raise cached_error
+
+    try:
+        templates = _read_workflow_templates(template_dir)
+    except WorkflowTemplateLoadError as exc:
+        _TEMPLATE_CACHE_ERRORS[cache_key] = exc
+        raise
+
+    _TEMPLATE_CACHE[cache_key] = templates
+    return dict(templates)
+
+
+def reload_workflow_templates(
+    templates_dir: str | Path | None = None,
+) -> dict[str, WorkflowTemplate]:
+    """Drop the cached templates for one directory and read them again."""
+
+    clear_workflow_template_cache(templates_dir)
+    return load_workflow_templates(templates_dir)
+
+
+def clear_workflow_template_cache(templates_dir: str | Path | None = None) -> None:
+    """Forget cached templates so the next load re-reads the directory."""
+
+    if templates_dir is None:
+        _TEMPLATE_CACHE.clear()
+        _TEMPLATE_CACHE_ERRORS.clear()
+        return
+
+    cache_key = str(_resolve_template_dir(templates_dir))
+    _TEMPLATE_CACHE.pop(cache_key, None)
+    _TEMPLATE_CACHE_ERRORS.pop(cache_key, None)
+
+
+def warm_workflow_template_cache(
+    templates_dir: str | Path | None = None,
+) -> dict[str, WorkflowTemplate]:
+    """Validate every template at process start so bad data fails at boot."""
+
+    return load_workflow_templates(templates_dir)
+
+
+def _read_workflow_templates(template_dir: Path) -> dict[str, WorkflowTemplate]:
     if not template_dir.exists():
         raise WorkflowTemplateLoadError(f"workflow template directory not found: {template_dir}")
     if not template_dir.is_dir():
@@ -136,6 +217,28 @@ def load_workflow_templates(
     if not templates:
         raise WorkflowTemplateLoadError(f"no workflow templates found in {template_dir}")
     return templates
+
+
+def try_match_workflow_template(
+    raw_user_input: str,
+    templates_dir: str | Path | None = None,
+) -> WorkflowTemplate | None:
+    """Match a workflow template without letting bad template data break a request.
+
+    Workflow templates are only a planner hint, never a safety boundary, so an
+    unloadable template directory must degrade to "no workflow matched" rather
+    than fail the whole turn.
+    """
+
+    try:
+        return match_workflow_template(raw_user_input, templates_dir)
+    except WorkflowTemplateLoadError as exc:
+        warnings.warn(
+            f"workflow template load failed, continuing without workflow hints: {exc}",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
 
 
 def match_workflow_template(
@@ -304,17 +407,25 @@ def _load_template_file(template_path: Path) -> WorkflowTemplate:
             f"invalid workflow template {template_path}: {exc}"
         ) from exc
 
-    _reject_banned_tools(template, source=str(template_path))
+    _reject_unregistered_tools(template, source=str(template_path))
     return template
 
 
-def _reject_banned_tools(template: WorkflowTemplate, *, source: str) -> None:
+def _reject_unregistered_tools(template: WorkflowTemplate, *, source: str) -> None:
     used_tools = set(template.allowed_tools)
     used_tools.update(step.tool_name for step in template.steps)
+
     banned = sorted(used_tools.intersection(BANNED_TOOL_NAMES))
     if banned:
         raise WorkflowTemplateLoadError(
             f"workflow template {source} declares forbidden tool names: {banned}"
+        )
+
+    unregistered = sorted(used_tools.difference(CANONICAL_WORKFLOW_TOOL_NAMES))
+    if unregistered:
+        raise WorkflowTemplateLoadError(
+            f"workflow template {source} declares tool names outside the canonical "
+            f"tool registry: {unregistered}"
         )
 
 

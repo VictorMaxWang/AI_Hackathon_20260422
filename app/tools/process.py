@@ -4,10 +4,13 @@ import json
 from typing import Any
 
 from app.models import CommandResult, ToolResult
+from app.tools import safe_run
 
 
 TOOL_NAME = "process_query_tool"
 MAX_LIMIT = 50
+PS_TIMEOUT = 10
+TRUNCATION_MARKER = "[truncated"
 UNSUPPORTED_PROCESS_QUERY_MESSAGE = (
     "当前本地环境不支持此进程查询方式。建议在 Linux/SSH 目标环境中执行，或使用支持该查询的系统工具。"
 )
@@ -24,6 +27,7 @@ def process_query_tool(
 
     normalized_mode = _normalize_mode(mode)
     effective_limit = _bounded_limit(limit)
+    effective_pid: int | None = None
 
     if normalized_mode == "pid":
         if pid is None:
@@ -43,7 +47,7 @@ def process_query_tool(
         sort_key = "-pcpu" if normalized_mode == "cpu" else "-pmem"
         argv = [*_ps_all_argv(), f"--sort={sort_key}"]
 
-    result = executor.run(argv, timeout=10)
+    result = safe_run(executor, argv, timeout=PS_TIMEOUT)
     if not result.success:
         if _should_try_windows_process_query(result):
             return _windows_process_query(
@@ -51,7 +55,7 @@ def process_query_tool(
                 mode=normalized_mode,
                 limit=effective_limit,
                 keyword=keyword,
-                pid=pid,
+                pid=effective_pid,
                 original_result=result,
             )
         return _command_error(result, normalized_mode)
@@ -66,7 +70,7 @@ def process_query_tool(
             or needle in str(process["args"]).lower()
         ]
 
-    truncated = len(processes) > effective_limit
+    truncated = len(processes) > effective_limit or _output_truncated(result.stdout)
     limited_processes = processes[:effective_limit]
 
     return ToolResult(
@@ -74,9 +78,10 @@ def process_query_tool(
         success=True,
         data={
             "status": "ok",
+            "source": "ps",
             "mode": normalized_mode,
             "keyword": keyword if normalized_mode == "keyword" else None,
-            "pid": pid if normalized_mode == "pid" else None,
+            "pid": effective_pid if normalized_mode == "pid" else None,
             "processes": limited_processes,
             "count": len(limited_processes),
             "limit": effective_limit,
@@ -123,6 +128,8 @@ def _ps_all_argv() -> list[str]:
         "-o",
         "pmem=",
         "-o",
+        "rss=",
+        "-o",
         "comm=",
         "-o",
         "args=",
@@ -133,7 +140,7 @@ def _ps_pid_argv(pid: int) -> list[str]:
     return [
         "ps",
         "-p",
-        str(pid),
+        str(int(pid)),
         "-o",
         "pid=",
         "-o",
@@ -142,6 +149,8 @@ def _ps_pid_argv(pid: int) -> list[str]:
         "pcpu=",
         "-o",
         "pmem=",
+        "-o",
+        "rss=",
         "-o",
         "comm=",
         "-o",
@@ -158,7 +167,11 @@ def _windows_process_query(
     pid: int | None,
     original_result: CommandResult,
 ) -> ToolResult:
-    windows_result = executor.run(_windows_process_argv(mode, limit, pid), timeout=10)
+    windows_result = safe_run(
+        executor,
+        _windows_process_argv(mode, limit, pid),
+        timeout=PS_TIMEOUT,
+    )
     if not windows_result.success:
         return _unsupported_environment(
             mode=mode,
@@ -179,7 +192,7 @@ def _windows_process_query(
             or needle in str(process["args"]).lower()
         ]
 
-    truncated = len(processes) > limit
+    truncated = len(processes) > limit or _output_truncated(windows_result.stdout)
     limited_processes = processes[:limit]
     return ToolResult(
         tool_name=TOOL_NAME,
@@ -199,19 +212,20 @@ def _windows_process_query(
 
 
 def _windows_process_argv(mode: str, limit: int, pid: int | None) -> list[str]:
+    safe_limit = _bounded_limit(limit)
     if mode == "pid" and pid is not None:
-        selector = f"$items = Get-Process -Id {pid} -ErrorAction SilentlyContinue; "
+        selector = f"$items = Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue; "
     elif mode == "memory":
         selector = (
             "$items = Get-Process | Sort-Object WorkingSet64 -Descending | "
-            f"Select-Object -First {limit}; "
+            f"Select-Object -First {safe_limit}; "
         )
     elif mode == "keyword":
         selector = "$items = Get-Process; "
     else:
         selector = (
             "$items = Get-Process | Sort-Object CPU -Descending | "
-            f"Select-Object -First {limit}; "
+            f"Select-Object -First {safe_limit}; "
         )
 
     script = (
@@ -230,12 +244,25 @@ def _windows_process_argv(mode: str, limit: int, pid: int | None) -> list[str]:
 
 def _parse_ps_output(stdout: str) -> list[dict[str, Any]]:
     processes: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
-        if not line.strip():
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("...[truncated"):
             continue
-        parts = line.strip().split(maxsplit=5)
+
+        parts = line.split(maxsplit=6)
         if len(parts) < 5:
             continue
+
+        resident_kb = _parse_int(parts[4]) if len(parts) > 5 else None
+        if resident_kb is None:
+            parts = line.split(maxsplit=5)
+            command = parts[4]
+            args = parts[5] if len(parts) > 5 else ""
+            memory_bytes = None
+        else:
+            command = parts[5]
+            args = parts[6] if len(parts) > 6 else ""
+            memory_bytes = resident_kb * 1024
 
         processes.append(
             {
@@ -243,8 +270,9 @@ def _parse_ps_output(stdout: str) -> list[dict[str, Any]]:
                 "user": parts[1],
                 "cpu_percent": _parse_float(parts[2]),
                 "memory_percent": _parse_float(parts[3]),
-                "command": parts[4],
-                "args": parts[5] if len(parts) > 5 else "",
+                "memory_bytes": memory_bytes,
+                "command": command,
+                "args": args,
             }
         )
     return processes
@@ -279,14 +307,18 @@ def _parse_windows_process_json(stdout: str) -> list[dict[str, Any]]:
     return processes
 
 
-def _parse_int(value: str) -> int | None:
+def _output_truncated(stdout: str) -> bool:
+    return TRUNCATION_MARKER in str(stdout or "")
+
+
+def _parse_int(value: Any) -> int | None:
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
 
 
-def _parse_float(value: str) -> float | None:
+def _parse_float(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -325,6 +357,8 @@ def _command_error(result: CommandResult, mode: str) -> ToolResult:
 
 
 def _should_try_windows_process_query(result: CommandResult) -> bool:
+    if result.timed_out:
+        return False
     text = f"{result.stderr}\n{result.stdout}".lower()
     return any(
         marker in text

@@ -55,12 +55,12 @@ GuardedOps 当前不优先做多模态。
 - Web 为主演示入口；
 - CLI 为调试入口；
 - LocalExecutor 支持本地执行；
-- SSHExecutor 支持远程执行；
+- SSHExecutor 支持远程执行（**目前只是库级能力**：两个入口都硬编码 `LocalExecutor`，没有地方能构造 `SSHConnectionConfig`）；
 - 规则风控优先；
 - LLM 只用于辅助理解和解释，不作为安全边界；
 - 执行层只允许白名单工具；
 - 所有敏感操作必须经过风险评估和确认；
-- 所有操作必须记录审计日志。
+- 所有操作必须记录审计日志（**目标**；当前只有响应内的证据链，没有落盘审计）。
 
 ---
 
@@ -94,10 +94,12 @@ GuardedOps 分为五层：
    - SSHExecutor
    - Tool wrappers
 
-5. 审计层
+5. 审计层（**目标架构，尚未实现**）
    - SQLite Audit Store
    - JSONL Audit Log
    - Audit Viewer / Exporter
+
+   `app/audit/` 目前是空包。当前可审计信息只体现为单次响应内的证据链（`evidence_chain`，`app/models/evidence.py`），不落盘、不可跨请求查询、进程重启即丢失。这一层属于 P4-T01 / P4-T02，任何提交材料都不得把它描述为已交付。
 
 ---
 
@@ -135,14 +137,15 @@ Phase 3.6 仍然坚持既有安全边界：不开放 arbitrary shell，不开放
 
 白名单工具包括：
 
-- env_probe_tool
-- disk_usage_tool
-- file_search_tool
-- process_query_tool
-- port_query_tool
-- create_user_tool
-- delete_user_tool
-- audit_query_tool
+- env_probe_tool（已实现）
+- disk_usage_tool（已实现）
+- memory_usage_tool（已实现）
+- file_search_tool（已实现）
+- process_query_tool（已实现）
+- port_query_tool（已实现）
+- create_user_tool（已实现）
+- delete_user_tool（已实现）
+- audit_query_tool（**未实现**：意图名在 `app/policy/rules.py` 的白名单里，但 `app/tools/` 下没有对应模块，依赖尚未实现的审计层）
 
 禁止实现 arbitrary command tool。
 
@@ -244,23 +247,32 @@ Phase 3.6 仍然坚持既有安全边界：不开放 arbitrary shell，不开放
 
 ## 9. 技术选型初稿
 
-计划使用：
+实际使用：
 
-- Python 3.11
-- FastAPI
+- Python 3.11 / 3.12 / 3.13（CI 三个版本都跑）
+- FastAPI + Uvicorn
 - Pydantic v2
-- Paramiko
-- SQLite
-- pytest
-- HTML/CSS/JS 单页 Web UI
+- Paramiko（`SSHExecutor`，目前无入口可达）
+- pytest（`[test]` extra，连同 `httpx`）
+- 标准库 `argparse` 做 CLI，未引入 Typer
+- setuptools + `pyproject.toml` 管理依赖，未引入 uv / poetry / pip-tools
+- HTML/CSS/JS 单页 Web UI，无前端构建步骤
+- 可选：OpenAI SDK（`[llm]` extra）对接 DashScope Qwen3.6-Plus
 
-待确认：
+已确认：
 
-- 最终是否使用 Typer 作为 CLI 框架；
-- 是否使用 uv / poetry / pip-tools 管理依赖；
-- 是否启用真实 LLM API；
-- SSH 认证优先使用 key 还是 password；
+- **是否使用 Typer**：否，用标准库 `argparse`，避免为一个调试入口增加依赖。
+- **依赖管理工具**：`pyproject.toml` + pip，`[test]` / `[llm]` 两个 extra。
+- **是否启用真实 LLM API**：启用但默认关闭，只作为意图候选来源。
+
+仍待确认：
+
+- SSH 认证优先使用 key 还是 password（`SSHConnectionConfig` 两者都支持，但没有入口能配置）；
 - 演示系统发行版。
+
+未使用：
+
+- SQLite 目前只被 `app/evolution/experience_store.py` 用于经验存储，**没有**用于审计层——审计层尚未实现。
 
 ---
 
@@ -275,20 +287,21 @@ Phase 3.6 仍然坚持既有安全边界：不开放 arbitrary shell，不开放
 - 创建/删除普通用户可确认、可验证；
 - 高风险操作能拒绝并解释；
 - 多轮连续任务可闭环；
-- 审计日志可查看；
-- 提交文档完整。
+- 审计日志可查看（**尚未达成**，审计层未实现）；
+- 提交文档完整，且不声称未实现的能力。
 
 ---
 
 ## 11. 新线程开始前必须读取
 
-新 AI 线程开始前，请先读取：
+这些文件都在 `docs/process/`（本文件所在目录）。新 AI 线程开始前，请先读取：
 
 1. `agent.md`
 2. `project_context.md`
 3. `architecture_constraints.md`
 4. `current_status.md`
-5. 当前 Task 的 Codex Prompt
-6. 如涉及并行开发，读取 `parallel_workstreams.md`
+5. `validation_matrix.md`（特别是第 6 节“未交付能力”）
+6. 当前 Task 的 Codex Prompt（在仓库根的 `prompts/`）
+7. 如涉及并行开发，读取 `parallel_workstreams.md`
 
 不要基于记忆或猜测继续开发。
