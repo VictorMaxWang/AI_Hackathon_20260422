@@ -21,18 +21,25 @@ from app.evolution.experience_store import (  # noqa: E402
     is_valid_evidence_ref,
     passes_promotion_gate,
 )
-from app.evolution.init import apply_evo_lite_hook  # noqa: E402
+from app.agent.confirmation import confirmation_status_from_parts  # noqa: E402
+from app.evolution.init import _experience_status, apply_evo_lite_hook  # noqa: E402
+from app.evolution.regression import _confirmation_status_from_envelope  # noqa: E402
+import app.evolution.workflows  # noqa: E402
 from app.evolution.workflows import (  # noqa: E402
+    DEFAULT_TEMPLATE_DIR,
     WorkflowTemplateLoadError,
     clear_workflow_template_cache,
+    load_usable_workflow_templates,
     load_workflow_templates,
     match_workflow_template,
     reload_workflow_templates,
     try_match_workflow_template,
+    warm_workflow_template_cache,
 )
 from app.models.evolution import (  # noqa: E402
     CANONICAL_WORKFLOW_TOOL_NAMES,
     WORKFLOW_TOOL_INTENTS,
+    EvaluationResult,
     ExperienceRecord,
     GovernanceStatus,
     MemoryType,
@@ -502,8 +509,122 @@ def test_one_malformed_template_does_not_break_matching(template_dir: Path) -> N
     with pytest.raises(WorkflowTemplateLoadError):
         match_workflow_template("hardening probe", template_dir)
 
-    with pytest.warns(UserWarning, match="workflow template load failed"):
-        assert try_match_workflow_template("hardening probe", template_dir) is None
+    with pytest.warns(UserWarning, match="broken.json"):
+        matched = try_match_workflow_template("hardening probe", template_dir)
+
+    assert matched is not None
+    assert matched.workflow_id == "hardening_probe"
+
+
+def test_non_utf8_template_file_is_rejected_by_name_and_others_keep_loading(
+    template_dir: Path,
+) -> None:
+    write_template(template_dir, readonly_template_payload())
+    (template_dir / "latin1.json").write_bytes(b'{"name": "caf\xe9"}')
+    clear_workflow_template_cache(template_dir)
+
+    with pytest.raises(WorkflowTemplateLoadError, match="not valid UTF-8"):
+        load_workflow_templates(template_dir)
+
+    templates, rejections = load_usable_workflow_templates(template_dir)
+
+    assert set(templates) == {"hardening_probe"}
+    assert [item.filename for item in rejections] == ["latin1.json"]
+    assert "not valid UTF-8" in rejections[0].error
+
+    with pytest.warns(UserWarning, match="latin1.json"):
+        matched = try_match_workflow_template("hardening probe", template_dir)
+
+    assert matched is not None
+    assert matched.workflow_id == "hardening_probe"
+
+
+def test_binary_template_file_never_raises_a_raw_decode_error(template_dir: Path) -> None:
+    write_template(template_dir, readonly_template_payload())
+    (template_dir / "binary.json").write_bytes(bytes(range(256)))
+    clear_workflow_template_cache(template_dir)
+
+    with pytest.raises(WorkflowTemplateLoadError) as excinfo:
+        warm_workflow_template_cache(template_dir)
+
+    assert "binary.json" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+
+
+def test_directory_named_like_a_template_is_rejected_without_breaking_matching(
+    template_dir: Path,
+) -> None:
+    write_template(template_dir, readonly_template_payload())
+    (template_dir / "not_a_file.json").mkdir()
+    clear_workflow_template_cache(template_dir)
+
+    templates, rejections = load_usable_workflow_templates(template_dir)
+
+    assert set(templates) == {"hardening_probe"}
+    assert [item.filename for item in rejections] == ["not_a_file.json"]
+
+    with pytest.warns(UserWarning, match="not_a_file.json"):
+        assert try_match_workflow_template("hardening probe", template_dir) is not None
+
+
+def test_unusable_template_directory_degrades_to_no_workflow_hint(tmp_path: Path) -> None:
+    missing_dir = tmp_path / "absent_templates"
+
+    with pytest.warns(UserWarning, match="continuing without workflow hints"):
+        assert try_match_workflow_template("hardening probe", missing_dir) is None
+
+
+def test_non_utf8_template_does_not_refuse_an_ordinary_readonly_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shipped_dir = tmp_path / "templates"
+    shipped_dir.mkdir()
+    for source in DEFAULT_TEMPLATE_DIR.glob("*.json"):
+        (shipped_dir / source.name).write_bytes(source.read_bytes())
+    (shipped_dir / "latin1.json").write_bytes(b'{"name": "caf\xe9"}')
+
+    monkeypatch.setattr(app.evolution.workflows, "DEFAULT_TEMPLATE_DIR", shipped_dir)
+    clear_workflow_template_cache()
+    clear_workflow_template_cache(shipped_dir)
+
+    mocks = EvoLiteToolMocks()
+    with pytest.warns(UserWarning, match="latin1.json"):
+        envelope = make_orchestrator(mocks).run("帮我查看当前磁盘使用情况")
+
+    clear_workflow_template_cache(shipped_dir)
+    clear_workflow_template_cache()
+
+    assert envelope["result"]["status"] == "success"
+    assert envelope["risk"]["risk_level"] == "S0"
+    assert "UnicodeDecodeError" not in json.dumps(envelope, ensure_ascii=False, default=str)
+
+
+def test_rejected_templates_are_dropped_not_partially_loaded(template_dir: Path) -> None:
+    write_template(template_dir, readonly_template_payload())
+    write_template(
+        template_dir,
+        readonly_template_payload(
+            workflow_id="raw_command_probe",
+            steps=[
+                {
+                    "step_id": "probe_environment",
+                    "tool_name": "env_probe_tool",
+                    "intent": "env_probe",
+                    "description": "rm -rf /tmp/whatever",
+                    "risk_level": "S0",
+                    "requires_policy": True,
+                    "requires_confirmation": False,
+                }
+            ],
+        ),
+    )
+    clear_workflow_template_cache(template_dir)
+
+    templates, rejections = load_usable_workflow_templates(template_dir)
+
+    assert set(templates) == {"hardening_probe"}
+    assert [item.filename for item in rejections] == ["raw_command_probe.json"]
 
 
 def test_templates_are_validated_once_and_cached(template_dir: Path) -> None:
@@ -520,6 +641,109 @@ def test_templates_are_validated_once_and_cached(template_dir: Path) -> None:
 
     assert load_workflow_templates(template_dir)["hardening_probe"].name == "hardening probe"
     assert reload_workflow_templates(template_dir)["hardening_probe"].name == "renamed probe"
+
+
+def test_incomplete_continuous_run_is_never_stored_as_a_success() -> None:
+    envelope = {
+        "result": {"status": "incomplete", "data": None, "error": "写步骤条件未满足"},
+        "execution": {"status": "incomplete", "steps": [], "results": []},
+        "plan": {"status": "incomplete"},
+        "risk": {"risk_level": "S1", "allow": True},
+    }
+    optimistic = EvaluationResult(task_success=True, safety_success=True)
+
+    assert _experience_status(envelope, optimistic) == ExecutionStatus.FAILED
+
+
+def test_unknown_state_turn_is_stored_as_unknown_not_refused() -> None:
+    envelope = {
+        "result": {
+            "status": "unknown",
+            "data": None,
+            "error": "RuntimeError: crashed after the write",
+            "state_unknown": True,
+        },
+        "execution": {"status": "unknown", "steps": [], "results": []},
+        "plan": {"status": "confirmed"},
+        "risk": {"risk_level": "S1", "allow": True},
+    }
+
+    assert _experience_status(envelope, EvaluationResult()) == ExecutionStatus.UNKNOWN
+    assert _experience_status(envelope, EvaluationResult(task_success=True)) == ExecutionStatus.UNKNOWN
+
+
+def test_known_statuses_keep_their_existing_classification() -> None:
+    pending = {
+        "result": {"status": "pending_confirmation"},
+        "execution": {"status": "skipped"},
+        "plan": {"status": "pending_confirmation"},
+        "risk": {"risk_level": "S1", "allow": True},
+    }
+    refused = {
+        "result": {"status": "refused"},
+        "execution": {"status": "skipped"},
+        "plan": {"status": "refused"},
+        "risk": {"risk_level": "S3", "allow": False},
+    }
+
+    assert _experience_status(pending, EvaluationResult()) == ExecutionStatus.PENDING_CONFIRMATION
+    assert _experience_status(refused, EvaluationResult()) == ExecutionStatus.REFUSED
+    assert (
+        _experience_status(
+            {"result": {"status": "success"}, "execution": {"status": "success"}},
+            EvaluationResult(task_success=True, safety_success=True),
+        )
+        == ExecutionStatus.SUCCESS
+    )
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {
+            "risk": {"requires_confirmation": True},
+            "plan": {"status": "pending_confirmation"},
+            "execution": {"results": []},
+            "result": {"status": "pending_confirmation"},
+        },
+        {
+            "risk": {"requires_confirmation": True},
+            "plan": {"status": "confirmed"},
+            "execution": {"results": [{"tool_name": "create_user_tool", "success": True}]},
+            "result": {"status": "success"},
+        },
+        {
+            "risk": {"requires_confirmation": True},
+            "plan": {"status": "pending_confirmation"},
+            "execution": {"results": []},
+            "result": {"status": "pending_confirmation", "error": "confirmation_text_mismatch"},
+        },
+        {
+            "risk": {"requires_confirmation": True},
+            "plan": {"status": "cancelled"},
+            "execution": {"results": []},
+            "result": {"status": "cancelled"},
+        },
+        {
+            "risk": {"requires_confirmation": False},
+            "plan": {"status": "ready"},
+            "execution": {"results": [{"tool_name": "disk_usage_tool", "success": True}]},
+            "result": {"status": "success"},
+        },
+    ],
+)
+def test_regression_harness_reads_confirmation_state_from_the_shared_helper(
+    envelope: dict[str, Any],
+) -> None:
+    expected = confirmation_status_from_parts(
+        risk=envelope["risk"],
+        plan=envelope["plan"],
+        execution=envelope["execution"],
+        result=envelope["result"],
+        timeline=[],
+    )
+
+    assert _confirmation_status_from_envelope(envelope) == expected
 
 
 def test_evolution_init_imports_without_the_agent_package() -> None:

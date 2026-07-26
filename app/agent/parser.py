@@ -31,6 +31,31 @@ GRANT_SUDO_INTENT = "grant_sudo"
 MODIFY_SSHD_CONFIG_INTENT = "modify_sshd_config"
 BULK_PERMISSION_INTENT = "bulk_permission_change"
 
+WRITE_NOT_SUPPORTED_REASON = "当前只支持只读基础能力，写操作不在 P1-T05 范围内"
+WRITE_KEYWORDS: tuple[str, ...] = (
+    "创建",
+    "新增",
+    "删除",
+    "删掉",
+    "移除",
+    "写入",
+    "清理",
+    "清空",
+    "杀掉",
+    "重启",
+    "启动",
+    "停止",
+    "安装",
+    "卸载",
+    "chmod",
+    "chown",
+    "sudoers",
+    "useradd",
+    "userdel",
+)
+AMBIGUOUS_WRITE_KEYWORDS: tuple[str, ...] = ("修改", "更改", "改动", "变更")
+_ATTRIBUTIVE_CHANGE_PATTERN = re.compile(r"(?:修改|更改|改动|变更)\s*(?:过\s*的?|的)")
+
 
 class ReadonlyParser:
     """Rule-based parser for Phase 1 read-only Chinese operations requests."""
@@ -48,17 +73,20 @@ class ReadonlyParser:
         if dangerous_intent is not None:
             return dangerous_intent
 
-        write_reason = _detect_write_like_request(_write_scan_text(text))
+        write_reason = _detect_write_like_request(text)
         if write_reason:
-            return ParsedIntent(
-                intent=UNKNOWN_INTENT,
-                target=IntentTarget(),
-                constraints={"unsupported_reason": write_reason},
-                requires_write=True,
-                raw_user_input=raw_user_input,
-                confidence=0.75,
-            )
+            return _write_like_unknown(raw_user_input, write_reason)
 
+        ambiguous_write_reason = _detect_ambiguous_write_request(text)
+        if ambiguous_write_reason is None:
+            readonly_intent = self._parse_readonly_intent(text, raw_user_input)
+            if readonly_intent is not None:
+                return readonly_intent
+            return _unknown(raw_user_input, "unsupported read-only request")
+
+        return _write_like_unknown(raw_user_input, ambiguous_write_reason)
+
+    def _parse_readonly_intent(self, text: str, raw_user_input: str) -> ParsedIntent | None:
         if _looks_like_file_search(text):
             return self._parse_file_search(text, raw_user_input)
         if _looks_like_port_query(text):
@@ -77,8 +105,7 @@ class ReadonlyParser:
                 raw_user_input=raw_user_input,
                 confidence=0.9,
             )
-
-        return _unknown(raw_user_input, "unsupported read-only request")
+        return None
 
     def _parse_file_search(self, text: str, raw_user_input: str) -> ParsedIntent:
         base_path = _extract_path(text)
@@ -179,6 +206,17 @@ def _unknown(raw_user_input: str, reason: str) -> ParsedIntent:
     )
 
 
+def _write_like_unknown(raw_user_input: str, reason: str) -> ParsedIntent:
+    return ParsedIntent(
+        intent=UNKNOWN_INTENT,
+        target=IntentTarget(),
+        constraints={"unsupported_reason": reason},
+        requires_write=True,
+        raw_user_input=raw_user_input,
+        confidence=0.75,
+    )
+
+
 def _parse_contextual_reference(
     text: str,
     raw_user_input: str,
@@ -231,7 +269,7 @@ def _parse_contextual_reference(
         port = _resolve_memory(memory, "port")
         if port is None:
             return _unresolved_context_ref(raw_user_input, port_ref, "port", text)
-        if _detect_write_like_request(text):
+        if _detect_any_write_like_request(text):
             return ParsedIntent(
                 intent=UNKNOWN_INTENT,
                 target=IntentTarget(port=port),
@@ -316,7 +354,7 @@ def _unresolved_context_ref(
             "unsupported_reason": f"无法解析该引用：{ref_text}",
         },
         context_refs=[ref_text],
-        requires_write=_detect_write_like_request(text) is not None,
+        requires_write=_detect_any_write_like_request(text) is not None,
         raw_user_input=raw_user_input,
         confidence=0.0,
     )
@@ -395,32 +433,27 @@ def _parse_dangerous_intent(text: str, raw_user_input: str) -> ParsedIntent | No
 
 
 def _detect_write_like_request(text: str) -> str | None:
-    write_keywords = [
-        "创建",
-        "新增",
-        "删除",
-        "删掉",
-        "移除",
-        "修改",
-        "更改",
-        "写入",
-        "清理",
-        "清空",
-        "杀掉",
-        "重启",
-        "启动",
-        "停止",
-        "安装",
-        "卸载",
-        "chmod",
-        "chown",
-        "sudoers",
-        "useradd",
-        "userdel",
-    ]
-    if _contains_any(text, write_keywords):
-        return "当前只支持只读基础能力，写操作不在 P1-T05 范围内"
+    if _contains_any(text, list(WRITE_KEYWORDS)):
+        return WRITE_NOT_SUPPORTED_REASON
     return None
+
+
+def _detect_ambiguous_write_request(text: str) -> str | None:
+    """Flag a 修改-style verb only when it is not describing a file attribute.
+
+    "最近 7 天修改的文件" names files rather than asking for an edit, so it must
+    stay a read-only search; a bare "修改 …" is still a write and stays refused,
+    which keeps the default fail-closed for everything read-only parsing does
+    not claim.
+    """
+
+    if _contains_any(_write_scan_text(text), list(AMBIGUOUS_WRITE_KEYWORDS)):
+        return WRITE_NOT_SUPPORTED_REASON
+    return None
+
+
+def _detect_any_write_like_request(text: str) -> str | None:
+    return _detect_write_like_request(text) or _detect_ambiguous_write_request(text)
 
 
 def _looks_like_sudoers_change(text: str) -> bool:
@@ -503,7 +536,7 @@ def _extract_username_for_sudo(text: str) -> str | None:
 
 
 def _write_scan_text(text: str) -> str:
-    return text.replace("修改过", "")
+    return _ATTRIBUTIVE_CHANGE_PATTERN.sub("", text)
 
 
 def _looks_like_disk_query(text: str) -> bool:

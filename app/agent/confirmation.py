@@ -21,6 +21,7 @@ CANCEL_PENDING_TEXTS = frozenset(
     {"\u53d6\u6d88", "\u653e\u5f03", "cancel"}
 )
 DEFAULT_CONFIRMATION_TOKEN_TTL = timedelta(minutes=5)
+UNAVAILABLE_FINGERPRINT = "unavailable:no-readable-files"
 MAX_TRACKED_CONSUMED_TOKEN_IDS = 4096
 
 _CONSUMED_TOKEN_IDS: OrderedDict[str, None] = OrderedDict()
@@ -109,6 +110,13 @@ def stable_hash(value: Any) -> str:
 
 
 def stable_file_content_hash(paths: Iterable[Path]) -> str:
+    """Fingerprint a set of files, refusing to fingerprint an empty set.
+
+    A hash over zero files is a confident-looking value that proves nothing.
+    Callers must be able to tell "these are the policy files I read" from
+    "I found no policy files at all", so the empty case is named instead.
+    """
+
     entries: list[dict[str, str]] = []
     for path in sorted(paths, key=lambda item: item.as_posix()):
         try:
@@ -116,7 +124,17 @@ def stable_file_content_hash(paths: Iterable[Path]) -> str:
         except OSError:
             digest = "missing"
         entries.append({"path": path.name, "digest": digest})
+    if not entries:
+        return UNAVAILABLE_FINGERPRINT
+    if all(entry["digest"] == "missing" for entry in entries):
+        return UNAVAILABLE_FINGERPRINT
     return stable_hash(entries)
+
+
+def fingerprint_is_available(fingerprint: str) -> bool:
+    """Report whether a fingerprint was computed over real file content."""
+
+    return str(fingerprint or "").strip() != UNAVAILABLE_FINGERPRINT
 
 
 class ConfirmationToken(BaseModel):

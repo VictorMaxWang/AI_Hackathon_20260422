@@ -136,6 +136,21 @@ class _PreviewIntentData:
         )
 
     @property
+    def effective_path(self) -> str:
+        """Return the path the tool will really traverse.
+
+        The guarded tools normalize before executing, so a traversal-expressed
+        scope such as ``/var/log/../../etc`` is searched as ``/etc``. Reporting
+        the raw text would tell the operator the search is narrower than it is.
+        """
+
+        return normalize_path(self.path) or self.path
+
+    @property
+    def path_was_rewritten(self) -> bool:
+        return bool(self.path) and self.effective_path != self.path
+
+    @property
     def base_paths(self) -> list[str]:
         raw_value = self.target.get("base_paths")
         if isinstance(raw_value, list):
@@ -290,7 +305,8 @@ def _file_search_preview(
     data: _PreviewIntentData,
     risk_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    base_path = data.path or "missing"
+    base_path = data.effective_path or "missing"
+    requested_path = data.path
     max_results = _coerce_int(data.constraints.get("max_results"), default=20)
     max_depth = _coerce_int(data.constraints.get("max_depth"), default=4)
     keyword = _first_text(data.target.get("keyword"))
@@ -301,12 +317,19 @@ def _file_search_preview(
     if any(is_same_or_child_path(base_path, blocked_root) for blocked_root in DEEP_SEARCH_REFUSED_PATHS):
         protected_paths = _matched_protected_paths([base_path], include_deep_roots=True)
 
+    rewrite_note = (
+        f"Requested scope {requested_path} resolves to actual scope {base_path}."
+        if data.path_was_rewritten
+        else ""
+    )
     summary = f"Read-only search scope is bounded to {base_path} with depth {max_depth} and at most {max_results} results."
     if not bool(risk_payload.get("allow")):
         summary = _first_text(
             _first_reason(risk_payload),
             f"Search scope is refused for {base_path}.",
         )
+    if rewrite_note:
+        summary = f"{summary} {rewrite_note}"
 
     notes = [
         "Search previews reflect planner limits only and do not estimate an exact file count.",
@@ -320,6 +343,8 @@ def _file_search_preview(
         {"label": "max_results", "value": str(max_results)},
         {"label": "max_depth", "value": str(max_depth)},
     ]
+    if data.path_was_rewritten:
+        facts.insert(0, {"label": "requested base_path", "value": requested_path})
     if keyword:
         facts.append({"label": "name filter", "value": keyword})
     if modified_within_days:
@@ -374,7 +399,9 @@ def _refused_request_preview(
         {"label": "Risk level", "value": _first_text(risk_payload.get("risk_level"), "unknown")},
     ]
     if data.path:
-        facts.append({"label": "Target path", "value": data.path})
+        facts.append({"label": "Target path", "value": data.effective_path})
+    if data.path_was_rewritten:
+        facts.append({"label": "Requested path", "value": data.path})
 
     impacts = [
         {
@@ -513,10 +540,12 @@ def _scope_summary(data: _PreviewIntentData) -> str:
         )
     if data.intent_name == "search_files":
         summary = (
-            f"Read-only file search under {data.path or 'missing'}; "
+            f"Read-only file search under {data.effective_path or 'missing'}; "
             f"max_depth={_coerce_int(data.constraints.get('max_depth'), default=4)}; "
             f"max_results={_coerce_int(data.constraints.get('max_results'), default=20)}."
         )
+        if data.path_was_rewritten:
+            summary += f" Requested scope {data.path} resolves to actual scope {data.effective_path}."
         keyword = _first_text(data.target.get("keyword"))
         if keyword:
             summary += f" name filter={keyword}."
@@ -525,6 +554,11 @@ def _scope_summary(data: _PreviewIntentData) -> str:
             summary += f" modified_within_days={modified_within_days}."
         return summary
     if data.path:
+        if data.path_was_rewritten:
+            return (
+                f"Path-targeted request against {data.effective_path} "
+                f"(requested as {data.path})."
+            )
         return f"Path-targeted request against {data.path}."
     if data.username:
         return f"User-targeted request for {data.username}."

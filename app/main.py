@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
@@ -23,6 +23,11 @@ from app.config import load_config
 
 BASE_DIR = Path(__file__).resolve().parent
 UI_DIR = BASE_DIR / "ui"
+UI_INDEX_FILE = UI_DIR / "index.html"
+UI_UNAVAILABLE_MESSAGE = (
+    "Web 控制面静态资源缺失（安装包未包含 app/ui），API 仍然可用："
+    "请改用 POST /api/chat 或 GET /health。"
+)
 
 APP_VERSION = "0.1.0"
 APP_SUMMARY = "安全优先的自然语言 Linux 运维代理：安全边界在代码里，不在提示词里。"
@@ -54,11 +59,26 @@ def create_app() -> FastAPI:
     application.state.chat_sessions = SessionRegistry()
     application.add_middleware(GZipMiddleware, minimum_size=GZIP_MINIMUM_SIZE)
     application.include_router(chat_router)
-    application.mount("/ui", StaticFiles(directory=UI_DIR), name="ui")
+    if UI_DIR.is_dir():
+        application.mount("/ui", StaticFiles(directory=UI_DIR), name="ui")
+    else:
+        LOGGER.warning(
+            "UI directory missing, serving the API without the operator panel path=%s",
+            UI_DIR,
+        )
 
     @application.get("/", include_in_schema=False)
-    def index() -> FileResponse:
-        return FileResponse(UI_DIR / "index.html")
+    def index() -> Response:
+        if not UI_INDEX_FILE.is_file():
+            LOGGER.warning(
+                "UI index missing, degraded to an API-only response path=%s",
+                UI_INDEX_FILE,
+            )
+            return Utf8JSONResponse(
+                status_code=503,
+                content={"detail": UI_UNAVAILABLE_MESSAGE},
+            )
+        return FileResponse(UI_INDEX_FILE)
 
     @application.get(
         "/health",

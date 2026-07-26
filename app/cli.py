@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -20,6 +21,7 @@ EXIT_INTERNAL_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_REFUSED_BY_POLICY = 3
 EXIT_PENDING_CONFIRMATION = 4
+EXIT_GUARDED_STEP_NOT_RUN = 5
 
 STATUS_EXIT_CODES = {
     "success": EXIT_SUCCESS,
@@ -28,12 +30,15 @@ STATUS_EXIT_CODES = {
     "refused": EXIT_REFUSED_BY_POLICY,
     "unsupported": EXIT_REFUSED_BY_POLICY,
     "pending_confirmation": EXIT_PENDING_CONFIRMATION,
+    "incomplete": EXIT_GUARDED_STEP_NOT_RUN,
+    "skipped": EXIT_GUARDED_STEP_NOT_RUN,
     "failed": EXIT_INTERNAL_FAILURE,
 }
 
 EXIT_CODE_EPILOG = (
     "退出码：0 成功（含已取消）；1 内部或工具失败；2 用法错误；"
-    "3 被策略拒绝（期望结果）；4 等待精确确认。"
+    "3 被策略拒绝（期望结果）；4 等待精确确认；"
+    "5 受控写步骤未执行，连续任务未全部完成（期望结果，不是故障）。"
 )
 
 
@@ -80,17 +85,62 @@ def main(argv: Sequence[str] | None = None) -> int:
             "explanation": f"CLI 调用失败：{exc}",
         }
         if args.json_output:
-            print(json.dumps(error_response, ensure_ascii=False, indent=2, default=str))
+            print(dump_json(error_response))
         else:
             print(error_response["explanation"], file=sys.stderr)
         return EXIT_INTERNAL_FAILURE
 
     if args.json_output:
-        print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
+        print(dump_json(response))
     else:
         print(response.get("explanation") or "请求已处理，但没有返回摘要。")
 
     return exit_code_for(response)
+
+
+def dump_json(payload: Any) -> str:
+    """Serialize to strict RFC 8259 JSON so `jq` and other strict parsers accept it."""
+
+    try:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+            allow_nan=False,
+        )
+    except ValueError:
+        return json.dumps(
+            _replace_non_finite(payload),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+            allow_nan=False,
+        )
+
+
+def _replace_non_finite(value: Any) -> Any:
+    if isinstance(value, float):
+        return _finite_float_or_name(value)
+    if isinstance(value, dict):
+        return {_json_key(key): _replace_non_finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_replace_non_finite(item) for item in value]
+    return value
+
+
+def _json_key(key: Any) -> Any:
+    if isinstance(key, float):
+        return _finite_float_or_name(key)
+    return key
+
+
+def _finite_float_or_name(value: float) -> Any:
+    if math.isfinite(value):
+        return value
+    if math.isnan(value):
+        return "NaN"
+    return "Infinity" if value > 0 else "-Infinity"
 
 
 def exit_code_for(response: dict[str, Any]) -> int:

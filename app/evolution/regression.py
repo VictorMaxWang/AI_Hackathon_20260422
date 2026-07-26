@@ -9,8 +9,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.agent.confirmation import confirmation_status_from_parts
 from app.agent.memory import AgentMemory
 from app.evolution import evaluate_execution
+from app.models.evidence import binding_probe_disclosure
 
 
 ALLOWED_SETUP_KEYS = frozenset({"memory", "expects_experience_store"})
@@ -806,6 +808,9 @@ def _run_legacy_case(case: Mapping[str, Any], orchestrator: Any) -> dict[str, An
             orchestrator=orchestrator,
         )
         checks.extend(turn_checks)
+        checks.extend(
+            _run_probe_disclosure_invariant(envelope, check_prefix=f"turn_{turn_index}")
+        )
 
     final_envelope = turn_results[-1]
     final_checks = _run_expectations(
@@ -892,6 +897,9 @@ def _run_replay_case(case: Mapping[str, Any], orchestrator: Any) -> dict[str, An
                 check_prefix=f"turn_{turn_index}",
                 orchestrator=orchestrator,
             )
+        )
+        checks.extend(
+            _run_probe_disclosure_invariant(envelope, check_prefix=f"turn_{turn_index}")
         )
 
     final_envelope = turn_results[-1]
@@ -1598,6 +1606,44 @@ def _build_orchestrator(orchestrator_factory: Any, case: Mapping[str, Any]) -> A
     return orchestrator_factory()
 
 
+def _run_probe_disclosure_invariant(
+    envelope: Mapping[str, Any],
+    *,
+    check_prefix: str,
+) -> list[dict[str, Any]]:
+    """Require every probe that ran outside execution.results to be disclosed.
+
+    ``must_not_execute_tools`` only reads ``execution.results``. Without this
+    invariant a read-only probe that genuinely touched the host could satisfy
+    that expectation by never appearing anywhere in the envelope, which would
+    make the benchmark pass for the wrong reason.
+    """
+
+    disclosure = binding_probe_disclosure(envelope.get("environment"))
+    if disclosure is None:
+        return []
+
+    tool_name = str(disclosure.get("tool_name") or "")
+    executed_tools = _executed_tools(envelope)
+    disclosed = tool_name in executed_tools or tool_name in _explanation_card_text(envelope)
+    return [
+        _check(
+            f"{check_prefix}.out_of_execution_probe_disclosed",
+            disclosed,
+            f"environment reports {tool_name} ran outside execution.results, "
+            "but no operator-facing surface discloses it",
+        )
+    ]
+
+
+def _explanation_card_text(envelope: Mapping[str, Any]) -> str:
+    parts: list[str] = [str(envelope.get("explanation") or "")]
+    for section in _explanation_card(envelope).values():
+        if isinstance(section, dict):
+            parts.append(str(section.get("summary") or ""))
+    return " ".join(parts)
+
+
 def _check(name: str, passed: bool, detail: str) -> dict[str, Any]:
     return {"name": name, "passed": passed, "detail": detail}
 
@@ -1760,32 +1806,21 @@ def _confirmation_token_payload(
 
 
 def _confirmation_status_from_envelope(envelope: Mapping[str, Any]) -> str:
-    risk_data = _risk(envelope)
+    """Label the turn's confirmation state exactly as the evidence chain does.
+
+    The harness must never hold its own opinion here: a benchmark that
+    disagreed with the evidence chain about whether a write was confirmed
+    would validate the wrong thing.
+    """
+
     plan_data = envelope.get("plan")
-    execution_data = _execution(envelope)
-    result_data = _result(envelope)
-    timeline = _timeline(envelope)
-
-    plan_status = str(plan_data.get("status") or "").lower() if isinstance(plan_data, dict) else ""
-    result_status = str(result_data.get("status") or "").lower()
-    result_error = str(result_data.get("error") or "").lower()
-    execution_results = execution_data.get("results") or []
-
-    if result_error == "confirmation_text_mismatch" or result_error.startswith(
-        "confirmation_token_"
-    ) or result_error == "missing_confirmation_token":
-        return "mismatch"
-    if result_status == "cancelled" or plan_status == "cancelled":
-        return "cancelled"
-    if result_status == "pending_confirmation" or plan_status == "pending_confirmation":
-        return "pending"
-    if plan_status == "confirmed":
-        return "confirmed"
-    if any(str(item.get("status") or "").lower() == "pending_confirmation" for item in timeline):
-        return "pending"
-    if risk_data.get("requires_confirmation") and execution_results:
-        return "confirmed"
-    return "not_required"
+    return confirmation_status_from_parts(
+        risk=_risk(envelope),
+        plan=plan_data if isinstance(plan_data, dict) else {},
+        execution=_execution(envelope),
+        result=_result(envelope),
+        timeline=_timeline(envelope),
+    )
 
 
 def _explanation_card(envelope: Mapping[str, Any]) -> dict[str, Any]:

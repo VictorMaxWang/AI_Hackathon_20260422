@@ -18,6 +18,7 @@ from app.agent.extraction import (
     extract_path as _extract_path,
     extract_port as _extract_port,
     extract_username as _extract_username,
+    mentions_privilege_token,
     split_clauses,
 )
 from app.agent.parser import (
@@ -762,6 +763,9 @@ def _port_process_steps(port: int) -> list[PlanStep]:
 
 
 def _has_unsupported_action(text: str) -> bool:
+    if mentions_privilege_token(text):
+        return True
+
     lower_text = text.lower()
     if _contains_any(
         text,

@@ -16,6 +16,10 @@ if TYPE_CHECKING:
     from app.agent.memory import AgentMemory
 
 
+INCOMPLETE_STATUS = "incomplete"
+UNKNOWN_STATUS = ExecutionStatus.UNKNOWN.value
+
+
 def apply_evo_lite_hook(
     envelope: Mapping[str, Any],
     *,
@@ -168,17 +172,32 @@ def _experience_status(
     envelope: Mapping[str, Any],
     evaluation: EvaluationResult,
 ) -> ExecutionStatus:
-    result_status = _status_value(_as_dict(envelope.get("result")).get("status"))
-    execution_status = _status_value(_as_dict(envelope.get("execution")).get("status"))
+    """Classify one turn for the experience store.
+
+    Every continuous status is mapped explicitly. ``unknown`` and
+    ``incomplete`` are checked before the evaluation verdict so a turn whose
+    guarded write never ran, or whose target state was never established, can
+    never be stored as a success.
+    """
+
+    result_data = _as_dict(envelope.get("result"))
+    execution_data = _as_dict(envelope.get("execution"))
+    result_status = _status_value(result_data.get("status"))
+    execution_status = _status_value(execution_data.get("status"))
     plan_status = _status_value(_as_dict(envelope.get("plan")).get("status"))
     risk_level = _status_value(_as_dict(envelope.get("risk")).get("risk_level"))
     allow = _as_dict(envelope.get("risk")).get("allow")
+    statuses = {result_status, execution_status, plan_status}
 
+    if UNKNOWN_STATUS in statuses or result_data.get("state_unknown") is True:
+        return ExecutionStatus.UNKNOWN
+    if INCOMPLETE_STATUS in statuses:
+        return ExecutionStatus.FAILED
     if evaluation.task_success and evaluation.safety_success:
         return ExecutionStatus.SUCCESS
-    if "pending_confirmation" in {result_status, execution_status, plan_status}:
+    if "pending_confirmation" in statuses:
         return ExecutionStatus.PENDING_CONFIRMATION
-    if "refused" in {result_status, execution_status, plan_status}:
+    if "refused" in statuses:
         return ExecutionStatus.REFUSED
     if risk_level == "s3" and allow is False:
         return ExecutionStatus.REFUSED

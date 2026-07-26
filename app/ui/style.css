@@ -519,6 +519,17 @@ input {
   border-color: rgba(158, 63, 47, 0.24);
 }
 
+.tool-call-warnings li {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tool-call-warnings li::before {
+  background: var(--pending);
+}
+
 .tool-call-command,
 .tool-call-output {
   display: block;

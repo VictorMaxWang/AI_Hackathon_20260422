@@ -589,7 +589,7 @@ def test_frontend_never_uses_innerhtml() -> None:
     assert "insertAdjacentHTML" not in source
 
 
-def test_frontend_sends_session_id_and_a_request_timeout() -> None:
+def test_frontend_leaves_the_session_to_the_httponly_cookie() -> None:
     observed = _node(
         """
 const fs = require("fs");
@@ -597,6 +597,7 @@ const panel = require(process.argv[1]);
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 const doc = makeDoc(input.ids);
 const requests = [];
+const storage = makeStorage();
 const scope = {
   fetch: function (url, init) {
     requests.push({ url: url, init: init });
@@ -607,7 +608,7 @@ const scope = {
     });
   },
   AbortSignal: { timeout: function (ms) { return { timeoutMs: ms }; } },
-  sessionStorage: makeStorage(),
+  sessionStorage: storage,
   crypto: { randomUUID: function () { return "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"; } }
 };
 
@@ -617,12 +618,13 @@ doc.nodes["operator-form"].listeners.submit[0]({ preventDefault: function () {} 
   process.stdout.write(JSON.stringify({
     url: requests[0].url,
     body: JSON.parse(requests[0].init.body),
+    credentials: requests[0].init.credentials,
     timeout: requests[0].init.signal.timeoutMs,
     status: doc.nodes["request-status"].textContent,
     disabled: doc.nodes["operator-request"].disabled,
     focused: doc.nodes["operator-request"].focused,
     ariaBusy: doc.nodes["operator-panel"].attributes["aria-busy"],
-    stored: scope.sessionStorage.values
+    stored: storage.values
   }));
 });
 """,
@@ -630,14 +632,14 @@ doc.nodes["operator-form"].listeners.submit[0]({ preventDefault: function () {} 
     )
 
     assert observed["url"] == "/api/chat"
-    assert observed["body"]["session_id"] == "aaaaaaaabbbbccccddddeeeeeeeeeeee"
-    assert observed["body"]["raw_user_input"] == "帮我查看当前磁盘使用情况"
+    assert observed["body"] == {"raw_user_input": "帮我查看当前磁盘使用情况"}
+    assert observed["credentials"] == "same-origin"
     assert observed["timeout"] == 60000
     assert observed["status"] == "控制面已更新"
     assert observed["disabled"] is False
     assert observed["focused"] is True
     assert observed["ariaBusy"] == "false"
-    assert observed["stored"]["guardedops.session_id"] == "aaaaaaaabbbbccccddddeeeeeeeeeeee"
+    assert observed["stored"] == {}
 
 
 @pytest.mark.parametrize(
@@ -746,7 +748,7 @@ doc.nodes["operator-form"].listeners.submit[0]({ preventDefault: function () {} 
         {"payload": envelope, "ids": _panel_element_ids()},
     )
 
-    assert observed["status"] == "服务端返回失败信封"
+    assert observed["status"] == "服务端返回失败信封（关联 ID feedface1234）"
     assert observed["badge"] == "失败"
     assert observed["recoveryHidden"] is False
     assert "feedface1234" in observed["recovery"]
@@ -886,6 +888,8 @@ def test_cli_exit_codes_separate_refusal_from_failure(
         "refused": cli.EXIT_REFUSED_BY_POLICY,
         "unsupported": cli.EXIT_REFUSED_BY_POLICY,
         "pending_confirmation": cli.EXIT_PENDING_CONFIRMATION,
+        "incomplete": cli.EXIT_GUARDED_STEP_NOT_RUN,
+        "skipped": cli.EXIT_GUARDED_STEP_NOT_RUN,
         "failed": cli.EXIT_INTERNAL_FAILURE,
         "weird": cli.EXIT_INTERNAL_FAILURE,
     }

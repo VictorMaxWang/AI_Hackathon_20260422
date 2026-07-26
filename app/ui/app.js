@@ -41,6 +41,8 @@
     cancelled: "已取消",
     confirmed: "已确认",
     skipped: "已跳过",
+    incomplete: "未完成",
+    aborted: "已中止",
     unknown: "未知",
     unsupported: "不支持",
   };
@@ -99,6 +101,8 @@
     warning: "警告",
     tool_call: "工具调用",
     ok: "正常",
+    incomplete: "未完成",
+    aborted: "已中止",
   };
 
   const TEXT_TRANSLATIONS = {
@@ -135,6 +139,8 @@
     "awaiting exact confirmation": "等待精确确认",
     "policy denied this request": "策略拒绝该请求",
     "bounded readonly plan": "受限只读计划",
+    "最终结果为 incomplete：受保护的写步骤没有执行。":
+      "最终结果为未完成：受保护的写步骤没有执行。",
   };
 
   const PREFLIGHT_TITLE_LABELS = {
@@ -154,7 +160,6 @@
     final_result: "最终结果",
   };
 
-  const SESSION_STORAGE_KEY = "guardedops.session_id";
   const REQUEST_TIMEOUT_MS = 60000;
 
   const HTTP_STATUS_MESSAGES = {
@@ -177,8 +182,10 @@
     pending: "pending",
     cancelled: "pending",
     skipped: "pending",
+    incomplete: "pending",
     refused: "blocked",
     failed: "blocked",
+    aborted: "blocked",
     mismatch: "blocked",
     required: "pending",
     info: "info",
@@ -203,8 +210,6 @@
       return;
     }
 
-    const sessionId = resolveSessionId(runtime);
-
     form.dataset.bound = "true";
     form.addEventListener("submit", async function (event) {
       event.preventDefault();
@@ -222,14 +227,13 @@
       try {
         const response = await requestChat(runtime, {
           raw_user_input: rawUserInput,
-          session_id: sessionId,
         });
 
         if (!response.ok) {
           const failurePayload = parseJsonSafely(await readBodyText(response));
           if (failurePayload && hasArray(asObject(failurePayload.operator_panel).explanation_sections)) {
             renderViewModel(doc, createViewModel(failurePayload, rawUserInput));
-            statusText.textContent = "服务端返回失败信封";
+            statusText.textContent = describeFailureEnvelope(failurePayload);
             return;
           }
           throw new Error(describeResponseFailure(response.status, failurePayload));
@@ -259,9 +263,18 @@
       headers: {
         "Content-Type": "application/json",
       },
+      credentials: "same-origin",
       body: JSON.stringify(body),
       signal: requestTimeoutSignal(scope),
     });
+  }
+
+  function describeFailureEnvelope(payload) {
+    const correlationId = firstText(asObject(payload).correlation_id);
+    if (!correlationId) {
+      return "服务端返回失败信封";
+    }
+    return "服务端返回失败信封（关联 ID " + correlationId + "）";
   }
 
   function requestTimeoutSignal(scope) {
@@ -346,51 +359,6 @@
       return "无法连接后端服务，请确认服务已启动。";
     }
     return firstText(error && error.message, "请求失败");
-  }
-
-  function resolveSessionId(scope) {
-    const store = safeSessionStorage(scope);
-    const existing = store ? firstText(store.getItem(SESSION_STORAGE_KEY)) : "";
-    if (existing) {
-      return existing;
-    }
-
-    const generated = generateSessionId(scope);
-    if (!store) {
-      return generated;
-    }
-
-    try {
-      store.setItem(SESSION_STORAGE_KEY, generated);
-    } catch (error) {
-      return generated;
-    }
-    return generated;
-  }
-
-  function safeSessionStorage(scope) {
-    try {
-      const store = scope && scope.sessionStorage;
-      return store && typeof store.getItem === "function" ? store : null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function generateSessionId(scope) {
-    const cryptoApi = scope && scope.crypto;
-    if (cryptoApi && typeof cryptoApi.randomUUID === "function") {
-      return cryptoApi.randomUUID().replace(/-/g, "");
-    }
-    if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
-      const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
-      return Array.prototype.map
-        .call(bytes, function (value) {
-          return ("0" + value.toString(16)).slice(-2);
-        })
-        .join("");
-    }
-    return "s" + Date.now().toString(16) + Math.random().toString(16).slice(2, 10);
   }
 
   function currentScope() {
@@ -639,6 +607,7 @@
       tool_calls: asList(execution.results).map(function (entry, index) {
         const item = asObject(entry);
         const step = asObject(asList(execution.steps)[index]);
+        const data = asObject(item.data);
         const success = item.success === true;
         return {
           order: index + 1,
@@ -646,8 +615,10 @@
           status: success ? "success" : "failed",
           success: success,
           args: [],
-          command: firstText(asObject(item.data).source),
+          command: firstText(data.source),
           error: firstText(item.error),
+          partial: data.partial === true,
+          warnings: uniqueStrings(data.warnings),
           output_excerpt: "",
           evidence_refs: [],
         };
@@ -1027,6 +998,8 @@
         command: firstText(item.command),
         error: localizeText(firstText(item.error)),
         outputExcerpt: firstText(item.output_excerpt),
+        partial: item.partial === true,
+        warnings: uniqueStrings(item.warnings),
         args: asList(item.args).map(function (argEntry) {
           const arg = asObject(argEntry);
           return {
@@ -1041,11 +1014,17 @@
     const failed = entries.filter(function (entry) {
       return entry.status !== "success";
     }).length;
+    const partial = entries.filter(function (entry) {
+      return entry.partial;
+    }).length;
+    const partialText = partial
+      ? "其中 " + partial + " 个只返回了不完整结果，不能当作完整清单。"
+      : "";
 
     return {
       visible: entries.length > 0,
       summary: entries.length
-        ? "本次共调用 " + entries.length + " 个白名单工具（失败 " + failed + " 个）；工具集合固定，不存在任意 shell。"
+        ? "本次共调用 " + entries.length + " 个白名单工具（失败 " + failed + " 个）；工具集合固定，不存在任意 shell。" + partialText
         : "",
       entries: entries,
     };
@@ -1056,7 +1035,7 @@
     if (["refused", "unsupported", "failed"].indexOf(lowered) >= 0) {
       return "blocked";
     }
-    if (["pending_confirmation", "cancelled"].indexOf(lowered) >= 0) {
+    if (["pending_confirmation", "cancelled", "incomplete", "skipped"].indexOf(lowered) >= 0) {
       return "pending";
     }
     if (["unknown", ""].indexOf(lowered) >= 0) {
@@ -1273,8 +1252,28 @@
       createElement(doc, "h3", "check-title", entry.order + ". " + entry.toolName)
     );
     top.appendChild(createOutcomeChip(doc, entry.statusLabel, entry.tone));
+    if (entry.partial) {
+      top.appendChild(createOutcomeChip(doc, "部分结果", "pending"));
+    }
     node.appendChild(top);
 
+    if (entry.partial) {
+      node.appendChild(
+        createElement(
+          doc,
+          "p",
+          "check-summary",
+          "本次遍历不完整：部分目录未能读取，结果不能视为该路径的完整清单。"
+        )
+      );
+    }
+    if (entry.warnings.length) {
+      const warningList = createElement(doc, "ul", "compact-list tool-call-warnings");
+      entry.warnings.forEach(function (warning) {
+        warningList.appendChild(createElement(doc, "li", "", warning));
+      });
+      node.appendChild(warningList);
+    }
     if (entry.command) {
       node.appendChild(createElement(doc, "code", "tool-call-command", entry.command));
     }
@@ -1684,7 +1683,9 @@
       .replace(/\bsuccess\b/g, "成功")
       .replace(/\bready\b/g, "就绪")
       .replace(/\bfailed\b/g, "失败")
-      .replace(/\brefused\b/g, "已拒绝");
+      .replace(/\brefused\b/g, "已拒绝")
+      .replace(/\bincomplete\b/g, "未完成")
+      .replace(/\baborted\b/g, "已中止");
   }
 
   function formatStatusLabel(status) {
@@ -1826,10 +1827,10 @@
     createFailureViewModel: createFailureViewModel,
     createViewModel: createViewModel,
     buildFallbackPanel: buildFallbackPanel,
+    describeFailureEnvelope: describeFailureEnvelope,
     describeResponseFailure: describeResponseFailure,
     normalizeDetail: normalizeDetail,
     normalizeToolCalls: normalizeToolCalls,
     renderViewModel: renderViewModel,
-    resolveSessionId: resolveSessionId,
   };
 });

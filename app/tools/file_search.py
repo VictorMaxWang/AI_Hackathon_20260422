@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+from decimal import Decimal
 from typing import Any
 
 from app.models import CommandResult, ToolResult
@@ -229,10 +231,12 @@ def _validate_name_contains(name_contains: Any) -> tuple[str | None, str | None]
 def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
     if value is None:
         value = default
+    if not _is_finite_number(value):
+        raise ValueError("numeric limits must be finite integers")
     try:
         number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("numeric limits must be integers") from exc
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("numeric limits must be finite integers") from exc
 
     return min(max(number, minimum), maximum)
 
@@ -240,13 +244,25 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
 def _optional_positive_int(value: Any) -> int | None:
     if value is None:
         return None
+    if not _is_finite_number(value):
+        raise ValueError("modified_within_days must be a finite positive integer")
     try:
         number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("modified_within_days must be a positive integer") from exc
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("modified_within_days must be a finite positive integer") from exc
     if number < 1:
-        raise ValueError("modified_within_days must be a positive integer")
+        raise ValueError("modified_within_days must be a finite positive integer")
     return number
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Non-finite floats reach here through ``json.loads('1e999')`` at the LLM boundary."""
+
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, Decimal):
+        return value.is_finite()
+    return True
 
 
 def _parse_find_output(stdout: str) -> list[dict[str, Any]]:

@@ -342,6 +342,24 @@ def test_two_concurrent_confirmations_execute_the_write_exactly_once() -> None:
     assert statuses == ["refused", "success"]
 
 
+def test_executing_a_claimed_action_does_not_erase_a_newer_pending_action() -> None:
+    mocks = HardeningToolMocks()
+    orchestrator = make_orchestrator(mocks)
+
+    def delete_user_then_start_another_turn(executor: Any, **kwargs: Any) -> ToolResult:
+        orchestrator.run("请创建普通用户 later_user")
+        return mocks.delete_user(executor, **kwargs)
+
+    orchestrator.tools["delete_user_tool"] = delete_user_then_start_another_turn
+    orchestrator.run("请删除普通用户 demo_guest")
+    executed = orchestrator.run("确认删除普通用户 demo_guest")
+
+    assert executed["result"]["status"] == "success"
+    pending_action = orchestrator.memory.pending_action
+    assert pending_action is not None
+    assert pending_action.confirmation_text == "确认创建普通用户 later_user"
+
+
 def test_a_confirmation_token_id_can_only_be_claimed_once() -> None:
     token_id = new_confirmation_token_id()
 

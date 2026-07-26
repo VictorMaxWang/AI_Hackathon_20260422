@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -44,18 +45,40 @@ SESSION_ID_MAX_LENGTH = 128
 SESSION_TTL_SECONDS = 1800.0
 MAX_ACTIVE_SESSIONS = 128
 TOOL_CALL_OUTPUT_MAX_CHARS = 400
+TOOL_CALL_MAX_WARNINGS = 5
+TOOL_CALL_WARNING_MAX_CHARS = 200
 MAX_VALIDATION_ERRORS = 10
 VALIDATION_MESSAGE_MAX_CHARS = 200
 
+SESSION_CAPACITY_MESSAGE = (
+    "服务端待确认会话已达上限。为了不丢弃正在等待精确确认的写操作，本次请求不再新建会话。"
+    "请先完成或取消已有的确认，然后重试。"
+)
+SESSION_CAPACITY_RETRY_AFTER_SECONDS = 30
+
 _SESSION_ID_PATTERN = re.compile(r"\A[A-Za-z0-9._:-]{1,%d}\Z" % SESSION_ID_MAX_LENGTH)
 _REGISTRY_LOCK = threading.Lock()
+
+LOGGER = logging.getLogger("guardedops.api.sessions")
+
+
+class SessionCapacityExceeded(RuntimeError):
+    """No session could be freed without discarding guarded state awaiting confirmation."""
 
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     raw_user_input: str = Field(min_length=1, max_length=MAX_RAW_USER_INPUT_LENGTH)
-    session_id: str | None = Field(default=None, max_length=SESSION_ID_MAX_LENGTH)
+    session_id: str | None = Field(
+        default=None,
+        max_length=SESSION_ID_MAX_LENGTH,
+        description=(
+            "未经认证的持有者标识（bearer identifier）：任何出示该值的客户端都拥有这份会话的"
+            "待确认动作。本 Demo 是单操作员模型，不提供多租户隔离保证。"
+            "浏览器请改用服务端签发的 httpOnly Cookie；该字段留给 CLI 与脚本。"
+        ),
+    )
 
     @field_validator("raw_user_input")
     @classmethod
@@ -74,9 +97,46 @@ class ChatSession:
     lock: threading.Lock = field(default_factory=threading.Lock)
     last_seen: float = 0.0
 
+    def has_pending_action(self) -> bool:
+        """Any pending action at all — the audit view, used when something is discarded."""
+
+        try:
+            return self._pending_action() is not None
+        except Exception:  # pragma: no cover - an unreadable orchestrator stays pinned
+            return True
+
+    def pins_eviction(self) -> bool:
+        """Only a still-confirmable pending action pins the session in the cache.
+
+        The confirmation token carries its own TTL: once it has passed, the phrase
+        would be rejected anyway, so the cache entry no longer protects anything the
+        operator can still act on. That keeps pending-action lifetime from turning
+        into an unbounded hold on the session cache.
+        """
+
+        try:
+            pending = self._pending_action()
+            if pending is None:
+                return False
+            token = getattr(pending, "confirmation_token", None)
+            is_expired = getattr(token, "is_expired", None)
+            return not (callable(is_expired) and is_expired())
+        except Exception:  # pragma: no cover - an unreadable orchestrator stays pinned
+            return True
+
+    def _pending_action(self) -> Any:
+        memory = getattr(self.orchestrator, "memory", None)
+        return getattr(memory, "pending_action", None)
+
 
 class SessionRegistry:
-    """Bounded per-session orchestrator cache with TTL expiry and LRU eviction."""
+    """Bounded per-session orchestrator cache with TTL expiry and pending-aware eviction.
+
+    A session holding a pending action is pinned: eviction walks further down the LRU
+    order rather than dropping it, and when every cached session is pinned the *new*
+    session is rejected instead. Refusing to start new work is safer than silently
+    voiding a write the operator was already told is waiting for exact confirmation.
+    """
 
     def __init__(
         self,
@@ -97,16 +157,20 @@ class SessionRegistry:
             self._drop_expired(now)
             session = self._sessions.get(session_id)
             if session is None:
+                self._make_room_for_new_session()
                 session = ChatSession(session_id=session_id, orchestrator=factory())
                 self._sessions[session_id] = session
             session.last_seen = now
             self._sessions.move_to_end(session_id)
-            self._drop_overflow()
             return session
 
     def active_session_ids(self) -> list[str]:
         with self._lock:
             return list(self._sessions)
+
+    def pending_session_ids(self) -> list[str]:
+        with self._lock:
+            return [key for key, session in self._sessions.items() if session.has_pending_action()]
 
     def _drop_expired(self, now: float) -> None:
         expired = [
@@ -115,11 +179,31 @@ class SessionRegistry:
             if now - session.last_seen > self._ttl_seconds
         ]
         for key in expired:
-            del self._sessions[key]
+            self._discard(key, reason="ttl_expired")
 
-    def _drop_overflow(self) -> None:
-        while len(self._sessions) > self._max_sessions:
-            self._sessions.popitem(last=False)
+    def _make_room_for_new_session(self) -> None:
+        while len(self._sessions) >= self._max_sessions:
+            victim = self._first_evictable_session_id()
+            if victim is None:
+                raise SessionCapacityExceeded(
+                    f"all {len(self._sessions)} cached sessions hold a confirmable pending action"
+                )
+            self._discard(victim, reason="lru_evicted")
+
+    def _first_evictable_session_id(self) -> str | None:
+        for key, session in self._sessions.items():
+            if not session.pins_eviction():
+                return key
+        return None
+
+    def _discard(self, session_id: str, *, reason: str) -> None:
+        session = self._sessions.pop(session_id, None)
+        if session is not None and session.has_pending_action():
+            LOGGER.warning(
+                "discarded a session holding a pending action session_id=%s reason=%s",
+                session_id,
+                reason,
+            )
 
 
 def get_executor() -> BaseExecutor:
@@ -149,13 +233,23 @@ def session_registry(app: FastAPI) -> SessionRegistry:
         "只允许白名单工具执行，并返回带证据链的统一信封。\n\n"
         "会话隔离：`session_id`（或 `X-GuardedOps-Session` 头、`guardedops_session` Cookie）"
         "决定使用哪一份多轮上下文；未携带时服务端签发一个新会话，"
-        "任何一个会话的待确认动作都不会出现在另一个会话的响应里。"
+        "任何一个会话的待确认动作都不会出现在另一个会话的响应里。\n\n"
+        "**信任模型（请照实理解，不要当成多租户隔离）**："
+        "`session_id` 是未经认证的持有者标识，任何出示该值的客户端都拥有这份会话的待确认动作。"
+        "本 Demo 面向单操作员：浏览器走服务端签发的 httpOnly Cookie（页面 JavaScript 读不到它），"
+        "请求体字段与请求头形式保留给 CLI 与脚本。"
     ),
     response_description="统一响应信封：intent / risk / plan / execution / result / evidence_chain / operator_panel",
     responses={
         200: {"description": "请求已受控处理（成功、等待确认或被策略拒绝都返回 200）"},
         422: {"description": "请求体不合法，例如 raw_user_input 为空或超过长度上限"},
         500: {"description": "服务端内部错误，返回带 correlation_id 的失败信封，不会执行任何命令"},
+        503: {
+            "description": (
+                "所有在册会话都持有待确认动作，服务端拒绝新建会话，"
+                "而不是丢弃已经受控的待确认写操作"
+            )
+        },
     },
 )
 def chat(
@@ -164,11 +258,23 @@ def chat(
     response: Response,
     executor: BaseExecutor = Depends(get_executor),
 ) -> dict[str, Any]:
-    session_id, issued = _resolve_session_id(http_request, request.session_id)
+    session_id, session_source = _resolve_session_id(http_request, request.session_id)
     http_request.state.raw_user_input = request.raw_user_input
     http_request.state.session_id = session_id
 
-    session = _acquire_session(http_request.app, session_id=session_id, executor=executor)
+    try:
+        session = _acquire_session(http_request.app, session_id=session_id, executor=executor)
+    except SessionCapacityExceeded as exc:
+        LOGGER.warning(
+            "refused a new session because every cached session is pending confirmation: %s",
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=SESSION_CAPACITY_MESSAGE,
+            headers={"Retry-After": str(SESSION_CAPACITY_RETRY_AFTER_SECONDS)},
+        ) from exc
+
     with session.lock:
         envelope = dict(session.orchestrator.run(request.raw_user_input))
 
@@ -177,7 +283,7 @@ def chat(
         envelope,
         raw_user_input=request.raw_user_input,
     )
-    if issued:
+    if session_source in {"issued", "cookie"}:
         response.set_cookie(
             SESSION_COOKIE_NAME,
             session_id,
@@ -321,17 +427,25 @@ def _acquire_session(
     return registry.acquire(session_id, lambda: ReadonlyOrchestrator(executor))
 
 
-def _resolve_session_id(http_request: Request, requested: str | None) -> tuple[str, bool]:
+def _resolve_session_id(http_request: Request, requested: str | None) -> tuple[str, str]:
+    """Resolve the session id and where it came from.
+
+    The returned id is an unauthenticated bearer identifier, not proof of identity:
+    whichever client presents it owns that session's pending action. The demo is a
+    single-operator tool, so the browser path uses a server-issued httpOnly cookie
+    that page JavaScript cannot read, and the body/header forms stay for CLI use.
+    """
+
     candidates = (
-        requested,
-        http_request.headers.get(SESSION_HEADER_NAME),
-        http_request.cookies.get(SESSION_COOKIE_NAME),
+        ("body", requested),
+        ("header", http_request.headers.get(SESSION_HEADER_NAME)),
+        ("cookie", http_request.cookies.get(SESSION_COOKIE_NAME)),
     )
-    for candidate in candidates:
+    for source, candidate in candidates:
         normalized = _normalize_session_id(candidate)
         if normalized:
-            return normalized, False
-    return uuid.uuid4().hex, True
+            return normalized, source
+    return uuid.uuid4().hex, "issued"
 
 
 def _normalize_session_id(value: Any) -> str:
@@ -520,6 +634,8 @@ def _build_tool_calls(
                 "args": _normalize_labeled_args(step.get("args")),
                 "command": _first_text(data.get("source")),
                 "error": _first_text(result.get("error")),
+                "partial": bool(data.get("partial")),
+                "warnings": _tool_warnings(data.get("warnings")),
                 "output_excerpt": _tool_output_excerpt(result.get("data")),
                 "started_at": _first_text(step.get("started_at")),
                 "finished_at": _first_text(step.get("finished_at")),
@@ -565,6 +681,13 @@ def _tool_output_excerpt(value: Any) -> str:
     if value is None:
         return ""
     return _compact_json(value, limit=TOOL_CALL_OUTPUT_MAX_CHARS)
+
+
+def _tool_warnings(value: Any) -> list[str]:
+    warnings: list[str] = []
+    for item in _string_list(value)[:TOOL_CALL_MAX_WARNINGS]:
+        warnings.append(_compact_json(item, limit=TOOL_CALL_WARNING_MAX_CHARS))
+    return warnings
 
 
 def _compact_json(value: Any, *, limit: int) -> str:
@@ -853,7 +976,7 @@ def _plan_preflight_status(plan_status: str) -> str:
     lowered = plan_status.lower()
     if lowered in {"refused", "unsupported", "failed"}:
         return "blocked"
-    if lowered in {"pending_confirmation", "cancelled"}:
+    if lowered in {"pending_confirmation", "cancelled", "incomplete", "skipped"}:
         return "pending"
     if lowered in {"unknown", ""}:
         return "not_available"
@@ -966,7 +1089,7 @@ def _severity_for_timeline_status(status: str) -> str:
     lowered = status.lower()
     if lowered in {"failed", "refused", "aborted"}:
         return "critical"
-    if lowered in {"pending_confirmation", "cancelled", "skipped"}:
+    if lowered in {"pending_confirmation", "cancelled", "skipped", "incomplete"}:
         return "warning"
     return "info"
 

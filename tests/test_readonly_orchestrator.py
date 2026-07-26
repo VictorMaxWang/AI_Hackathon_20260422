@@ -251,6 +251,62 @@ def test_unknown_request_does_not_execute_any_tool() -> None:
     assert "当前只支持只读基础能力" in result["explanation"]
 
 
+def test_a_confirm_prefixed_readonly_request_is_parsed_normally() -> None:
+    for raw_user_input, expected_intent in [
+        ("确认一下磁盘使用情况", "query_disk_usage"),
+        ("确认当前有哪些进程占用 CPU", "query_process"),
+        ("确认 8080 端口现在是谁在占用", "query_port"),
+    ]:
+        mocks = ToolMocks()
+        result = make_orchestrator(mocks).run(raw_user_input)
+
+        assert result["intent"]["intent"] == expected_intent, raw_user_input
+        assert result["result"]["status"] == "success", raw_user_input
+
+
+def test_a_confirm_prefixed_write_sentence_never_becomes_a_fresh_write_intent() -> None:
+    for raw_user_input in [
+        "确认创建普通用户 demo_guest",
+        "确认删除普通用户 demo_guest",
+        "确认帮我创建普通用户 demo_guest",
+    ]:
+        mocks = ToolMocks()
+        result = make_orchestrator(mocks).run(raw_user_input)
+
+        assert result["result"]["status"] == "refused", raw_user_input
+        assert result["intent"]["intent"] not in {"create_user", "delete_user"}, raw_user_input
+        assert result["result"].get("confirmation_text") is None, raw_user_input
+        assert mocks.calls == [], raw_user_input
+
+
+def test_a_time_filtered_file_search_is_not_read_as_a_write() -> None:
+    for raw_user_input in [
+        "在 /home/demo 下找最近 7 天修改的 conf 文件",
+        "查找 /var/log 下最近 7 天修改过的 error 文件",
+        "找出 /var/log 下最近 7 天改动过的 error 文件",
+        "在 /var/log 里找最近 3 天变更的日志文件",
+    ]:
+        mocks = ToolMocks()
+        result = make_orchestrator(mocks).run(raw_user_input)
+
+        assert result["intent"]["intent"] == "search_files", raw_user_input
+        assert result["intent"]["requires_write"] is False, raw_user_input
+        assert result["result"]["status"] == "success", raw_user_input
+
+
+def test_an_actual_modify_request_is_still_refused_as_a_write() -> None:
+    for raw_user_input in [
+        "修改 /etc/hosts 里的这一行",
+        "更改 /var/www 下的配置",
+    ]:
+        mocks = ToolMocks()
+        result = make_orchestrator(mocks).run(raw_user_input)
+
+        assert result["intent"]["requires_write"] is True, raw_user_input
+        assert result["result"]["status"] == "refused", raw_user_input
+        assert mocks.calls == [], raw_user_input
+
+
 def test_response_contains_stable_top_level_sections() -> None:
     mocks = ToolMocks()
     result = make_orchestrator(mocks).run("查一下 3306 端口")

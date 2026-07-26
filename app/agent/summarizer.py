@@ -19,6 +19,16 @@ from app.models.evidence import (
     EvidenceStage,
     ExplanationCard,
     ExplanationSection,
+    binding_probe_disclosure,
+    final_outcome_assertion_summary,
+    is_state_unknown,
+    tool_call_records,
+)
+
+
+STATE_UNKNOWN_SUMMARY = (
+    "请求在工具执行之后中断，已发生的工具调用可能已经生效，"
+    "当前目标状态未知，请人工核对目标状态后再决定下一步。"
 )
 
 
@@ -47,6 +57,8 @@ class ReadonlySummarizer:
                 tool_result.error
                 or "当前本地环境不支持此进程查询方式。建议在 Linux/SSH 目标环境中执行，或使用支持该查询的系统工具。"
             )
+        if status == "unknown":
+            return f"{STATE_UNKNOWN_SUMMARY}{f'原因：{reason}。' if reason else ''}"
         if status in {"unsupported", "refused", "skipped"}:
             return f"{reason or '当前只支持只读基础能力'}，未执行任何命令。"
         if status == "failed":
@@ -99,6 +111,9 @@ class ReadonlySummarizer:
                 "连续任务未全部完成：受策略或条件保护的写步骤没有执行，"
                 f"因此不能视为成功。原因：{reason or '写步骤条件未满足'}。{delete_reason}"
             )
+
+        if status == "unknown":
+            return f"连续任务状态未知：{STATE_UNKNOWN_SUMMARY}{delete_reason}"
 
         if status == "aborted":
             return f"连续任务已中止：{reason or '前置步骤未成功'}。{delete_reason}"
@@ -184,6 +199,8 @@ class ReadonlySummarizer:
                 summary=_execution_section_summary(
                     legacy_explanation=legacy_explanation,
                     execution_data=execution_data,
+                    environment_data=environment_data,
+                    result_data=result_data,
                     blocked_assertion=blocked_assertion,
                 ),
                 evidence_refs=_merge_refs(
@@ -377,26 +394,45 @@ def _execution_section_summary(
     *,
     legacy_explanation: str | None,
     execution_data: dict[str, Any],
+    environment_data: dict[str, Any],
+    result_data: dict[str, Any],
     blocked_assertion: dict[str, Any] | None,
 ) -> str:
-    results = [item for item in _as_list(execution_data.get("results")) if isinstance(item, dict)]
-    if results:
-        successes = sum(1 for item in results if item.get("success") is True)
-        tool_names = [str(item.get("tool_name") or "unknown") for item in results]
-        prefix = (
-            f"执行证据：共记录 {len(results)} 次白名单工具调用，成功 {successes} 次；"
+    records = tool_call_records(execution_data)
+    probe_suffix = _binding_probe_suffix(environment_data)
+
+    if records:
+        successes = sum(1 for record in records if record.success is True)
+        pending = [record for record in records if not record.result_recorded]
+        tool_names = [record.tool_name for record in records]
+        summary = (
+            f"执行证据：共记录 {len(records)} 次白名单工具调用，成功 {successes} 次；"
             f"工具链路：{' -> '.join(tool_names)}。"
         )
+        if pending:
+            summary += (
+                f"其中 {len(pending)} 次调用没有回执结果，"
+                "不能据此认定这些调用没有发生。"
+            )
+        if is_state_unknown(result_data, execution_data):
+            summary += STATE_UNKNOWN_SUMMARY
         if legacy_explanation:
-            return f"{prefix} 摘要：{legacy_explanation}"
-        return prefix
+            summary = f"{summary} 摘要：{legacy_explanation}"
+        return f"{summary}{probe_suffix}"
 
     if blocked_assertion is not None:
-        return f"执行证据：{blocked_assertion.get('summary')}"
+        return f"执行证据：{blocked_assertion.get('summary')}{probe_suffix}"
 
     if legacy_explanation:
-        return f"执行证据：{legacy_explanation}"
-    return "执行证据：当前没有工具调用记录。"
+        return f"执行证据：{legacy_explanation}{probe_suffix}"
+    return f"执行证据：当前没有工具调用记录。{probe_suffix}"
+
+
+def _binding_probe_suffix(environment_data: dict[str, Any]) -> str:
+    disclosure = binding_probe_disclosure(environment_data)
+    if disclosure is None:
+        return ""
+    return str(disclosure.get("summary") or "")
 
 
 def _result_section_summary(
@@ -409,7 +445,7 @@ def _result_section_summary(
     if outcome_assertion is not None:
         parts.append(str(outcome_assertion.get("summary") or "").strip())
     else:
-        parts.append(f"最终状态：{result_data.get('status') or 'unknown'}。")
+        parts.append(final_outcome_assertion_summary(result_data))
 
     if post_check_assertion is not None:
         parts.append(str(post_check_assertion.get("summary") or "").strip())
@@ -450,6 +486,8 @@ def _residual_section_summary(
     safe_alternative = risk_data.get("safe_alternative")
     error = result_data.get("error")
 
+    if is_state_unknown(result_data):
+        return f"残余风险/下一步：{STATE_UNKNOWN_SUMMARY}"
     if status == "pending_confirmation":
         return f"下一步：输入精确确认语继续。{_confirmation_text_suffix(confirmation_text)}"
     if status == "refused":

@@ -12,6 +12,10 @@ class ExecutionStatus(StrEnum):
     FAILED = "failed"
     REFUSED = "refused"
     PENDING_CONFIRMATION = "pending_confirmation"
+    UNKNOWN = "unknown"
+
+
+STATE_UNKNOWN_STATUS = ExecutionStatus.UNKNOWN.value
 
 
 class CommandResult(BaseModel):

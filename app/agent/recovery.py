@@ -5,7 +5,10 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from app.models.evidence import is_state_unknown
 
+
+FAILURE_UNKNOWN_STATE = "unknown_state_after_side_effects"
 FAILURE_CONFIRMATION_MISMATCH = "confirmation_mismatch"
 FAILURE_ENVIRONMENT_DRIFT = "environment_drift"
 FAILURE_PERMISSION_DENIED = "permission_denied"
@@ -48,6 +51,9 @@ def build_recovery_suggestion(
     execution_data = _as_dict(execution)
     result_data = _as_dict(result)
     timeline = [item for item in (timeline or []) if isinstance(item, dict)]
+
+    if is_state_unknown(result_data, execution_data):
+        return _unknown_state_suggestion(execution_data, timeline)
 
     final_status = _lower(result_data.get("status") or execution_data.get("status") or plan_data.get("status"))
     final_error = _lower(result_data.get("error"))
@@ -252,6 +258,61 @@ def build_recovery_suggestion(
         requires_confirmation_for_recovery=False,
         can_retry_safely=False,
     )
+
+
+def _unknown_state_suggestion(
+    execution_data: dict[str, Any],
+    timeline: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Recovery for a turn that crashed once tool calls had already happened.
+
+    Nothing here may claim the change was rolled back or refused: the operator
+    is told to establish the real state before anything else runs.
+    """
+
+    executed = _invoked_tool_names(execution_data, timeline)
+    executed_text = ", ".join(executed[:5]) if executed else "at least one tool"
+    return _build_suggestion(
+        failure_type=FAILURE_UNKNOWN_STATE,
+        why_it_failed=(
+            "The turn was interrupted after tool execution had already started, so GuardedOps "
+            "cannot assert whether the change was applied. "
+            f"Tools that were invoked before the interruption: {executed_text}. "
+            "Treat the target state as unknown until it is verified."
+        ),
+        safe_next_steps=[
+            "Verify the current target state manually before issuing any follow-up request.",
+            "Do not replay the interrupted request; submit a fresh one only after the real state is confirmed.",
+        ],
+        suggested_readonly_diagnostics=[
+            "Review execution.steps and the tool_call evidence events to see which tool ran last.",
+            "Run a bounded read-only check against the same target to establish its current state.",
+        ],
+        requires_confirmation_for_recovery=True,
+        can_retry_safely=False,
+    )
+
+
+def _invoked_tool_names(
+    execution_data: dict[str, Any],
+    timeline: list[dict[str, Any]],
+) -> list[str]:
+    names: list[str] = []
+    for item in _as_list(execution_data.get("steps")):
+        data = _as_dict(item)
+        name = data.get("tool_name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    for item in _as_list(execution_data.get("results")):
+        data = _as_dict(item)
+        name = data.get("tool_name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    for item in timeline:
+        name = item.get("tool_name") or item.get("intent")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return _unique_nonempty(names)
 
 
 def _build_suggestion(

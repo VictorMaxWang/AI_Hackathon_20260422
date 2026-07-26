@@ -21,9 +21,11 @@ from app.agent.extraction import (
     USER_CONTEXT_REFS,
     contains_any as _contains_any,
     extract_all_usernames,
+    extract_assigned_groups,
     extract_normal_user_token,
     looks_like_confirmation_reply,
     mentions_privilege_token,
+    starts_with_confirmation_prefix,
     tool_name_for_intent,
 )
 from app.agent.llm_parser import candidate_target_is_safe, parse_with_llm
@@ -65,6 +67,7 @@ from app.models.evidence import (
 )
 from app.models.intent import ExecutionPlan, PlanStep
 from app.policy import evaluate as evaluate_policy
+from app.policy.rules import has_privileged_group, is_privileged_group
 from app.tools.disk import disk_usage_tool
 from app.tools.env_probe import env_probe_tool
 from app.tools.file_search import file_search_tool
@@ -97,6 +100,41 @@ PROCESS_QUERY_TOOL_NAME = "process_query_tool"
 REPLAYED_CONFIRMATION_TOKEN = "confirmation_token_already_used"
 NO_PENDING_ACTION_ERROR = "no_pending_action_to_confirm"
 CONTINUOUS_PENDING_KEY = "continuous_task"
+PRIVILEGE_ACTION_WORDS: tuple[str, ...] = (
+    "创建",
+    "新建",
+    "新增",
+    "添加",
+    "删除",
+    "删掉",
+    "移除",
+    "加入",
+    "加到",
+    "加进",
+    "放到",
+    "放进",
+    "移入",
+    "归到",
+    "给",
+    "授予",
+    "提升",
+    "设为",
+    "设成",
+    "设置",
+    "改成",
+    "允许",
+    "让他",
+    "让她",
+    "让它",
+    "create",
+    "add",
+    "delete",
+    "remove",
+    "grant",
+    "usermod",
+    "useradd",
+)
+UNSUPPORTED_GROUP_REASON = "当前不支持为用户附加用户组"
 CHECKPOINT_KEY = "checkpoint"
 VERIFY_USER_EXISTS_INTENT = "verify_user_exists"
 VERIFY_USER_ABSENT_INTENT = "verify_user_absent"
@@ -731,7 +769,6 @@ class ReadonlyOrchestrator:
         parsed_intent = _parsed_intent_from_pending(pending_action, raw_user_input)
         risk = evaluate_policy(parsed_intent)
         if not _requires_pending_confirmation(risk):
-            self.memory.clear_pending_action()
             reason = _policy_refusal_reason(risk)
             timeline.append(
                 _timeline_entry(
@@ -772,7 +809,6 @@ class ReadonlyOrchestrator:
 
         checkpoint = _pending_checkpoint(pending_action)
         if checkpoint is None:
-            self.memory.clear_pending_action()
             reason = "safe checkpoint is missing; resume is refused"
             timeline.append(_drift_timeline_entry(step, reason))
             _append_aborted_remaining_steps(
@@ -804,7 +840,6 @@ class ReadonlyOrchestrator:
         )
         timeline.extend(revalidation_entries)
         if revalidation_error is not None:
-            self.memory.clear_pending_action()
             _append_aborted_remaining_steps(
                 plan.steps[pending_step_index + 1 :],
                 timeline,
@@ -825,7 +860,6 @@ class ReadonlyOrchestrator:
                 execution_results=execution_results,
             )
 
-        self.memory.clear_pending_action()
         tool_result, execution_step = self._execute_continuous_step(
             step,
             parsed_intent,
@@ -937,7 +971,6 @@ class ReadonlyOrchestrator:
         pending_action: PendingAction,
         error_code: str,
     ) -> dict[str, Any]:
-        self.memory.clear_pending_action()
         plan = ExecutionPlan.model_validate(pending_action.context["plan"])
         step = plan.steps[int(pending_action.context["pending_step_index"])]
         timeline = list(pending_action.context.get("timeline") or [])
@@ -1464,7 +1497,6 @@ class ReadonlyOrchestrator:
         pending_action: PendingAction,
         error_code: str,
     ) -> dict[str, Any]:
-        self.memory.clear_pending_action()
         parsed_intent = _parsed_intent_from_pending(pending_action, raw_user_input)
         reason = _confirmation_token_error_reason(error_code)
         risk = PolicyDecision(
@@ -1497,7 +1529,6 @@ class ReadonlyOrchestrator:
         raw_user_input: str,
         pending_action: PendingAction,
     ) -> dict[str, Any]:
-        self.memory.clear_pending_action()
         parsed_intent = _parsed_intent_from_pending(pending_action, raw_user_input)
         risk = PolicyDecision(
             risk_level=pending_action.risk_level,
@@ -1529,6 +1560,13 @@ class ReadonlyOrchestrator:
         raw_user_input: str,
         pending_action: PendingAction,
     ) -> dict[str, Any]:
+        """Run the action already claimed under the lock by ``_claim_pending_action``.
+
+        The claim popped this action, so nothing here may clear the slot again:
+        a later clear would erase whatever pending action a concurrent turn has
+        since put there.
+        """
+
         parsed_intent = _parsed_intent_from_pending(pending_action, raw_user_input)
         risk = evaluate_policy(parsed_intent)
         plan = ReadonlyPlan(
@@ -1538,7 +1576,6 @@ class ReadonlyOrchestrator:
         )
 
         if not _requires_pending_confirmation(risk):
-            self.memory.clear_pending_action()
             explanation = "确认语已匹配，但策略重新评估拒绝执行，未调用任何工具。"
             return self._envelope(
                 parsed_intent=parsed_intent,
@@ -1590,7 +1627,6 @@ class ReadonlyOrchestrator:
                     data=None,
                     error=str(exc),
                 )
-        self.memory.clear_pending_action()
         if tool_result.success:
             self.memory.remember_intent(parsed_intent, risk_level=risk.risk_level)
 
@@ -1626,8 +1662,25 @@ def run_readonly_request(executor: Any, raw_user_input: str) -> dict[str, Any]:
     return ReadonlyOrchestrator(executor).run(raw_user_input)
 
 
+def _names_privilege_target(raw_user_input: str) -> bool:
+    """Report a request that asks for a privilege on a user or group.
+
+    The multi-step planner emits a create_user step with ``no_sudo`` hardcoded
+    and consults no privilege detector, so letting it read a request that names
+    sudo, a privileged group, root or uid 0 would drop the privileged half of
+    the request before the policy engine ever sees it.
+    """
+
+    text = str(raw_user_input or "")
+    if not mentions_privilege_token(text):
+        return False
+    return _contains_any(text, list(PRIVILEGE_ACTION_WORDS))
+
+
 def _should_try_continuous_plan(raw_user_input: str) -> bool:
     text = str(raw_user_input or "")
+    if _names_privilege_target(text):
+        return False
     if "先" in text and _contains_any(text, ["再", "如果", "则", "就"]):
         return True
     if _looks_like_contextual_delete(text):
@@ -2834,7 +2887,7 @@ def _parse_confirmable_user_request(raw_user_input: str) -> ParsedIntent | None:
         return None
     if _contains_any(text, list(USER_CONTEXT_REFS)):
         return None
-    if looks_like_confirmation_reply(text):
+    if starts_with_confirmation_prefix(text):
         return None
 
     wants_create = _contains_any(text, ["创建", "新增", "添加"])
@@ -2845,8 +2898,11 @@ def _parse_confirmable_user_request(raw_user_input: str) -> ParsedIntent | None:
         return None
 
     username = extract_normal_user_token(text)
-    if mentions_privilege_token(text):
-        return _privileged_user_request(raw_user_input, username)
+    groups = extract_assigned_groups(text)
+    if mentions_privilege_token(text) or has_privileged_group(groups):
+        return _privileged_user_request(raw_user_input, username, groups)
+    if groups:
+        return _unsupported_group_request(raw_user_input, username, groups)
 
     constraints: dict[str, Any] = {"groups": [], "no_sudo": True}
     if wants_create:
@@ -2874,20 +2930,55 @@ def _parse_confirmable_user_request(raw_user_input: str) -> ParsedIntent | None:
 def _privileged_user_request(
     raw_user_input: str,
     username: str | None,
+    groups: list[str],
 ) -> ParsedIntent:
-    """Surface the privileged part of the request instead of narrowing it away."""
+    """Surface the privileged part of the request instead of narrowing it away.
 
+    The group the user actually named is handed to policy so that
+    ``has_privileged_group`` rules on it, rather than a text pattern deciding on
+    its own which groups count as root-equivalent.
+    """
+
+    requested_groups = list(groups)
+    policy_groups = (
+        requested_groups if has_privileged_group(requested_groups) else [*requested_groups, "sudo"]
+    )
+    privilege = next(
+        (group for group in requested_groups if is_privileged_group(group)),
+        "sudo",
+    )
     return ParsedIntent(
         intent=GRANT_SUDO_INTENT,
         target=IntentTarget(username=username),
         constraints={
             "danger_category": "privilege_escalation",
-            "groups": ["sudo"],
-            "privilege": "sudo",
+            "groups": policy_groups,
+            "requested_groups": requested_groups,
+            "privilege": privilege,
         },
         requires_write=True,
         raw_user_input=raw_user_input,
         confidence=0.9,
+    )
+
+
+def _unsupported_group_request(
+    raw_user_input: str,
+    username: str | None,
+    groups: list[str],
+) -> ParsedIntent:
+    """Refuse instead of creating the user without the group that was asked for."""
+
+    return ParsedIntent(
+        intent=UNKNOWN_INTENT,
+        target=IntentTarget(username=username),
+        constraints={
+            "groups": list(groups),
+            "unsupported_reason": f"{UNSUPPORTED_GROUP_REASON}：{'、'.join(groups)}",
+        },
+        requires_write=True,
+        raw_user_input=raw_user_input,
+        confidence=0.6,
     )
 
 

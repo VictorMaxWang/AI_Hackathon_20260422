@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import warnings
+from dataclasses import dataclass
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,9 @@ __all__ = [
     "DEFAULT_TEMPLATE_DIR",
     "WORKFLOW_TOOL_INTENTS",
     "WorkflowTemplateLoadError",
+    "WorkflowTemplateRejection",
     "clear_workflow_template_cache",
+    "load_usable_workflow_templates",
     "load_workflow_template",
     "load_workflow_templates",
     "match_workflow_template",
@@ -115,8 +118,22 @@ class WorkflowTemplateLoadError(ValueError):
     """Raised when a declarative workflow template cannot be loaded safely."""
 
 
+@dataclass(frozen=True)
+class WorkflowTemplateRejection:
+    """One template file that was refused, kept so the operator can see which."""
+
+    filename: str
+    error: str
+
+    def describe(self) -> str:
+        return f"{self.filename}: {self.error}"
+
+
 _TEMPLATE_CACHE: dict[str, dict[str, WorkflowTemplate]] = {}
 _TEMPLATE_CACHE_ERRORS: dict[str, WorkflowTemplateLoadError] = {}
+_USABLE_TEMPLATE_CACHE: dict[
+    str, tuple[dict[str, WorkflowTemplate], tuple[WorkflowTemplateRejection, ...]]
+] = {}
 
 
 def load_workflow_template(
@@ -160,13 +177,36 @@ def load_workflow_templates(
         raise cached_error
 
     try:
-        templates = _read_workflow_templates(template_dir)
+        templates, _ = _read_workflow_templates(template_dir, strict=True)
     except WorkflowTemplateLoadError as exc:
         _TEMPLATE_CACHE_ERRORS[cache_key] = exc
         raise
 
     _TEMPLATE_CACHE[cache_key] = templates
     return dict(templates)
+
+
+def load_usable_workflow_templates(
+    templates_dir: str | Path | None = None,
+) -> tuple[dict[str, WorkflowTemplate], list[WorkflowTemplateRejection]]:
+    """Return every template that still validates, plus the files that did not.
+
+    One unreadable file must not delete the whole workflow hint layer: an
+    invalid template is dropped and named, the remaining templates keep
+    serving. Dropping a template can only remove planner hints, never widen
+    what the policy engine allows.
+    """
+
+    template_dir = _resolve_template_dir(templates_dir)
+    cache_key = str(template_dir)
+
+    cached = _USABLE_TEMPLATE_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached[0]), list(cached[1])
+
+    templates, rejections = _read_workflow_templates(template_dir, strict=False)
+    _USABLE_TEMPLATE_CACHE[cache_key] = (templates, tuple(rejections))
+    return dict(templates), list(rejections)
 
 
 def reload_workflow_templates(
@@ -184,39 +224,64 @@ def clear_workflow_template_cache(templates_dir: str | Path | None = None) -> No
     if templates_dir is None:
         _TEMPLATE_CACHE.clear()
         _TEMPLATE_CACHE_ERRORS.clear()
+        _USABLE_TEMPLATE_CACHE.clear()
         return
 
     cache_key = str(_resolve_template_dir(templates_dir))
     _TEMPLATE_CACHE.pop(cache_key, None)
     _TEMPLATE_CACHE_ERRORS.pop(cache_key, None)
+    _USABLE_TEMPLATE_CACHE.pop(cache_key, None)
 
 
 def warm_workflow_template_cache(
     templates_dir: str | Path | None = None,
 ) -> dict[str, WorkflowTemplate]:
-    """Validate every template at process start so bad data fails at boot."""
+    """Validate every template at process start so bad data fails at boot.
+
+    Every rejection reason, including a file that is not valid UTF-8 or that
+    cannot be read at all, is reported as ``WorkflowTemplateLoadError`` naming
+    the offending file, never as the raw decode or OS exception.
+    """
 
     return load_workflow_templates(templates_dir)
 
 
-def _read_workflow_templates(template_dir: Path) -> dict[str, WorkflowTemplate]:
+def _read_workflow_templates(
+    template_dir: Path,
+    *,
+    strict: bool,
+) -> tuple[dict[str, WorkflowTemplate], list[WorkflowTemplateRejection]]:
     if not template_dir.exists():
         raise WorkflowTemplateLoadError(f"workflow template directory not found: {template_dir}")
     if not template_dir.is_dir():
         raise WorkflowTemplateLoadError(f"workflow template path is not a directory: {template_dir}")
 
+    try:
+        template_paths = sorted(template_dir.glob("*.json"))
+    except OSError as exc:
+        raise WorkflowTemplateLoadError(
+            f"failed to list workflow template directory {template_dir}: {exc}"
+        ) from exc
+
     templates: dict[str, WorkflowTemplate] = {}
-    for template_path in sorted(template_dir.glob("*.json")):
-        template = _load_template_file(template_path)
-        if template.workflow_id in templates:
-            raise WorkflowTemplateLoadError(
-                f"duplicate workflow_id {template.workflow_id!r} in {template_path}"
-            )
+    rejections: list[WorkflowTemplateRejection] = []
+    for template_path in template_paths:
+        try:
+            template = _load_template_file(template_path)
+            if template.workflow_id in templates:
+                raise WorkflowTemplateLoadError(
+                    f"duplicate workflow_id {template.workflow_id!r} in {template_path}"
+                )
+        except WorkflowTemplateLoadError as exc:
+            if strict:
+                raise
+            rejections.append(WorkflowTemplateRejection(template_path.name, str(exc)))
+            continue
         templates[template.workflow_id] = template
 
-    if not templates:
+    if not templates and strict:
         raise WorkflowTemplateLoadError(f"no workflow templates found in {template_dir}")
-    return templates
+    return templates, rejections
 
 
 def try_match_workflow_template(
@@ -225,20 +290,41 @@ def try_match_workflow_template(
 ) -> WorkflowTemplate | None:
     """Match a workflow template without letting bad template data break a request.
 
-    Workflow templates are only a planner hint, never a safety boundary, so an
-    unloadable template directory must degrade to "no workflow matched" rather
-    than fail the whole turn.
+    Workflow templates are only a planner hint, never a safety boundary, so a
+    single unloadable file must degrade to "match against the templates that
+    still load" and, in the worst case, to "no workflow matched" — never to a
+    failed turn. Rejected files are named so the operator can repair them.
     """
 
     try:
         return match_workflow_template(raw_user_input, templates_dir)
     except WorkflowTemplateLoadError as exc:
         warnings.warn(
-            f"workflow template load failed, continuing without workflow hints: {exc}",
+            f"workflow template load failed, retrying with the templates that still load: {exc}",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    try:
+        templates, rejections = load_usable_workflow_templates(templates_dir)
+    except WorkflowTemplateLoadError as exc:
+        warnings.warn(
+            f"workflow template directory unusable, continuing without workflow hints: {exc}",
             UserWarning,
             stacklevel=2,
         )
         return None
+
+    if rejections:
+        warnings.warn(
+            "workflow templates rejected, continuing with the remaining "
+            f"{len(templates)}: {'; '.join(item.describe() for item in rejections)}",
+            UserWarning,
+            stacklevel=2,
+        )
+    if not templates:
+        return None
+    return _match_loaded_templates(raw_user_input, templates)
 
 
 def match_workflow_template(
@@ -252,11 +338,17 @@ def match_workflow_template(
     steps, not create a new execution path.
     """
 
+    return _match_loaded_templates(raw_user_input, load_workflow_templates(templates_dir))
+
+
+def _match_loaded_templates(
+    raw_user_input: str,
+    templates: dict[str, WorkflowTemplate],
+) -> WorkflowTemplate | None:
     text = _normalize_match_text(raw_user_input)
     if not text:
         return None
 
-    templates = load_workflow_templates(templates_dir)
     exact_match = _match_exact_workflow_id(text, templates)
     if exact_match is not None:
         return exact_match
@@ -380,6 +472,11 @@ def _load_template_file(template_path: Path) -> WorkflowTemplate:
 
     try:
         raw_text = template_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkflowTemplateLoadError(
+            f"workflow template {template_path} is not valid UTF-8: "
+            f"{exc.reason} at byte {exc.start}"
+        ) from exc
     except OSError as exc:
         raise WorkflowTemplateLoadError(
             f"failed to read workflow template {template_path}: {exc}"
@@ -391,6 +488,10 @@ def _load_template_file(template_path: Path) -> WorkflowTemplate:
         raise WorkflowTemplateLoadError(
             f"invalid JSON in workflow template {template_path}: "
             f"line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkflowTemplateLoadError(
+            f"unreadable workflow template {template_path}: {exc}"
         ) from exc
 
     if not isinstance(payload, dict):
