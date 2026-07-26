@@ -30,7 +30,9 @@ GuardedOps 的两个写操作（创建普通用户、删除普通用户）不会
 
 **从 wheel 安装时：** `parents[2]` 会指向 site-packages 的上一层，那里没有 `scripts/`，preflight 会明确报 `wrapper script is missing: ...`。这是预期的失败方式（明确报错而不是静默降级），但也意味着**写操作目前只在从仓库源码运行时可用**。
 
-如果你要把 wrapper 装到 `/usr/local/libexec/guardedops/` 之类的系统位置，请通过修改这两个常量或引入一个显式配置项来做，不要依赖 CWD。
+Evo-Lite 的 workflow 模板曾经有同样的"文件在 `app` 包外、不进 wheel"问题，现在已经修好：模板搬进了 `app/evolution/templates/`，由 `pyproject.toml` 的 `package-data` 打进包，`tests/test_packaging.py` 每次都断言它们在 wheel 里。**wrapper 不能照搬这个修法。** 模板是纯数据，谁能读都无所谓；wrapper 是唯一被授予 root 的可执行文件，第 4 节要求它 root 所有、`0755`、且不能被运行 GuardedOps 的账号写入。site-packages 通常属于安装它的那个账号，把 wrapper 放进去等于把 NOPASSWD 授权交给一个可写路径。
+
+如果你要把 wrapper 装到 `/usr/local/libexec/guardedops/` 之类的系统位置，请通过修改这两个常量或引入一个显式配置项来做，不要依赖 CWD，也不要依赖包安装位置。
 
 ## 3. wrapper 自己会拒绝什么
 

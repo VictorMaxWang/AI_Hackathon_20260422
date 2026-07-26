@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import re
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,6 +8,8 @@ from typing import Any
 
 from app.agent.confirmation import (
     PendingAction,
+    claim_confirmation_token_id,
+    confirmation_status_from_parts,
     confirmation_text_for,
     issue_confirmation_token,
     is_cancel_pending_text,
@@ -15,10 +17,27 @@ from app.agent.confirmation import (
     stable_file_content_hash,
     validate_confirmation_token,
 )
-from app.agent.llm_parser import parse_with_llm
+from app.agent.extraction import (
+    USER_CONTEXT_REFS,
+    contains_any as _contains_any,
+    extract_all_usernames,
+    extract_normal_user_token,
+    looks_like_confirmation_reply,
+    mentions_privilege_token,
+    tool_name_for_intent,
+)
+from app.agent.llm_parser import candidate_target_is_safe, parse_with_llm
 from app.agent.memory import AgentMemory
-from app.agent.parser import ReadonlyParser
+from app.agent.parser import (
+    DISK_INTENT,
+    FILE_INTENT,
+    GRANT_SUDO_INTENT,
+    MEMORY_INTENT,
+    UNKNOWN_INTENT,
+    ReadonlyParser,
+)
 from app.agent.planner import (
+    RECOGNIZED_STEP_CONDITIONS,
     MultistepPlanner,
     PlannedToolCall,
     ReadonlyPlan,
@@ -29,7 +48,7 @@ from app.agent.recovery import build_recovery_suggestion
 from app.agent.summarizer import ReadonlySummarizer
 from app.evolution.experience_store import ExperienceStore
 from app.evolution.init import apply_evo_lite_hook
-from app.evolution.workflows import match_workflow_template
+from app.evolution.workflows import try_match_workflow_template
 from app.models import (
     EnvironmentSnapshot,
     IntentTarget,
@@ -62,15 +81,21 @@ LLMParserCallable = Callable[..., dict[str, Any]]
 CREATE_USER_INTENT = "create_user"
 DELETE_USER_INTENT = "delete_user"
 ENV_PROBE_INTENT = "env_probe"
-MEMORY_QUERY_INTENT = "query_memory_usage"
+DISK_QUERY_INTENT = DISK_INTENT
+FILE_SEARCH_INTENT = FILE_INTENT
+MEMORY_QUERY_INTENT = MEMORY_INTENT
 PORT_QUERY_INTENT = "query_port"
 PROCESS_QUERY_INTENT = "query_process"
 CREATE_USER_TOOL_NAME = "create_user_tool"
 DELETE_USER_TOOL_NAME = "delete_user_tool"
+DISK_USAGE_TOOL_NAME = "disk_usage_tool"
 ENV_PROBE_TOOL_NAME = "env_probe_tool"
+FILE_SEARCH_TOOL_NAME = "file_search_tool"
 MEMORY_USAGE_TOOL_NAME = "memory_usage_tool"
 PORT_QUERY_TOOL_NAME = "port_query_tool"
 PROCESS_QUERY_TOOL_NAME = "process_query_tool"
+REPLAYED_CONFIRMATION_TOKEN = "confirmation_token_already_used"
+NO_PENDING_ACTION_ERROR = "no_pending_action_to_confirm"
 CONTINUOUS_PENDING_KEY = "continuous_task"
 CHECKPOINT_KEY = "checkpoint"
 VERIFY_USER_EXISTS_INTENT = "verify_user_exists"
@@ -116,27 +141,76 @@ class ReadonlyOrchestrator:
         self.experience_store = experience_store
         self.llm_parser_fn = llm_parser_fn or parse_with_llm
         self.tools: dict[str, ToolCallable] = {
-            "disk_usage_tool": disk_tool,
+            DISK_USAGE_TOOL_NAME: disk_tool,
             MEMORY_USAGE_TOOL_NAME: memory_usage_tool_fn,
-            "file_search_tool": file_search_tool_fn,
-            "process_query_tool": process_query_tool_fn,
-            "port_query_tool": port_query_tool_fn,
+            FILE_SEARCH_TOOL_NAME: file_search_tool_fn,
+            PROCESS_QUERY_TOOL_NAME: process_query_tool_fn,
+            PORT_QUERY_TOOL_NAME: port_query_tool_fn,
             CREATE_USER_TOOL_NAME: create_user_tool_fn,
             DELETE_USER_TOOL_NAME: delete_user_tool_fn,
         }
+        self._pending_lock = threading.Lock()
 
     def run(self, raw_user_input: str) -> dict[str, Any]:
-        pending_action = self.memory.pending_action
-        if pending_action is not None:
+        try:
+            return self._run(raw_user_input)
+        except Exception as exc:
+            return self._unexpected_failure_response(raw_user_input, exc)
+
+    def _claim_pending_action(
+        self,
+        raw_user_input: str,
+    ) -> tuple[str, PendingAction] | None:
+        """Pop the pending action under a lock so only one caller can execute it.
+
+        Claiming and executing must not be two observable steps: otherwise a
+        double submit runs the same guarded write twice.
+        """
+
+        with self._pending_lock:
+            pending_action = self.memory.pending_action
+            if pending_action is None:
+                return None
             if is_cancel_pending_text(raw_user_input):
+                self.memory.clear_pending_action()
+                return "cancel", pending_action
+            if not pending_action.matches_confirmation(raw_user_input):
+                return "mismatch", pending_action
+
+            token = pending_action.confirmation_token
+            self.memory.clear_pending_action()
+            if token is not None and not claim_confirmation_token_id(token.token_id):
+                return "replayed", pending_action
+            return "execute", pending_action
+
+    def _run(self, raw_user_input: str) -> dict[str, Any]:
+        claim = self._claim_pending_action(raw_user_input)
+        if claim is not None:
+            mode, pending_action = claim
+            if mode == "cancel":
                 return self._cancel_pending_action(raw_user_input, pending_action)
-            if pending_action.matches_confirmation(raw_user_input):
+            if mode == "execute":
                 if _is_continuous_pending(pending_action):
                     return self._resume_continuous_action(raw_user_input, pending_action)
                 return self._execute_pending_action(raw_user_input, pending_action)
+            if mode == "replayed":
+                if _is_continuous_pending(pending_action):
+                    return self._invalid_continuous_confirmation_token_response(
+                        raw_user_input=raw_user_input,
+                        pending_action=pending_action,
+                        error_code=REPLAYED_CONFIRMATION_TOKEN,
+                    )
+                return self._invalid_confirmation_token_response(
+                    raw_user_input=raw_user_input,
+                    pending_action=pending_action,
+                    error_code=REPLAYED_CONFIRMATION_TOKEN,
+                )
             if _is_continuous_pending(pending_action):
                 return self._continuous_confirmation_mismatch(raw_user_input, pending_action)
             return self._pending_confirmation_mismatch(raw_user_input, pending_action)
+
+        if looks_like_confirmation_reply(raw_user_input):
+            return self._no_pending_action_response(raw_user_input)
 
         if _should_try_continuous_plan(raw_user_input):
             continuous_plan = self.multistep_planner.plan(raw_user_input, memory=self.memory)
@@ -152,17 +226,18 @@ class ReadonlyOrchestrator:
             if continuous_plan.supported:
                 return self._run_continuous_plan(continuous_plan)
 
-        parsed_intent = _parse_confirmable_user_request(raw_user_input) or self.parser.parse(
-            raw_user_input,
-            memory=self.memory,
-        )
+        parsed_intent = self.parser.parse(raw_user_input, memory=self.memory)
+        if _may_delegate_to_confirmable_request(parsed_intent):
+            confirmable_intent = _parse_confirmable_user_request(raw_user_input)
+            if confirmable_intent is not None:
+                parsed_intent = confirmable_intent
         if _should_try_llm_parser_fallback(parsed_intent):
             parsed_intent = self._maybe_parse_with_llm(raw_user_input, parsed_intent)
         if _has_unresolved_context_ref(parsed_intent):
             return self._unresolved_context_response(parsed_intent)
 
         risk = evaluate_policy(parsed_intent)
-        if risk.risk_level == RiskLevel.S3:
+        if not risk.allow:
             plan = ReadonlyPlan(status="refused", reason=_policy_refusal_reason(risk))
             explanation = self.summarizer.summarize(
                 parsed_intent,
@@ -174,7 +249,11 @@ class ReadonlyOrchestrator:
                 parsed_intent=parsed_intent,
                 environment={
                     "status": "not_collected",
-                    "reason": "s3_refused_before_execution",
+                    "reason": (
+                        "s3_refused_before_execution"
+                        if risk.risk_level == RiskLevel.S3
+                        else "policy_refused_before_execution"
+                    ),
                 },
                 risk=risk,
                 plan=plan,
@@ -188,14 +267,19 @@ class ReadonlyOrchestrator:
             )
 
         if _requires_pending_confirmation(risk):
-            pending_action = self._build_pending_action(parsed_intent, risk)
+            pending_action, probe_environment = self._build_pending_action(parsed_intent, risk)
             if pending_action is not None:
-                self.memory.remember_intent(parsed_intent, risk_level=risk.risk_level)
+                self.memory.remember_intent(
+                    parsed_intent,
+                    risk_level=risk.risk_level,
+                    confirmed=False,
+                )
                 self.memory.set_pending_action(pending_action)
                 return self._pending_confirmation_response(
                     parsed_intent,
                     risk,
                     pending_action,
+                    environment=probe_environment,
                 )
 
         plan = self.planner.plan(parsed_intent)
@@ -293,6 +377,7 @@ class ReadonlyOrchestrator:
                     data=None,
                     error=error,
                 )
+                execution_results.append(tool_result.model_dump(mode="json"))
                 break
 
             try:
@@ -368,9 +453,13 @@ class ReadonlyOrchestrator:
             return fallback_intent
 
         try:
-            return ParsedIntent.model_validate(candidates[0])
+            candidate_intent = ParsedIntent.model_validate(candidates[0])
         except Exception:
             return fallback_intent
+
+        if not candidate_target_is_safe(candidates[0]):
+            return fallback_intent
+        return candidate_intent
 
     def _run_continuous_plan(
         self,
@@ -494,7 +583,11 @@ class ReadonlyOrchestrator:
                     host_id=_probe_confirmation_host_id(self.executor),
                     policy_version=_current_policy_version(),
                 )
-                self.memory.remember_intent(parsed_intent, risk_level=risk.risk_level)
+                self.memory.remember_intent(
+                    parsed_intent,
+                    risk_level=risk.risk_level,
+                    confirmed=False,
+                )
                 self.memory.set_pending_action(pending_action)
 
                 pending_timeline = list(pending_context_timeline)
@@ -677,7 +770,7 @@ class ReadonlyOrchestrator:
                 error_code=token_error,
             )
 
-        checkpoint = self.memory.get_pending_checkpoint()
+        checkpoint = _pending_checkpoint(pending_action)
         if checkpoint is None:
             self.memory.clear_pending_action()
             reason = "safe checkpoint is missing; resume is refused"
@@ -910,8 +1003,27 @@ class ReadonlyOrchestrator:
     ) -> tuple[ToolResult, dict[str, Any]]:
         del parsed_intent
 
-        tool_name, args = _tool_for_plan_step(step, step_results)
+        tool_name, args = _tool_for_plan_step(
+            step,
+            step_results,
+            allowed_tools=frozenset(self.tools),
+        )
         tool_started = _utc_now()
+        if tool_name is None:
+            error = f"no whitelisted tool is mapped for intent: {step.intent}"
+            tool_result = ToolResult(
+                tool_name=str(step.intent or "unknown"),
+                success=False,
+                data=None,
+                error=error,
+            )
+            return tool_result, _execution_step(
+                tool_result.tool_name,
+                {},
+                tool_started,
+                False,
+                error,
+            )
         if tool_name == ENV_PROBE_TOOL_NAME:
             try:
                 snapshot = self.env_probe(self.executor)
@@ -969,8 +1081,8 @@ class ReadonlyOrchestrator:
         execution_steps: list[dict[str, Any]],
         execution_results: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        final_status = _continuous_final_status(timeline)
-        error = _continuous_error(timeline)
+        final_status = _continuous_final_status(timeline, plan)
+        error = _continuous_error(timeline, plan)
         explanation = self.summarizer.summarize_continuous(
             status=final_status,
             timeline=timeline,
@@ -1137,15 +1249,44 @@ class ReadonlyOrchestrator:
         self,
         parsed_intent: ParsedIntent,
         risk: PolicyDecision,
-    ) -> PendingAction | None:
+    ) -> tuple[PendingAction | None, dict[str, Any]]:
         pending_action = _pending_action_from_intent(parsed_intent, risk)
         if pending_action is None:
-            return None
-        return _bind_confirmation_token_to_pending_action(
+            return None, {
+                "status": "not_collected",
+                "reason": "pending_confirmation_before_execution",
+            }
+        host_id, environment = self._probe_confirmation_environment()
+        bound_action = _bind_confirmation_token_to_pending_action(
             pending_action,
-            host_id=_probe_confirmation_host_id(self.executor),
+            host_id=host_id,
             policy_version=_current_policy_version(),
         )
+        return bound_action, environment
+
+    def _probe_confirmation_environment(self) -> tuple[str, dict[str, Any]]:
+        """Collect the read-only snapshot the confirmation token is bound to.
+
+        The probe really runs against the target, so the envelope reports it
+        instead of claiming that nothing was collected.
+        """
+
+        try:
+            snapshot = env_probe_tool(self.executor)
+        except Exception as exc:
+            return "unknown", {
+                "status": "error",
+                "snapshot": None,
+                "error": str(exc),
+                "reason": "readonly_env_probe_for_confirmation_binding",
+            }
+        hostname = getattr(snapshot, "hostname", None)
+        host_id = hostname.strip() if isinstance(hostname, str) and hostname.strip() else "unknown"
+        return host_id, {
+            "status": "ok",
+            "snapshot": snapshot.model_dump(mode="json"),
+            "reason": "readonly_env_probe_for_confirmation_binding",
+        }
 
     def _unresolved_context_response(self, parsed_intent: ParsedIntent) -> dict[str, Any]:
         reason = _unresolved_context_reason(parsed_intent)
@@ -1173,6 +1314,8 @@ class ReadonlyOrchestrator:
         parsed_intent: ParsedIntent,
         risk: PolicyDecision,
         pending_action: PendingAction,
+        *,
+        environment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         plan = ReadonlyPlan(
             status="pending_confirmation",
@@ -1188,10 +1331,13 @@ class ReadonlyOrchestrator:
         explanation = f"该写操作需要确认。请输入精确确认语：{confirmation_text}"
         return self._envelope(
             parsed_intent=parsed_intent,
-            environment={
-                "status": "not_collected",
-                "reason": "pending_confirmation_before_execution",
-            },
+            environment=dict(
+                environment
+                or {
+                    "status": "not_collected",
+                    "reason": "pending_confirmation_before_execution",
+                }
+            ),
             risk=risk,
             plan=plan,
             execution={"status": "skipped", "steps": [], "results": []},
@@ -1204,6 +1350,71 @@ class ReadonlyOrchestrator:
             },
             explanation=explanation,
         )
+
+    def _no_pending_action_response(self, raw_user_input: str) -> dict[str, Any]:
+        reason = "当前没有待确认的操作，确认语不会触发任何新的写操作"
+        parsed_intent = ParsedIntent(
+            intent=UNKNOWN_INTENT,
+            constraints={
+                "unsupported_reason": reason,
+                "confirmation_without_pending_action": True,
+            },
+            raw_user_input=raw_user_input,
+            confidence=1.0,
+        )
+        risk = PolicyDecision(
+            risk_level=RiskLevel.S0,
+            allow=False,
+            requires_confirmation=False,
+            reasons=["confirmation vocabulary is reserved and no pending action exists"],
+        )
+        return self._envelope(
+            parsed_intent=parsed_intent,
+            environment={
+                "status": "not_collected",
+                "reason": "no_pending_action_to_confirm",
+            },
+            risk=risk,
+            plan=ReadonlyPlan(status="refused", reason=reason),
+            execution={"status": "skipped", "steps": [], "results": []},
+            result={
+                "status": "refused",
+                "data": None,
+                "error": NO_PENDING_ACTION_ERROR,
+            },
+            explanation=f"{reason}。如需执行，请重新发起原始请求，再输入新发出的确认语。",
+        )
+
+    def _unexpected_failure_response(
+        self,
+        raw_user_input: str,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        error = f"{type(exc).__name__}: {exc}"
+        parsed_intent = ParsedIntent(
+            intent=UNKNOWN_INTENT,
+            constraints={"unsupported_reason": "internal error before a safe outcome"},
+            raw_user_input=raw_user_input,
+            confidence=0.0,
+        )
+        risk = PolicyDecision(
+            risk_level=RiskLevel.S0,
+            allow=False,
+            requires_confirmation=False,
+            reasons=["unexpected internal error; request refused before execution"],
+        )
+        try:
+            return self._envelope(
+                parsed_intent=parsed_intent,
+                environment={"status": "not_collected", "reason": "internal_error"},
+                risk=risk,
+                plan=ReadonlyPlan(status="refused", reason=error),
+                execution={"status": "failed", "steps": [], "results": []},
+                result={"status": "refused", "data": None, "error": error},
+                explanation=f"请求处理过程中出现内部错误，已拒绝执行：{error}。",
+            )
+        except Exception:
+            return _minimal_error_envelope(parsed_intent, risk, error)
 
     def _pending_confirmation_mismatch(
         self,
@@ -1346,10 +1557,11 @@ class ReadonlyOrchestrator:
                 explanation=explanation,
             )
 
+        host_id, probe_environment = self._probe_confirmation_environment()
         token_error = _validate_pending_confirmation_token_binding(
             pending_action,
             risk=risk,
-            host_id=_probe_confirmation_host_id(self.executor),
+            host_id=host_id,
             policy_version=_current_policy_version(),
         )
         if token_error is not None:
@@ -1392,10 +1604,7 @@ class ReadonlyOrchestrator:
         final_status = "success" if tool_result.success else "failed"
         return self._envelope(
             parsed_intent=parsed_intent,
-            environment={
-                "status": "not_collected",
-                "reason": "confirmed_write_execution",
-            },
+            environment=dict(probe_environment),
             risk=risk,
             plan=plan,
             execution={
@@ -1423,7 +1632,7 @@ def _should_try_continuous_plan(raw_user_input: str) -> bool:
         return True
     if _looks_like_contextual_delete(text):
         return True
-    workflow_template = match_workflow_template(text)
+    workflow_template = try_match_workflow_template(text)
     if workflow_template is not None and workflow_template.requires_confirmation:
         return True
     return bool(
@@ -1470,6 +1679,13 @@ def _strip_delete_sensitivity_phrase(raw_user_input: str) -> str:
 
 def _is_continuous_pending(pending_action: PendingAction) -> bool:
     return pending_action.context.get(CONTINUOUS_PENDING_KEY) is True
+
+
+def _pending_checkpoint(pending_action: PendingAction) -> dict[str, Any] | None:
+    checkpoint = pending_action.context.get(CHECKPOINT_KEY)
+    if not isinstance(checkpoint, dict):
+        return None
+    return dict(checkpoint)
 
 
 def _pending_action_from_continuous_step(
@@ -1836,19 +2052,88 @@ def _parsed_intent_from_plan_step(
             confidence=1.0,
         )
 
+    if step.intent == DISK_QUERY_INTENT:
+        return ParsedIntent(
+            intent=DISK_QUERY_INTENT,
+            constraints={"focus": "overview"},
+            raw_user_input=raw_user_input,
+            confidence=1.0,
+        )
+
+    if step.intent == MEMORY_QUERY_INTENT:
+        return ParsedIntent(
+            intent=MEMORY_QUERY_INTENT,
+            constraints={
+                "mode": "summary_with_top_processes",
+                "limit": _int_or_none(target.get("limit")) or 10,
+            },
+            raw_user_input=raw_user_input,
+            confidence=1.0,
+        )
+
+    if step.intent == FILE_SEARCH_INTENT:
+        base_path = _str_or_none(target.get("base_path")) or _str_or_none(target.get("path"))
+        return ParsedIntent(
+            intent=FILE_SEARCH_INTENT,
+            target=IntentTarget(
+                path=base_path,
+                keyword=_str_or_none(target.get("name_contains"))
+                or _str_or_none(target.get("keyword")),
+                base_paths=[base_path] if base_path else [],
+            ),
+            constraints={
+                "modified_within_days": _int_or_none(target.get("modified_within_days")),
+                "max_results": _int_or_none(target.get("max_results")) or 20,
+                "max_depth": _int_or_none(target.get("max_depth")) or 4,
+            },
+            raw_user_input=raw_user_input,
+            confidence=1.0,
+        )
+
     return ParsedIntent(
-        intent=str(step.intent or "unknown"),
-        constraints=dict(target),
+        intent=UNKNOWN_INTENT,
+        constraints={
+            "unsupported_reason": f"unmapped plan step intent: {step.intent}",
+            "step_intent": str(step.intent or "unknown"),
+        },
         requires_write=False,
         raw_user_input=raw_user_input,
-        confidence=0.2,
+        confidence=0.0,
     )
 
 
 def _tool_for_plan_step(
     step: PlanStep,
     step_results: dict[str, dict[str, Any]],
-) -> tuple[str, dict[str, Any]]:
+    *,
+    allowed_tools: frozenset[str],
+) -> tuple[str | None, dict[str, Any]]:
+    """Map a plan step onto a whitelisted tool, or report that no tool exists.
+
+    An unmapped intent is an explicit error: the step intent must never be used
+    as if it were a tool name.
+    """
+
+    tool_name, args = _mapped_tool_for_plan_step(step, step_results)
+    if tool_name is None:
+        return None, {}
+
+    registry_tool_name = tool_name_for_intent(step.intent)
+    if registry_tool_name is not None and registry_tool_name != tool_name:
+        return None, {}
+
+    declared_tool_name = _str_or_none(step.target.get("tool_name"))
+    if declared_tool_name is not None and declared_tool_name != tool_name:
+        return None, {}
+    if tool_name != ENV_PROBE_TOOL_NAME and tool_name not in allowed_tools:
+        return None, {}
+    return tool_name, args
+
+
+def _mapped_tool_for_plan_step(
+    step: PlanStep,
+    step_results: dict[str, dict[str, Any]],
+) -> tuple[str | None, dict[str, Any]]:
     target = step.target
     if step.intent == ENV_PROBE_INTENT:
         return ENV_PROBE_TOOL_NAME, {}
@@ -1862,6 +2147,19 @@ def _tool_for_plan_step(
             "keyword": None,
             "pid": pid,
         }
+    if step.intent == DISK_QUERY_INTENT:
+        return DISK_USAGE_TOOL_NAME, {}
+    if step.intent == MEMORY_QUERY_INTENT:
+        return MEMORY_USAGE_TOOL_NAME, {"limit": _int_or_none(target.get("limit")) or 10}
+    if step.intent == FILE_SEARCH_INTENT:
+        return FILE_SEARCH_TOOL_NAME, {
+            "base_path": _str_or_none(target.get("base_path")) or _str_or_none(target.get("path")),
+            "name_contains": _str_or_none(target.get("name_contains"))
+            or _str_or_none(target.get("keyword")),
+            "modified_within_days": _int_or_none(target.get("modified_within_days")),
+            "max_results": _int_or_none(target.get("max_results")) or 20,
+            "max_depth": _int_or_none(target.get("max_depth")) or 4,
+        }
     if step.intent == CREATE_USER_INTENT:
         return CREATE_USER_TOOL_NAME, {
             "username": target.get("username"),
@@ -1873,7 +2171,7 @@ def _tool_for_plan_step(
             "username": target.get("username"),
             "remove_home": bool(target.get("remove_home", False)),
         }
-    return str(step.intent), dict(target)
+    return None, {}
 
 
 def _dependency_abort_reason(
@@ -1918,6 +2216,15 @@ def _condition_skip_reason(
         if _first_listener_pid(listeners) is None:
             return f"端口 {port} 的监听记录没有 PID，未继续查询对应进程。"
         return None
+
+    if step.condition in RECOGNIZED_STEP_CONDITIONS:
+        return None
+
+    if step.condition is not None and (step.write_step or step.requires_confirmation):
+        return (
+            f"写步骤条件无法在代码层求值：{step.condition}。"
+            "未继续执行该写步骤。"
+        )
 
     return None
 
@@ -2168,7 +2475,13 @@ def _continuous_risk_from_timeline(timeline: list[dict[str, Any]]) -> PolicyDeci
     )
 
 
-def _continuous_final_status(timeline: list[dict[str, Any]]) -> str:
+def _continuous_final_status(timeline: list[dict[str, Any]], plan: ExecutionPlan) -> str:
+    """Derive the overall status from step semantics, not from string precedence.
+
+    A plan whose guarded write step never ran has not succeeded, even when every
+    read-only step around it did.
+    """
+
     statuses = [str(item.get("status")) for item in timeline]
     if "refused" in statuses:
         return "refused"
@@ -2178,15 +2491,42 @@ def _continuous_final_status(timeline: list[dict[str, Any]]) -> str:
         return "aborted"
     if statuses and all(status == "skipped" for status in statuses):
         return "skipped"
+    if _skipped_guarded_entry(timeline, plan) is not None:
+        return "incomplete"
     return "success"
 
 
-def _continuous_error(timeline: list[dict[str, Any]]) -> str | None:
+def _continuous_error(
+    timeline: list[dict[str, Any]],
+    plan: ExecutionPlan,
+) -> str | None:
     for status in ("refused", "failed", "aborted"):
         for item in timeline:
             if item.get("status") == status:
                 summary = item.get("result_summary")
                 return summary if isinstance(summary, str) else status
+
+    skipped_entry = _skipped_guarded_entry(timeline, plan)
+    if skipped_entry is not None:
+        summary = skipped_entry.get("result_summary")
+        return summary if isinstance(summary, str) else "guarded step was skipped"
+    return None
+
+
+def _skipped_guarded_entry(
+    timeline: list[dict[str, Any]],
+    plan: ExecutionPlan,
+) -> dict[str, Any] | None:
+    guarded_step_ids = {
+        step.step_id
+        for step in plan.steps
+        if step.write_step or step.requires_confirmation
+    }
+    for item in timeline:
+        if str(item.get("status")) != "skipped":
+            continue
+        if str(item.get("step_id") or "") in guarded_step_ids:
+            return item
     return None
 
 
@@ -2399,6 +2739,8 @@ def _confirmation_token_error_reason(error_code: str) -> str:
         return "confirmation token is missing"
     if error_code == "confirmation_token_expired":
         return "confirmation token expired"
+    if error_code == REPLAYED_CONFIRMATION_TOKEN:
+        return "confirmation token was already used once and cannot be replayed"
     if error_code == "confirmation_token_host_mismatch":
         return "confirmation token host binding no longer matches the current host"
     if error_code == "confirmation_token_target_mismatch":
@@ -2474,25 +2816,40 @@ def _parsed_intent_from_pending(
     )
 
 
+def _may_delegate_to_confirmable_request(parsed_intent: ParsedIntent) -> bool:
+    """Only an unclassified request may be re-read as a guarded user request.
+
+    Whenever the rule parser already produced a concrete intent, that intent is
+    what policy sees; the narrower confirmable reader must never override it.
+    """
+
+    return parsed_intent.intent == UNKNOWN_INTENT and not _has_unresolved_context_ref(
+        parsed_intent
+    )
+
+
 def _parse_confirmable_user_request(raw_user_input: str) -> ParsedIntent | None:
     text = str(raw_user_input or "").strip()
     if "普通用户" not in text:
         return None
-    if _contains_any(text, ["刚才那个用户", "上一个用户", "刚刚创建的用户"]):
+    if _contains_any(text, list(USER_CONTEXT_REFS)):
+        return None
+    if looks_like_confirmation_reply(text):
         return None
 
-    username = _extract_username_after_normal_user(text)
-    constraints: dict[str, Any] = {}
-    if _requests_privilege_in_user_text(text):
-        constraints["groups"] = ["sudo"]
-    elif _has_no_privilege_constraint(text):
-        constraints["groups"] = []
-        constraints["no_sudo"] = True
+    wants_create = _contains_any(text, ["创建", "新增", "添加"])
+    wants_delete = _contains_any(text, ["删除", "删掉", "移除", "remove", "delete"])
+    if wants_create == wants_delete:
+        return None
+    if len(extract_all_usernames(text)) > 1:
+        return None
 
-    if _contains_any(text, ["创建", "新增", "添加"]):
-        constraints.setdefault("groups", [])
-        if not constraints["groups"]:
-            constraints.setdefault("no_sudo", True)
+    username = extract_normal_user_token(text)
+    if mentions_privilege_token(text):
+        return _privileged_user_request(raw_user_input, username)
+
+    constraints: dict[str, Any] = {"groups": [], "no_sudo": True}
+    if wants_create:
         constraints["create_home"] = True
         return ParsedIntent(
             intent=CREATE_USER_INTENT,
@@ -2503,62 +2860,35 @@ def _parse_confirmable_user_request(raw_user_input: str) -> ParsedIntent | None:
             confidence=0.9,
         )
 
-    if _contains_any(text, ["删除", "删掉", "移除", "remove", "delete"]):
-        constraints["remove_home"] = False
-        return ParsedIntent(
-            intent=DELETE_USER_INTENT,
-            target=IntentTarget(username=username),
-            constraints=constraints,
-            requires_write=True,
-            raw_user_input=raw_user_input,
-            confidence=0.9,
-        )
-
-    return None
-
-
-def _extract_username_after_normal_user(text: str) -> str | None:
-    match = re.search(r"普通用户\s*([^\s，,。、]+)", text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    return match.group(1).strip()
-
-
-def _requests_privilege_in_user_text(text: str) -> bool:
-    scan_text = _strip_negated_privilege_constraints(text)
-    lower_text = scan_text.lower()
-    return bool(
-        (
-            re.search(r"\b(?:admin|administrator|wheel)\b", lower_text) is not None
-            and _contains_any(scan_text, ["给", "授予", "加入", "加到", "添加", "设为", "设置", "提升", "权限"])
-        )
-        or _contains_any(
-            scan_text,
-            ["管理员权限", "root 权限", "root权限", "加入 sudo", "加到 sudo", "添加到 sudo", "给 sudo", "sudo 权限"],
-        )
-        or ("sudo" in lower_text and _contains_any(scan_text, ["加入", "加到", "添加", "给", "授予", "提升"]))
-        or ("提升" in scan_text and "权限" in scan_text)
+    constraints["remove_home"] = False
+    return ParsedIntent(
+        intent=DELETE_USER_INTENT,
+        target=IntentTarget(username=username),
+        constraints=constraints,
+        requires_write=True,
+        raw_user_input=raw_user_input,
+        confidence=0.9,
     )
 
 
-def _contains_any(text: str, needles: list[str]) -> bool:
-    lower_text = text.lower()
-    return any(needle.lower() in lower_text for needle in needles)
+def _privileged_user_request(
+    raw_user_input: str,
+    username: str | None,
+) -> ParsedIntent:
+    """Surface the privileged part of the request instead of narrowing it away."""
 
-
-def _has_no_privilege_constraint(text: str) -> bool:
-    return _strip_negated_privilege_constraints(text) != str(text or "")
-
-
-def _strip_negated_privilege_constraints(text: str) -> str:
-    cleaned = str(text or "")
-    patterns = [
-        r"(?:不要|不用|无需|不需要|别|不能|不可|不给|无|没有)\s*(?:给\s*)?(?:[a-z_][a-z0-9_-]{2,31}\s*)?(?:sudo|管理员|admin|administrator|wheel|root)\s*(?:权限|访问)?",
-        r"不\s*(?:加入|加到|添加到|加进)\s*(?:sudo|wheel|admin|administrator|管理员)",
-    ]
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-    return cleaned
+    return ParsedIntent(
+        intent=GRANT_SUDO_INTENT,
+        target=IntentTarget(username=username),
+        constraints={
+            "danger_category": "privilege_escalation",
+            "groups": ["sudo"],
+            "privilege": "sudo",
+        },
+        requires_write=True,
+        raw_user_input=raw_user_input,
+        confidence=0.9,
+    )
 
 
 def _dedupe_policy_decision(risk: PolicyDecision) -> PolicyDecision:
@@ -2997,6 +3327,8 @@ def _final_outcome_assertion_summary(result: dict[str, Any]) -> str:
         return "最终结果为 cancelled。"
     if status == "aborted":
         return "最终结果为 aborted。"
+    if status == "incomplete":
+        return "最终结果为 incomplete：受保护的写步骤没有执行。"
     return f"最终结果为 {status}。"
 
 
@@ -3008,26 +3340,13 @@ def _evidence_confirmation_status(
     result: dict[str, Any],
     timeline: list[dict[str, Any]],
 ) -> str:
-    plan_status = str(plan_payload.get("status") or "").lower()
-    result_status = str(result.get("status") or "").lower()
-    result_error = str(result.get("error") or "").lower()
-    execution_results = execution.get("results") or []
-
-    if result_error == "confirmation_text_mismatch" or result_error.startswith(
-        "confirmation_token_"
-    ) or result_error == "missing_confirmation_token":
-        return "mismatch"
-    if result_status == "cancelled" or plan_status == "cancelled":
-        return "cancelled"
-    if result_status == "pending_confirmation" or plan_status == "pending_confirmation":
-        return "pending"
-    if plan_status == "confirmed":
-        return "confirmed"
-    if any(str(item.get("status") or "").lower() == "pending_confirmation" for item in timeline):
-        return "pending"
-    if risk.requires_confirmation and execution_results:
-        return "confirmed"
-    return "not_required"
+    return confirmation_status_from_parts(
+        risk=risk.model_dump(mode="json"),
+        plan=plan_payload,
+        execution=execution,
+        result=result,
+        timeline=timeline,
+    )
 
 
 def _plan_event_severity(plan_payload: dict[str, Any]) -> EvidenceSeverity:
@@ -3057,7 +3376,7 @@ def _result_event_severity(result: dict[str, Any]) -> EvidenceSeverity:
     status = str(result.get("status") or "").lower()
     if status in {"failed", "refused"}:
         return EvidenceSeverity.CRITICAL
-    if status in {"pending_confirmation", "cancelled", "aborted", "skipped"}:
+    if status in {"pending_confirmation", "cancelled", "aborted", "skipped", "incomplete"}:
         return EvidenceSeverity.WARNING
     return EvidenceSeverity.INFO
 
@@ -3066,6 +3385,43 @@ def _is_post_check_timeline_entry(item: dict[str, Any]) -> bool:
     intent = str(item.get("intent") or "")
     step_id = str(item.get("step_id") or "")
     return intent.startswith("verify_") or step_id.endswith("_verify")
+
+
+def _minimal_error_envelope(
+    parsed_intent: ParsedIntent,
+    risk: PolicyDecision,
+    error: str,
+) -> dict[str, Any]:
+    """Last-resort envelope used when even envelope construction failed."""
+
+    builder = EvidenceBuilder()
+    event = builder.add_event(
+        stage=EvidenceStage.RESULT,
+        title="internal_error",
+        details={"error": error},
+        severity=EvidenceSeverity.CRITICAL,
+        refs=[f"intent:{parsed_intent.intent}"],
+    )
+    builder.add_assertion(
+        name="final_outcome",
+        passed=False,
+        evidence_refs=[event.event_id],
+        summary="最终结果为 refused：内部错误。",
+    )
+    return {
+        "intent": parsed_intent.model_dump(mode="json"),
+        "environment": {"status": "not_collected", "reason": "internal_error"},
+        "risk": risk.model_dump(mode="json"),
+        "plan": {"status": "refused", "reason": error, "steps": []},
+        "execution": {"status": "failed", "steps": [], "results": []},
+        "result": {"status": "refused", "data": None, "error": error},
+        "recovery": None,
+        "blast_radius_preview": None,
+        "policy_simulator": None,
+        "explanation": f"请求处理过程中出现内部错误，已拒绝执行：{error}。",
+        "evidence_chain": builder.build().model_dump(mode="json"),
+        "explanation_card": None,
+    }
 
 
 def _utc_now() -> str:

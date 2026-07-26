@@ -490,6 +490,49 @@ input {
   font-size: 11px;
 }
 
+.tool-call-details summary {
+  cursor: pointer;
+  margin-top: 14px;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.tool-call-list {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tool-call-item {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid rgba(47, 41, 34, 0.1);
+  border-radius: 16px;
+  background: var(--surface-strong);
+}
+
+.tool-call-item[data-tone="blocked"] {
+  border-color: rgba(158, 63, 47, 0.24);
+}
+
+.tool-call-command,
+.tool-call-output {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(35, 29, 23, 0.04);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
 .checklist,
 .compact-list {
   display: grid;

@@ -10,14 +10,16 @@ from app.policy.rules import (
     DELETE_USER_INTENTS,
     PRIVILEGED_GROUPS,
     PROTECTED_PATHS,
-    READ_ONLY_INTENTS,
+    contains_destructive_word,
     contains_write_word,
+    is_canonical_read_only_intent,
     is_deep_search_refused_path,
     is_protected_path,
     is_same_or_child_path,
     is_sshd_config_path,
     is_sudoers_path,
     normalize_intent_name,
+    normalize_path,
 )
 from app.policy.validators import validate_username_with_reasons
 
@@ -439,18 +441,39 @@ def _matched_policy_rules(
     data: _PreviewIntentData,
     risk_payload: dict[str, Any],
 ) -> list[dict[str, str]]:
+    """Report the rule the engine actually applied, in the engine's own order.
+
+    This is a display of the decision the policy engine already made, never a
+    second opinion: any divergence here would let the simulator describe a
+    request as allowed that the engine refuses.
+    """
+
     outcome = _rule_outcome(risk_payload)
     username_validation = validate_username_with_reasons(data.username) if data.username else None
-    paths = [data.path, *data.base_paths]
+    paths = [path for path in [data.path, *data.base_paths] if path]
+    is_read_only = not data.requires_write and is_canonical_read_only_intent(data.intent_name)
 
     if any(is_sudoers_path(path) for path in paths) or "sudoers" in data.intent_name:
         return [_rule("path.sudoers_denied", outcome, "Refuses modifications to sudoers paths.")]
     if any(is_sshd_config_path(path) for path in paths) or "sshd_config" in data.intent_name:
         return [_rule("path.sshd_config_denied", outcome, "Refuses modifications to sshd configuration.")]
-    if data.intent_name == "search_files" and any(is_same_or_child_path(path, "/") for path in paths):
-        return [_rule("path.full_disk_search_refused", outcome, "Refuses full filesystem searches from /.")]
-    if data.intent_name == "search_files" and any(is_deep_search_refused_path(path) for path in paths):
-        return [_rule("path.deep_search_refused", outcome, "Refuses deep search under /proc, /sys, or /dev.")]
+
+    if paths and is_read_only:
+        if any(not _is_absolute_path(path) for path in paths):
+            return [_rule("path.relative_scope_denied", outcome, "Refuses read-only scopes that are not absolute paths.")]
+        if any(is_same_or_child_path(path, "/") for path in paths):
+            return [_rule("path.full_disk_search_refused", outcome, "Refuses full filesystem searches from /.")]
+        if any(is_deep_search_refused_path(path) for path in paths):
+            return [_rule("path.deep_search_refused", outcome, "Refuses deep search under /proc, /sys, or /dev.")]
+    elif paths:
+        if any(
+            is_same_or_child_path(path, "/etc") and contains_destructive_word(data.intent_name)
+            for path in paths
+        ):
+            return [_rule("path.protected_write_denied", outcome, "Refuses destructive changes under /etc.")]
+        if any(is_protected_path(path) for path in paths):
+            return [_rule("path.protected_write_denied", outcome, "Refuses writes to protected system paths.")]
+
     if _requests_privilege_escalation(data):
         return [_rule("user.privilege_escalation_denied", outcome, "Refuses requests that would grant privileged access.")]
     if _is_bulk_permission_change(data):
@@ -463,14 +486,16 @@ def _matched_policy_rules(
         if username_validation is not None and not username_validation.valid:
             return [_rule("user.username_invalid", outcome, "Refuses usernames that do not match GuardedOps rules.")]
         return [_rule("user.delete_requires_confirmation", outcome, "Requires strong confirmation for deleting one normal user.")]
-    if paths and (data.requires_write or contains_write_word(data.intent_name)):
-        if any(is_protected_path(path) for path in paths):
-            return [_rule("path.protected_write_denied", outcome, "Refuses writes to protected system paths.")]
-    if not data.requires_write and data.intent_name in READ_ONLY_INTENTS:
+    if is_read_only:
         return [_rule("readonly.allowed", outcome, "Allows recognized read-only requests within bounded scope.")]
     if data.requires_write or contains_write_word(data.intent_name):
         return [_rule("write.unknown_denied", outcome, "Denies unknown or unsupported write requests by default.")]
     return [_rule("readonly.unsupported", outcome, "Rejects unsupported read-only requests without executing tools.")]
+
+
+def _is_absolute_path(path: str) -> bool:
+    normalized = normalize_path(path)
+    return bool(normalized and normalized.startswith("/"))
 
 
 def _scope_summary(data: _PreviewIntentData) -> str:

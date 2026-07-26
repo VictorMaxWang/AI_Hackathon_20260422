@@ -66,7 +66,7 @@ Phase 3.5 的目标产物是设计与受控数据结构，不是业务执行代�
 | P3.5-T01 | Execution Evaluator | 评估记录，不触发执行 | DONE | `app/evolution/evaluator.py`；`tests/test_evaluator.py` |
 | P3.5-T02 | Experience Store | 经验记录，不作为最终安全决策 | DONE | `app/evolution/experience_store.py`；`tests/test_experience_store.py` |
 | P3.5-T03 | Reflection Generator | 反思文本和经验条目，不修改边界 | DONE | `app/evolution/reflection.py`；`tests/test_reflection.py` |
-| P3.5-T04 | Safe Workflow Templates | 白名单工具模板，不生成脚本 | DONE | `workflows/templates/*.json`；`tests/test_workflow_templates.py` |
+| P3.5-T04 | Safe Workflow Templates | 白名单工具模板，不生成脚本 | DONE | `app/evolution/templates/*.json`；`tests/test_workflow_templates.py` |
 | P3.5-T05 | Workflow Retrieval in Planner | planner 建议，不绕过 policy | DONE | `app/evolution/workflows.py`；`tests/test_workflow_retrieval.py` |
 | P3.5-T06 | Evo-Lite Orchestrator Hook | 挂接评估和建议，不改变执行能力 | DONE | `app/evolution/init.py`；`tests/test_evo_lite_hook.py` |
 | P3.5-T07 | Safety Regression Benchmark | 安全回归验证 | DONE | `benchmarks/safety_regression.json`；`tests/test_safety_regression.py` |
@@ -94,4 +94,6 @@ Phase 3.5 实现必须能证明下列各点，对应的断言已经落到测试�
 
 ### 已知缺口
 
-`DEFAULT_TEMPLATE_DIR` 指向仓库根的 `workflows/templates/`，位于 `app` 包之外，因此不会被打进 wheel。从源码仓库运行不受影响，从 wheel 安装后调用默认模板目录会失败。见 `process/validation_matrix.md` 第 6 节。
+经验库目前是**只写加治理**：`app/evolution/init.py` 只往里写，生产路径上没有任何代码把经验读回来影响决策。这是有意的保守取舍——读回路一旦接上，经验就成了决策输入，必须先过隔离、去重和晋升门禁。`recent()` 和 `search_by_tags()` 已经排除了墓碑记录和过期记录，可以安全消费，所以补一条读回路是一次小改动，但它属于下一阶段。
+
+晋升门禁要求一条记忆至少携带 2 个形状合法的 evidence ref 且来自至少 2 个不同的 request_id，也就是说一条经验必须在两次以上的请求中复现才可能被晋升。

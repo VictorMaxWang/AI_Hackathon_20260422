@@ -32,7 +32,9 @@ cd AI_Hackathon_20260422
 py -3.11 -m pip install -e ".[test]"; py -3.11 -m pytest -q
 ```
 
-测试全绿即代表策略分级、确认门、证据链和回放回归都在这台机器上可复现。测试不调用真实 LLM，也不创建或删除真实系统用户。
+测试全绿即代表策略分级、确认门、证据链和回放回归都在这台机器上可复现。
+
+**「测试不调用真实 LLM」不是自律，是被代码强制的。** `tests/conftest.py` 里有一个 session 级 autouse fixture：它清空所有 `GUARDEDOPS_LLM_*` 与 `DASHSCOPE_API_KEY`、清空所有 `*_PROXY`，并 patch `socket.socket.connect` / `connect_ex`，任何指向非 loopback 地址的连接直接抛 `NetworkAccessBlockedError`。测试也不会创建或删除真实系统用户——写操作走注入的假执行器。
 
 启动 Web 演示：
 
@@ -114,9 +116,9 @@ flowchart LR
 - `app/api/`：FastAPI 对话接口
 - `app/ui/`：评审演示用 Operator Panel
 - `app/evolution/`：Evo-Lite 经验沉淀、工作流模板和回归入口
+- `app/evolution/templates/`：安全磁盘排查、文件搜索、端口归因、用户生命周期四份 workflow 模板（在包内，会随 wheel 一起发货）
 - `benchmarks/`：安全回归和 red-team mutation 用例
-- `workflows/templates/`：安全磁盘排查、文件搜索、端口归因、用户生命周期模板
-- `tests/`：策略、确认、API、CLI、回放回归、LLM mock 等测试
+- `tests/`：策略、确认、API、CLI、回放回归、打包、LLM mock 等测试
 - `docs/`：设计说明；`docs/process/` 是项目治理与任务文档
 
 ## 演示用例
@@ -167,6 +169,16 @@ guardedops "帮我查看当前磁盘使用情况"
 py -3.11 -m app.cli --json "8080 端口现在是谁在占用"
 ```
 
+退出码是脚本可依赖的契约（`app/cli.py::STATUS_EXIT_CODES`）：
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功，或用户主动取消 |
+| 1 | 内部或工具失败 |
+| 2 | 用法错误（argparse） |
+| 3 | 被策略拒绝或不受支持——**这是期望结果，不是故障** |
+| 4 | 等待精确确认 |
+
 API：
 
 ```bash
@@ -185,16 +197,44 @@ Invoke-RestMethod `
   -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
 ```
 
+会话隔离：请求体的 `session_id`、`X-GuardedOps-Session` 头或 `guardedops_session` Cookie 决定用哪一份多轮上下文；不带时服务端签发一个新会话并写回 Cookie。一个会话的待确认动作不会出现在另一个会话的响应里。
+
+运行时自检 `GET /health`（只回报 `DASHSCOPE_API_KEY` 是否存在，绝不返回密钥本身）：
+
+```bash
+curl -sS http://127.0.0.1:8001/health
+```
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "policy_version": "...",
+  "llm_enable": false,
+  "llm_allow_write_intents": false,
+  "dashscope_api_key_present": false
+}
+```
+
 ## 回归验证
 
 ```bash
 pytest -q                                       # 全量
 pytest tests/test_replayable_regression.py -q   # 红队回放
 pytest tests/test_safety_regression.py -q       # 传统安全回归
+pytest tests/test_packaging.py -q               # wheel 内容完整性
 pytest tests/test_llm_config.py tests/test_qwen_provider.py tests/test_llm_parser_integration.py -q
 ```
 
-CI 在 Python 3.11 / 3.12 / 3.13 上跑同一套测试，并额外构建 wheel、断言 Operator Panel 静态资源确实被打进包里、再装进干净虚拟环境验证导入。工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+`tests/test_operator_panel_core.py` 和 `tests/test_operator_panel_preview.py` 会用 `node` 直接跑 `app/ui/app.js`，以此证明前端代码里没有任何 allow/deny 判断，所以本机需要装 Node.js。
+
+CI 在 Python 3.11 / 3.12 / 3.13 上跑同一套测试，并额外用一个 `package` job 构建 wheel，断言：
+
+- Operator Panel 三个静态资源和四份 workflow 模板都在包里；
+- 除了 `app` 和 dist-info 之外没有多余的顶层成员；
+- 把 wheel 装进干净虚拟环境后，**在仓库目录之外**导入（否则 `import app` 会命中源码树，空 wheel 也能"通过"），并实际加载一遍 workflow 模板。
+
+同样的断言在本地由 `tests/test_packaging.py` 覆盖；没有可用的构建后端时它会 skip 而不是假装通过。工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
 ## 可选 Qwen3.6-Plus
 
@@ -220,13 +260,32 @@ $env:GUARDEDOPS_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v
 $env:DASHSCOPE_API_KEY = "your_api_key_here"
 ```
 
-安全约束：API key 只从 `DASHSCOPE_API_KEY` 读取，不写入日志、审计记录、前端响应或配置文件；LLM 输出只作为意图候选，必须通过 JSON、schema、策略和白名单校验；允许/拒绝仍由策略引擎决定。实际发货的系统提示词和输出契约见 [`docs/core_prompt.md`](docs/core_prompt.md)，provider 细节见 [`docs/llm_provider_qwen.md`](docs/llm_provider_qwen.md)。
+全部开关与取值范围（`app/config.py::load_config`）。**超出范围的值不会被钳制到边界，而是整个回落到默认值**，所以配错了只会得到保守配置，不会得到一个被悄悄放大的上限：
+
+| 环境变量 | 默认值 | 允许范围 |
+|---|---|---|
+| `GUARDEDOPS_LLM_ENABLE` | `false` | 布尔 |
+| `GUARDEDOPS_LLM_ALLOW_WRITE_INTENTS` | `false` | 布尔 |
+| `GUARDEDOPS_LLM_PROVIDER` | `aliyun_bailian` | 文本 |
+| `GUARDEDOPS_LLM_MODEL` | `qwen3.6-plus` | 文本 |
+| `GUARDEDOPS_LLM_BASE_URL` | DashScope 兼容端点 | 文本 |
+| `GUARDEDOPS_LLM_TIMEOUT_SECONDS` | `30` | 1 – 120 |
+| `GUARDEDOPS_LLM_MAX_TOKENS` | `1024` | 1 – 4096 |
+| `GUARDEDOPS_LLM_TEMPERATURE` | `0.0` | 0.0 – 1.0 |
+
+安全约束：
+
+- API key 只从 `DASHSCOPE_API_KEY` 读取，不写入日志、审计记录、前端响应或配置文件；`/health` 只回报它存在与否。
+- LLM 输出只作为意图候选，必须通过 JSON、schema、策略和白名单校验；允许/拒绝仍由策略引擎决定。
+- **写意图默认关闭。** `GUARDEDOPS_LLM_ALLOW_WRITE_INTENTS` 不显式打开时，模型给出的 `create_user` / `delete_user` 会被降级成未知写操作，由策略引擎在 S3 拒绝。也就是说默认配置下，LLM 这条路径**只可能让结果更严，不可能更宽**。
+
+实际发货的系统提示词和输出契约见 [`docs/core_prompt.md`](docs/core_prompt.md)（该文档第 2 节由 `tests/test_core_prompt_doc_matches_code.py` 断言与代码逐字一致），provider 细节见 [`docs/llm_provider_qwen.md`](docs/llm_provider_qwen.md)。
 
 ## 已交付 / 未交付
 
 已交付并有通过的测试：
 
-- FastAPI `/api/chat`、Web Operator Panel、CLI 入口
+- FastAPI `/api/chat`（带 `session_id` 会话隔离）、`/health` 运行时自检、Web Operator Panel、有退出码契约的 CLI 入口
 - 只读诊断闭环：磁盘、内存、文件、进程、端口
 - 普通用户创建/删除的策略、确认、执行和执行后状态验证
 - S3 高风险拒绝和安全替代建议
@@ -240,7 +299,9 @@ $env:DASHSCOPE_API_KEY = "your_api_key_here"
 - **SSH 端到端远程运维**。`SSHExecutor` 已实现且有测试，但 `app/api/chat.py` 与 `app/cli.py` 都硬编码 `LocalExecutor`，没有入口能构造 `SSHConnectionConfig`。目前 SSH 是库级能力，不是产品能力。
 - **持久化审计层**。`app/audit/` 是空包，没有 SQLite/JSONL 落盘，也没有跨请求审计查询。审计信息目前只体现为单次响应内的证据链。
 - **`audit_query_tool`**。它出现在 `app/policy/rules.py` 的白名单和设计文档里，但没有实现模块。白名单条目当前是空占位。
-- **真实 LLM 的自动化集成测试**。CI 不允许外网调用，只有 mock 测试。
+- **真实 LLM 的自动化集成测试**。CI 不允许外网调用，只有 mock 测试；`tests/conftest.py` 在 socket 层强制这一点。
+- **经验回读**。`app/evolution/experience_store.py` 有完整的存储、去重、隔离、晋升、衰减和 tombstone 实现并有测试，但生产请求路径里唯一的调用点是 `experience_store.add()`。经验目前是**只写 + 离线治理**：没有任何一次请求会因为历史经验改变解析、计划或风险结论。这对安全是好事（经验永远不可能放宽策略），但"越用越聪明"现在还不成立。
+- **写操作从 wheel 安装后可用**。sudo wrapper 在 `scripts/`（`app` 包外），从 wheel 装完后 `_wrapper_preflight` 会以 `wrapper script is missing` 明确拒绝。这是 fail-closed，不是静默降级，原因见 [`docs/sudo_wrapper_deployment.md`](docs/sudo_wrapper_deployment.md) 第 2 节。
 - **更大范围的运维写操作**。刻意不做。
 
 逐项状态和补齐路径见 [`docs/process/validation_matrix.md`](docs/process/validation_matrix.md) 第 6 节。

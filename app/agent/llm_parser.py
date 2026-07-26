@@ -6,7 +6,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import ValidationError
 
-from app.agent.parser import _looks_like_privilege_escalation as rule_privilege_escalation
+from app.agent.parser import looks_like_privilege_escalation as rule_privilege_escalation
 from app.config import AppConfig, load_config
 from app.llm import LLMProvider, LLMRequest, QwenProvider
 from app.llm.prompts import build_intent_candidate_messages

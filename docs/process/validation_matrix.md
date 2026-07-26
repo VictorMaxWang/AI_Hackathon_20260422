@@ -41,7 +41,7 @@ python -m pytest "<node id>" -q
 | 执行结果评估 | P3.5-T01 | 基于真实执行结果生成 success/risk/post_check 评估记录 | Evo-Lite 自评估 | `tests/test_evaluator.py::test_s3_refusal_is_safety_success_and_experience_candidate`、`tests/test_evaluator.py::test_post_check_failure_needs_reflection` | DONE |
 | 安全经验存储 | P3.5-T02 | 存储带来源、风险等级和适用范围的经验记录，且不落敏感字段 | Evo-Lite 自评估 | `tests/test_experience_store.py::test_add_and_get_experience`、`tests/test_experience_store.py::test_sensitive_or_large_fields_are_not_saved` | DONE |
 | 安全反思生成 | P3.5-T03 | 从评估记录生成 reflection，且只写入经验 | Evo-Lite 自评估 | `tests/test_reflection.py::test_delete_etc_refusal_generates_high_risk_reflection`、`tests/test_reflection.py::test_reflections_do_not_generate_dangerous_suggestions` | DONE |
-| 安全 workflow 模板 | P3.5-T04 | 模板只包含白名单工具和受控步骤，不含可执行脚本 | Evo-Lite 自评估 | `tests/test_workflow_templates.py::test_templates_contain_allowed_tools_and_steps_stay_within_them`、`tests/test_workflow_templates.py::test_templates_do_not_contain_shell_or_raw_command_content` | DONE |
+| 安全 workflow 模板 | P3.5-T04 | 模板只包含白名单工具和受控步骤，不含可执行脚本 | Evo-Lite 自评估 | `tests/test_workflow_templates.py::test_templates_contain_allowed_tools_and_steps_stay_within_them`、`tests/test_workflow_templates.py::test_templates_do_not_contain_shell_or_raw_command_content`、`tests/test_workflow_templates.py::test_default_template_dir_lives_inside_the_app_package` | DONE |
 | Planner workflow 检索 | P3.5-T05 | planner 可读取 workflow 建议但不绕过 policy | Evo-Lite 自评估 | `tests/test_workflow_retrieval.py::test_workflow_derived_plan_does_not_execute_tools` | DONE |
 | Evo-Lite Hook | P3.5-T06 | hook 不绕过 confirmation、policy、executor | Evo-Lite 自评估 | `tests/test_evo_lite_hook.py::test_s1_pending_confirmation_is_not_changed_to_execution`、`tests/test_evo_lite_hook.py::test_store_write_failure_does_not_break_main_request` | DONE |
 | 安全回归基准 | P3.5-T07 | 覆盖禁止训练、禁止 raw shell、禁止绕过 policy 的回归用例 | Evo-Lite 自评估 | `tests/test_safety_regression.py::test_benchmark_json_loads_with_unique_expected_case_ids`、`tests/test_safety_regression.py::test_all_safety_regression_cases_pass` | DONE |
@@ -54,7 +54,9 @@ python -m pytest "<node id>" -q
 | Operator Control Panel UX I | P3.6-T07 | 控制面展示解释卡、证据来源、确认绑定和恢复建议 | Phase 3.6 控制面 | `tests/test_operator_panel_core.py::test_api_chat_returns_explanation_card_and_operator_panel_projection`、`tests/test_operator_panel_core.py::test_page_has_no_raw_shell_input_and_keeps_natural_language_entry` | DONE |
 | Operator Control Panel UX II | P3.6-T08 | 控制面展示 blast radius 和 policy simulator | Phase 3.6 控制面 | `tests/test_operator_panel_preview.py::test_delete_user_request_exposes_blast_radius_preview`、`tests/test_operator_panel_preview.py::test_dangerous_refusal_exposes_policy_simulator_details`、`tests/test_operator_panel_preview.py::test_frontend_does_not_participate_in_allow_or_deny_decisions` | DONE |
 | 可选 LLM 意图候选 | P3-T04 | Qwen3.6-Plus 只提供意图候选，输出必须过 schema 与 policy | 无（默认关闭） | `tests/test_llm_config.py`、`tests/test_qwen_provider.py`、`tests/test_llm_parser_integration.py` | DONE |
-| CLI 入口 | P1-T06 | `python -m app.cli` 可跑只读 demo | 全部 demo | `tests/test_cli.py` | DONE |
+| 可安装包完整性 | 待编号 | 构建 wheel 并断言 UI 静态资源与四份 workflow 模板都在包内，且不泄漏 `app` 以外的顶层成员 | 无 | `tests/test_packaging.py::test_wheel_ships_the_operator_panel_assets`、`tests/test_packaging.py::test_wheel_ships_every_workflow_template`、`tests/test_packaging.py::test_wheel_has_no_top_level_member_beyond_the_app_package` | DONE |
+| 核心 Prompt 文档与代码一致 | 待编号 | `docs/core_prompt.md` 第 2 节的围栏块逐字等于 `INTENT_CANDIDATE_SYSTEM_PROMPT`，文档不能再靠人工同步 | 无 | `tests/test_core_prompt_doc_matches_code.py::test_core_prompt_doc_quotes_the_shipped_prompt_verbatim`、`tests/test_core_prompt_doc_matches_code.py::test_core_prompt_doc_holds_exactly_one_copy_of_the_prompt` | DONE |
+| CLI 入口 | P1-T06 | `python -m app.cli` 可跑只读 demo；退出码契约见 `app/cli.py::STATUS_EXIT_CODES`，测试目前覆盖 0（成功）与 3（被策略拒绝） | 全部 demo | `tests/test_cli.py::test_cli_accepts_natural_language_input`、`tests/test_cli.py::test_unknown_write_like_request_does_not_execute_any_command` | DONE |
 | Web/API 入口 | P1-T07 | `/api/chat` 返回结构化 envelope | 全部 demo | `tests/test_api_readonly.py`、`tests/test_api_confirmation.py` | DONE |
 | SSH 执行器（库级） | P1-T02 | `SSHExecutor` 使用 argv-only、有 timeout、统一 CommandResult | 无 | `tests/test_executors.py` | DONE |
 | SSH 远程运维（端到端） | 待编号 | 从 Web/CLI 选择 SSH 目标并远程执行 | 无 | 无 | NOT_IMPLEMENTED |
@@ -86,7 +88,7 @@ python -m pytest "<node id>" -q
 | 连续任务鲁棒性与恢复 | Step Contracts + Drift Revalidation + Checkpoint Resume + Failure Recovery | `tests/test_step_contracts.py`、`tests/test_recovery_engine.py` |
 | 可重放可信控制面 | Replayable Regression + Operator Control Panel UX | `tests/test_replayable_regression.py`、`tests/test_operator_panel_preview.py` |
 | 稳定性一致性 | 全量 pytest + GitHub Actions CI（3.11 / 3.12 / 3.13） | `.github/workflows/ci.yml` |
-| 工程质量 | 清晰分层 + 白名单工具 + 可安装的包 | `pyproject.toml`、CI 的 `package` job |
+| 工程质量 | 清晰分层 + 白名单工具 + 可安装的包 | `pyproject.toml`、`tests/test_packaging.py`、CI 的 `package` job |
 | 创新性 | 去命令行化安全运维入口 | Web demo + `app/ui/` |
 
 审计层目前不作为工程质量证据，因为它没有实现，见第 6 节。
@@ -194,5 +196,5 @@ python -m pytest "<node id>" -q
 | audit_query_tool | 出现在 `app/policy/rules.py` 的工具白名单以及两份设计文档里，但没有对应实现模块 | 白名单条目当前是空占位；不影响安全性（没有实现就调用不到），但会让文档看起来夸大 | P4-T02，依赖 P4-T01 |
 | 审计导出 | 未开始 | 无法导出最近操作报告 | P4-T02 |
 | 真实 LLM 自动化集成测试 | 只有 mock 测试；默认不调用 DashScope | 真实模型行为未在 CI 中验证（这是刻意的，CI 不允许外网调用） | 需要单独的、手动触发的冒烟流程 |
-| 打包 workflow 模板 | `app/evolution/workflows.py` 的 `DEFAULT_TEMPLATE_DIR` 指向仓库根的 `workflows/templates/`，位于 `app` 包之外，因此不会进入 wheel | 从 wheel 安装后调用默认模板目录会失败；从仓库源码运行不受影响 | 把模板移进 `app/evolution/templates/` 并加 `package-data` |
-| 打包 sudo wrapper | `app/tools/user.py` 的 `WRAPPER_DIR` 指向仓库根的 `scripts/`，同样在 `app` 包之外 | 从 wheel 安装后写操作会被 `_wrapper_preflight` 以 `wrapper script is missing` 明确拒绝（fail-closed，不是静默降级）；写操作目前只在从仓库源码运行时可用 | 把 wrapper 装到系统位置并让路径可配置，见 `../sudo_wrapper_deployment.md` 第 4 节 |
+| 打包 sudo wrapper | `app/tools/user.py` 的 `WRAPPER_DIR` 指向仓库根的 `scripts/`，在 `app` 包之外 | 从 wheel 安装后写操作会被 `_wrapper_preflight` 以 `wrapper script is missing` 明确拒绝（fail-closed，不是静默降级）；写操作目前只在从仓库源码运行时可用 | 把 wrapper 装到系统位置并让路径可配置，见 `../sudo_wrapper_deployment.md` 第 4 节。**注意这条不能照搬 workflow 模板的修法**：模板是纯数据、进包即可；wrapper 是需要 root 所有且不可被代理账号写入的可执行文件，塞进 site-packages 反而会削弱第 4 节的权限模型 |
+| 经验回读 | `app/evolution/experience_store.py` 提供了 `get` / `search_by_tags` / `recent` / `verify` / `mark_promoted` / `apply_decay` 等读取与治理接口并有测试，但生产请求路径里唯一的调用点是 `app/evolution/init.py` 的 `experience_store.add(record)` | 经验目前是**只写 + 离线治理**：没有任何一次请求会因为历史经验而改变解析、计划或风险结论。这对安全是好事（经验永远不可能放宽策略），但也意味着"经验沉淀改善后续行为"这句话现在不成立 | 需要单独任务：定义经验只能收紧不能放宽的回读契约，并为它写回归用例 |

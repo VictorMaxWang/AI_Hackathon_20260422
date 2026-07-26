@@ -20,6 +20,7 @@ class SessionMemory(BaseModel):
 
     session_id: str = "default"
     last_username: str | None = None
+    last_username_unconfirmed: bool = False
     last_path: str | None = None
     last_port: int | None = Field(default=None, ge=0, le=65535)
     last_pid: int | None = Field(default=None, ge=0)
@@ -61,12 +62,19 @@ class SessionMemory(BaseModel):
         parsed_intent: ParsedIntent,
         *,
         risk_level: RiskLevel | str | None = None,
+        confirmed: bool = True,
     ) -> None:
-        """Record explicit structured targets from a parsed, accepted request."""
+        """Record explicit structured targets from a parsed, accepted request.
+
+        ``confirmed=False`` marks a target that was only proposed. Such a target
+        is still reported for transparency but never resolves a later reference
+        like 刚才那个用户, because the object may not exist.
+        """
 
         target = parsed_intent.target
         if target.username:
             self.last_username = target.username
+            self.last_username_unconfirmed = not confirmed
         if target.path:
             self.last_path = target.path
         elif target.base_paths:
@@ -85,7 +93,7 @@ class SessionMemory(BaseModel):
 
     def resolve(self, slot: str) -> Any:
         if slot == "username":
-            return self.last_username
+            return None if self.last_username_unconfirmed else self.last_username
         if slot == "path":
             return self.last_path
         if slot == "port":

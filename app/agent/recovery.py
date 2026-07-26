@@ -292,7 +292,7 @@ def _is_environment_drift(
     corpus: str,
 ) -> bool:
     error = _lower(result_data.get("error"))
-    if error.startswith("confirmation_token_") and error.endswith("_mismatch"):
+    if error.startswith("confirmation_token_") or error == "missing_confirmation_token":
         return True
     if any(str(item.get("intent") or "").lower() == "contract_drift" for item in timeline):
         return True

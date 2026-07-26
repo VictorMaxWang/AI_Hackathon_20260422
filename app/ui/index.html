@@ -23,11 +23,17 @@
         </div>
       </form>
 
-      <section class="status-strip" aria-live="polite">
+      <section class="status-strip" role="status" aria-live="polite" aria-atomic="true">
         <span id="request-status">等待请求</span>
       </section>
 
-      <section id="operator-panel" class="operator-panel" hidden>
+      <section
+        id="operator-panel"
+        class="operator-panel"
+        aria-label="受控运维控制面"
+        aria-busy="false"
+        hidden
+      >
         <div class="workspace">
           <section class="workspace-main">
             <section class="surface surface-overview">
@@ -101,6 +107,18 @@
                 <h2>证据时间线 / 叙事时间线</h2>
               </div>
               <ol id="timeline-list" class="timeline"></ol>
+            </section>
+
+            <section id="tool-call-panel" class="surface" hidden>
+              <div class="surface-head">
+                <p class="surface-kicker">工具层</p>
+                <h2>工具调用</h2>
+              </div>
+              <p id="tool-call-summary" class="body-text">-</p>
+              <details class="tool-call-details">
+                <summary>展开本次白名单工具调用</summary>
+                <ol id="tool-call-list" class="tool-call-list"></ol>
+              </details>
             </section>
           </section>
 
@@ -190,6 +208,6 @@
       </section>
     </main>
 
-    <script src="/ui/app.js?v=cn-20260424f"></script>
+    <script src="/ui/app.js?v=cn-20260726a"></script>
   </body>
 </html>

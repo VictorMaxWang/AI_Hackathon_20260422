@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import app.evolution.workflows
 from app.evolution.workflows import (
     DEFAULT_TEMPLATE_DIR,
     WorkflowTemplateLoadError,
@@ -71,6 +72,16 @@ def test_templates_do_not_contain_shell_or_raw_command_content() -> None:
     for template_path in DEFAULT_TEMPLATE_DIR.glob("*.json"):
         payload = json.loads(template_path.read_text(encoding="utf-8"))
         _assert_no_raw_command_content(payload, template_path.name)
+
+
+def test_default_template_dir_lives_inside_the_app_package() -> None:
+    package_root = Path(app.evolution.workflows.__file__).resolve().parent
+
+    assert DEFAULT_TEMPLATE_DIR == package_root / "templates"
+    assert DEFAULT_TEMPLATE_DIR.is_dir()
+
+    shipped = {path.stem for path in DEFAULT_TEMPLATE_DIR.glob("*.json")}
+    assert EXPECTED_WORKFLOW_IDS <= shipped
 
 
 def test_safe_user_lifecycle_requires_confirmation_and_keeps_policy_gates() -> None:

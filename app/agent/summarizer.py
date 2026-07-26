@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from app.agent.confirmation import confirmation_status_from_parts
 from app.agent.parser import (
     DISK_INTENT,
     FILE_INTENT,
@@ -92,6 +93,12 @@ class ReadonlySummarizer:
 
         if status == "skipped":
             return f"连续任务已按条件跳过部分步骤：{reason or '条件未满足'}。{delete_reason}"
+
+        if status == "incomplete":
+            return (
+                "连续任务未全部完成：受策略或条件保护的写步骤没有执行，"
+                f"因此不能视为成功。原因：{reason or '写步骤条件未满足'}。{delete_reason}"
+            )
 
         if status == "aborted":
             return f"连续任务已中止：{reason or '前置步骤未成功'}。{delete_reason}"
@@ -482,24 +489,13 @@ def _confirmation_status(
     result_data: dict[str, Any],
     timeline: list[dict[str, Any]],
 ) -> str:
-    plan_status = str(plan_data.get("status") or "").lower()
-    result_status = str(result_data.get("status") or "").lower()
-    result_error = str(result_data.get("error") or "").lower()
-    execution_results = _as_list(execution_data.get("results"))
-
-    if result_error == "confirmation_text_mismatch":
-        return "mismatch"
-    if result_status == "cancelled" or plan_status == "cancelled":
-        return "cancelled"
-    if result_status == "pending_confirmation" or plan_status == "pending_confirmation":
-        return "pending"
-    if plan_status == "confirmed":
-        return "confirmed"
-    if any(str(item.get("status") or "").lower() == "pending_confirmation" for item in timeline):
-        return "pending"
-    if bool(risk_data.get("requires_confirmation")) and execution_results:
-        return "confirmed"
-    return "not_required"
+    return confirmation_status_from_parts(
+        risk=risk_data,
+        plan=plan_data,
+        execution=execution_data,
+        result=result_data,
+        timeline=timeline,
+    )
 
 
 def _event_ids(evidence: EvidenceChain, stage: EvidenceStage) -> list[str]:
@@ -566,6 +562,13 @@ def _translate_policy_reason(reason: str) -> str:
         return "请求目标是受保护的系统核心目录"
     if "unknown or unsupported write operation" in lower_reason or "unknown writes" in lower_reason:
         return "当前只支持只读基础能力，未知写操作默认拒绝"
+    if (
+        "not on the read-only whitelist" in lower_reason
+        or "unrecognized operations are denied" in lower_reason
+    ):
+        return "当前只支持只读基础能力，未识别的操作默认拒绝"
+    if "read-only scope must be an absolute path" in lower_reason:
+        return "只读范围必须是绝对路径，相对路径无法被策略收敛"
     return reason
 
 
@@ -638,7 +641,16 @@ def _summarize_file_search(data: Any) -> str:
     truncated = "结果已截断" if payload.get("truncated") else "结果未截断"
     keyword = payload.get("name_contains")
     keyword_text = f"，文件名包含 {keyword}" if keyword else ""
-    return f"已在 {base_path} 中完成文件检索{keyword_text}，返回 {count} 条结果，{truncated}。"
+    summary = f"已在 {base_path} 中完成文件检索{keyword_text}，返回 {count} 条结果，{truncated}。"
+    if not payload.get("partial"):
+        return summary
+
+    warnings = [str(item).strip() for item in (payload.get("warnings") or []) if str(item).strip()]
+    warning_text = f"（{'；'.join(warnings[:3])}）" if warnings else ""
+    return (
+        f"{summary}注意：本次遍历不完整{warning_text}，"
+        "部分目录未能读取，结果不能视为该路径的完整清单。"
+    )
 
 
 def _summarize_process(data: Any) -> str:

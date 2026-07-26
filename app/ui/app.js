@@ -154,6 +154,21 @@
     final_result: "最终结果",
   };
 
+  const SESSION_STORAGE_KEY = "guardedops.session_id";
+  const REQUEST_TIMEOUT_MS = 60000;
+
+  const HTTP_STATUS_MESSAGES = {
+    400: "请求格式不正确。",
+    404: "接口不存在，请确认服务已启动。",
+    413: "请求内容过大，请缩短后重试。",
+    422: "请求内容不合法。",
+    429: "请求过于频繁，请稍后重试。",
+    500: "服务端内部错误。",
+    502: "网关错误，后端不可达。",
+    503: "服务暂时不可用。",
+    504: "服务端响应超时。",
+  };
+
   const STATUS_TONES = {
     success: "ready",
     completed: "ready",
@@ -173,7 +188,8 @@
     not_available: "neutral",
   };
 
-  function boot(doc) {
+  function boot(doc, scope) {
+    const runtime = scope || currentScope();
     const form = doc.querySelector("#operator-form");
     const input = doc.querySelector("#operator-request");
     const button = doc.querySelector("#submit-request");
@@ -187,6 +203,8 @@
       return;
     }
 
+    const sessionId = resolveSessionId(runtime);
+
     form.dataset.bound = "true";
     form.addEventListener("submit", async function (event) {
       event.preventDefault();
@@ -198,22 +216,26 @@
       }
 
       setBusy(input, button, true);
+      setPanelBusy(doc, true);
       statusText.textContent = "正在读取编排器输出…";
 
       try {
-        const response = await fetch("/api/chat", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ raw_user_input: rawUserInput }),
+        const response = await requestChat(runtime, {
+          raw_user_input: rawUserInput,
+          session_id: sessionId,
         });
 
-        const payload = await response.json();
         if (!response.ok) {
-          throw new Error(payload.detail || "请求失败");
+          const failurePayload = parseJsonSafely(await readBodyText(response));
+          if (failurePayload && hasArray(asObject(failurePayload.operator_panel).explanation_sections)) {
+            renderViewModel(doc, createViewModel(failurePayload, rawUserInput));
+            statusText.textContent = "服务端返回失败信封";
+            return;
+          }
+          throw new Error(describeResponseFailure(response.status, failurePayload));
         }
 
+        const payload = await response.json();
         const viewModel = createViewModel(payload, rawUserInput);
         renderViewModel(doc, viewModel);
         statusText.textContent = "控制面已更新";
@@ -222,13 +244,161 @@
         renderViewModel(doc, viewModel);
         statusText.textContent = "请求失败";
       } finally {
+        setPanelBusy(doc, false);
         setBusy(input, button, false);
       }
     });
   }
 
+  function requestChat(scope, body) {
+    const fetchImpl = scope && typeof scope.fetch === "function"
+      ? scope.fetch.bind(scope)
+      : fetch;
+    return fetchImpl("/api/chat", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: requestTimeoutSignal(scope),
+    });
+  }
+
+  function requestTimeoutSignal(scope) {
+    const abortSignal = scope && scope.AbortSignal;
+    if (abortSignal && typeof abortSignal.timeout === "function") {
+      return abortSignal.timeout(REQUEST_TIMEOUT_MS);
+    }
+    return undefined;
+  }
+
+  async function readBodyText(response) {
+    try {
+      return await response.text();
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function parseJsonSafely(text) {
+    try {
+      const value = JSON.parse(firstText(text));
+      return value && typeof value === "object" ? value : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function describeResponseFailure(status, payload) {
+    const source = asObject(payload);
+    const detail = normalizeDetail(source.detail);
+    if (detail) {
+      return detail;
+    }
+
+    const serverText = firstText(asObject(source.result).error, source.explanation);
+    if (serverText) {
+      return serverText;
+    }
+
+    return firstText(HTTP_STATUS_MESSAGES[status], "请求失败（HTTP " + firstText(status, "未知") + "）。");
+  }
+
+  function normalizeDetail(detail) {
+    if (typeof detail === "string") {
+      return firstText(detail);
+    }
+
+    if (Array.isArray(detail)) {
+      return detail
+        .map(function (entry) {
+          const item = asObject(entry);
+          const location = asList(item.loc)
+            .slice(1)
+            .map(function (part) {
+              return firstText(part);
+            })
+            .filter(Boolean)
+            .join(".");
+          const message = firstText(item.msg, item.type);
+          if (location && message) {
+            return location + "：" + message;
+          }
+          return firstText(message, location);
+        })
+        .filter(Boolean)
+        .join("、");
+    }
+
+    if (detail && typeof detail === "object") {
+      return firstText(asObject(detail).msg);
+    }
+
+    return "";
+  }
+
+  function describeClientError(error) {
+    const name = firstText(error && error.name);
+    if (name === "TimeoutError" || name === "AbortError") {
+      return "请求超时或被中止，后端未在 60 秒内返回。";
+    }
+    if (name === "TypeError") {
+      return "无法连接后端服务，请确认服务已启动。";
+    }
+    return firstText(error && error.message, "请求失败");
+  }
+
+  function resolveSessionId(scope) {
+    const store = safeSessionStorage(scope);
+    const existing = store ? firstText(store.getItem(SESSION_STORAGE_KEY)) : "";
+    if (existing) {
+      return existing;
+    }
+
+    const generated = generateSessionId(scope);
+    if (!store) {
+      return generated;
+    }
+
+    try {
+      store.setItem(SESSION_STORAGE_KEY, generated);
+    } catch (error) {
+      return generated;
+    }
+    return generated;
+  }
+
+  function safeSessionStorage(scope) {
+    try {
+      const store = scope && scope.sessionStorage;
+      return store && typeof store.getItem === "function" ? store : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function generateSessionId(scope) {
+    const cryptoApi = scope && scope.crypto;
+    if (cryptoApi && typeof cryptoApi.randomUUID === "function") {
+      return cryptoApi.randomUUID().replace(/-/g, "");
+    }
+    if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
+      const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+      return Array.prototype.map
+        .call(bytes, function (value) {
+          return ("0" + value.toString(16)).slice(-2);
+        })
+        .join("");
+    }
+    return "s" + Date.now().toString(16) + Math.random().toString(16).slice(2, 10);
+  }
+
+  function currentScope() {
+    return typeof globalThis !== "undefined" ? globalThis : null;
+  }
+
   function createFailureViewModel(rawUserInput, error) {
-    const message = firstText(error && error.message, "请求失败");
+    const message = describeClientError(error);
     return {
       userInput: firstText(rawUserInput, "-"),
       status: "failed",
@@ -243,6 +413,7 @@
       answerSummary: emptyAnswerSummary(),
       blastRadius: normalizeBlastRadius({}),
       policySimulator: normalizePolicySimulator({}),
+      toolCalls: normalizeToolCalls([]),
       explanationSections: [],
       timelineEntries: [
         {
@@ -316,6 +487,7 @@
       answerSummary: answerSummary,
       blastRadius: normalizeBlastRadius(asObject(operatorPanel.blast_radius_preview)),
       policySimulator: normalizePolicySimulator(asObject(operatorPanel.policy_simulator)),
+      toolCalls: normalizeToolCalls(operatorPanel.tool_calls),
       explanationSections: normalizeExplanationSections(operatorPanel.explanation_sections),
       timelineEntries: normalizeTimelineEntries(operatorPanel.timeline_entries),
       preflightItems: normalizePreflightItems(operatorPanel.preflight_items),
@@ -342,6 +514,7 @@
     const resultStatus = firstText(result.status, execution.status, "unknown");
     const confirmationText = firstText(result.confirmation_text, risk.confirmation_text);
     const requiresConfirmation = Boolean(risk.requires_confirmation);
+    const confirmationMismatch = isConfirmationMismatch(result.error);
 
     return {
       user_input: firstText(rawUserInput, intent.raw_user_input, "-"),
@@ -429,29 +602,26 @@
         {
           key: "plan_ready",
           label: "Plan ready",
-          status: planStatus === "pending_confirmation"
-            ? "pending"
-            : ["refused", "unsupported", "failed"].indexOf(planStatus) >= 0
-              ? "blocked"
-              : "ready",
+          status: planPreflightStatus(planStatus),
           summary: "计划状态：" + planStatus + "。",
           evidence_refs: [],
         },
         {
           key: "confirmation_gate",
           label: "Confirmation gate",
-          status: !requiresConfirmation
-            ? "not_required"
-            : resultStatus === "pending_confirmation" || planStatus === "pending_confirmation"
-              ? "pending"
-              : planStatus === "confirmed" || resultStatus === "success"
-                ? "ready"
-                : "blocked",
+          status: confirmationPreflightStatus({
+            requiresConfirmation: requiresConfirmation,
+            planStatus: planStatus,
+            resultStatus: resultStatus,
+            mismatch: confirmationMismatch,
+          }),
           summary: !requiresConfirmation
             ? "该请求不需要额外确认。"
-            : confirmationText
-              ? "确认文本已绑定。"
-              : "等待确认状态。",
+            : confirmationMismatch
+              ? "确认绑定失配，当前请求未继续执行。"
+              : confirmationText
+                ? "确认文本已绑定。"
+                : "等待确认状态。",
           evidence_refs: [],
         },
         {
@@ -466,15 +636,30 @@
           evidence_refs: [],
         },
       ],
+      tool_calls: asList(execution.results).map(function (entry, index) {
+        const item = asObject(entry);
+        const step = asObject(asList(execution.steps)[index]);
+        const success = item.success === true;
+        return {
+          order: index + 1,
+          tool_name: firstText(item.tool_name, step.tool_name, "unknown"),
+          status: success ? "success" : "failed",
+          success: success,
+          args: [],
+          command: firstText(asObject(item.data).source),
+          error: firstText(item.error),
+          output_excerpt: "",
+          evidence_refs: [],
+        };
+      }),
       confirmation: {
         required: requiresConfirmation,
-        status: !requiresConfirmation
-          ? "not_required"
-          : resultStatus === "pending_confirmation" || planStatus === "pending_confirmation"
-            ? "pending_confirmation"
-            : planStatus === "confirmed" || resultStatus === "success"
-              ? "confirmed"
-              : "required",
+        status: confirmationPanelStatus({
+          requiresConfirmation: requiresConfirmation,
+          planStatus: planStatus,
+          resultStatus: resultStatus,
+          mismatch: confirmationMismatch,
+        }),
         text: confirmationText,
         summary: firstText(asObject(explanationCard.confirmation_basis).summary),
         evidence_refs: uniqueStrings(asObject(explanationCard.confirmation_basis).evidence_refs),
@@ -829,6 +1014,106 @@
     };
   }
 
+  function normalizeToolCalls(value) {
+    const entries = asList(value).map(function (entry, index) {
+      const item = asObject(entry);
+      const status = firstText(item.status, item.success === true ? "success" : "failed");
+      return {
+        order: firstText(item.order, index + 1),
+        toolName: firstText(item.tool_name, "unknown"),
+        status: status,
+        statusLabel: formatStatusLabel(status),
+        tone: toneForStatus(status),
+        command: firstText(item.command),
+        error: localizeText(firstText(item.error)),
+        outputExcerpt: firstText(item.output_excerpt),
+        args: asList(item.args).map(function (argEntry) {
+          const arg = asObject(argEntry);
+          return {
+            label: localizeLabel(firstText(arg.label, "arg")),
+            value: firstText(arg.value, "-"),
+          };
+        }),
+        evidenceRefs: uniqueStrings(item.evidence_refs),
+      };
+    });
+
+    const failed = entries.filter(function (entry) {
+      return entry.status !== "success";
+    }).length;
+
+    return {
+      visible: entries.length > 0,
+      summary: entries.length
+        ? "本次共调用 " + entries.length + " 个白名单工具（失败 " + failed + " 个）；工具集合固定，不存在任意 shell。"
+        : "",
+      entries: entries,
+    };
+  }
+
+  function planPreflightStatus(planStatus) {
+    const lowered = firstText(planStatus).toLowerCase();
+    if (["refused", "unsupported", "failed"].indexOf(lowered) >= 0) {
+      return "blocked";
+    }
+    if (["pending_confirmation", "cancelled"].indexOf(lowered) >= 0) {
+      return "pending";
+    }
+    if (["unknown", ""].indexOf(lowered) >= 0) {
+      return "not_available";
+    }
+    return "ready";
+  }
+
+  function confirmationPreflightStatus(state) {
+    if (!state.requiresConfirmation) {
+      return "not_required";
+    }
+    if (state.mismatch) {
+      return "blocked";
+    }
+
+    const plan = firstText(state.planStatus).toLowerCase();
+    const result = firstText(state.resultStatus).toLowerCase();
+    if (result === "pending_confirmation" || plan === "pending_confirmation") {
+      return "pending";
+    }
+    if (plan === "confirmed" || ["success", "completed"].indexOf(result) >= 0) {
+      return "ready";
+    }
+    if (["refused", "failed", "cancelled"].indexOf(result) >= 0) {
+      return "blocked";
+    }
+    return "pending";
+  }
+
+  function confirmationPanelStatus(state) {
+    if (!state.requiresConfirmation) {
+      return "not_required";
+    }
+    if (state.mismatch) {
+      return "mismatch";
+    }
+
+    const plan = firstText(state.planStatus).toLowerCase();
+    const result = firstText(state.resultStatus).toLowerCase();
+    if (result === "pending_confirmation" || plan === "pending_confirmation") {
+      return "pending_confirmation";
+    }
+    if (result === "cancelled" || plan === "cancelled") {
+      return "cancelled";
+    }
+    if (plan === "confirmed" || ["success", "completed"].indexOf(result) >= 0) {
+      return "confirmed";
+    }
+    return "required";
+  }
+
+  function isConfirmationMismatch(value) {
+    const lowered = firstText(value).toLowerCase();
+    return lowered === "confirmation_text_mismatch" || lowered.indexOf("confirmation_token_") === 0;
+  }
+
   function normalizeConfirmation(value) {
     const status = firstText(value.status, "not_required");
     const required = Boolean(value.required);
@@ -899,12 +1184,13 @@
       ? "置信度来源：" + viewModel.confidenceSource
       : "";
 
-    renderTags(query(doc, "#risk-reasons"), viewModel.riskReasons, "warning");
+    renderTags(doc, query(doc, "#risk-reasons"), viewModel.riskReasons, "warning");
     renderAnswerSummary(doc, viewModel.answerSummary);
     renderBlastRadius(doc, viewModel.blastRadius);
-    renderExplanationSections(query(doc, "#explanation-list"), viewModel.explanationSections);
-    renderTimeline(query(doc, "#timeline-list"), viewModel.timelineEntries);
-    renderPreflight(query(doc, "#preflight-list"), viewModel.preflightItems);
+    renderExplanationSections(doc, query(doc, "#explanation-list"), viewModel.explanationSections);
+    renderTimeline(doc, query(doc, "#timeline-list"), viewModel.timelineEntries);
+    renderToolCalls(doc, viewModel.toolCalls);
+    renderPreflight(doc, query(doc, "#preflight-list"), viewModel.preflightItems);
     renderPolicySimulator(doc, viewModel.policySimulator);
     renderConfirmation(doc, viewModel.confirmation);
     renderRefusal(doc, viewModel.refusal);
@@ -917,74 +1203,123 @@
     const panel = query(doc, "#answer-summary-panel");
     panel.hidden = !summary.visible;
     setText(doc, "#answer-summary-text", summary.text);
-    renderTags(query(doc, "#answer-summary-meta"), summary.meta || [], "info");
+    renderTags(doc, query(doc, "#answer-summary-meta"), summary.meta || [], "info");
   }
 
-  function renderExplanationSections(container, sections) {
+  function renderExplanationSections(doc, container, sections) {
     replaceChildren(
       container,
       sections.length
         ? sections.map(function (section) {
-            const item = createElement("article", "explanation-item");
-            const title = createElement("h3", "explanation-title", section.label);
-            const summary = createElement("p", "explanation-summary", section.summary);
+            const item = createElement(doc, "article", "explanation-item");
+            const title = createElement(doc, "h3", "explanation-title", section.label);
+            const summary = createElement(doc, "p", "explanation-summary", section.summary);
             item.appendChild(title);
             item.appendChild(summary);
-            item.appendChild(createRefs(section.evidenceRefs));
+            item.appendChild(createRefs(doc, section.evidenceRefs));
             return item;
           })
-        : [createElement("p", "empty-state", "暂无解释卡。")]
+        : [createElement(doc, "p", "empty-state", "暂无解释卡。")]
     );
   }
 
-  function renderTimeline(container, entries) {
+  function renderTimeline(doc, container, entries) {
     replaceChildren(
       container,
       entries.length
         ? entries.map(function (entry) {
-            const item = createElement("li", "timeline-item");
+            const item = createElement(doc, "li", "timeline-item");
             item.dataset.tone = entry.tone;
 
-            const top = createElement("div", "timeline-top");
-            top.appendChild(createElement("h3", "timeline-title", entry.title));
-            top.appendChild(createMetaList(entry.meta));
+            const top = createElement(doc, "div", "timeline-top");
+            top.appendChild(createElement(doc, "h3", "timeline-title", entry.title));
+            top.appendChild(createMetaList(doc, entry.meta));
 
             item.appendChild(top);
-            item.appendChild(createElement("p", "timeline-summary", entry.summary));
+            item.appendChild(createElement(doc, "p", "timeline-summary", entry.summary));
             if (entry.status) {
-              const statusWrap = createElement("div", "timeline-meta");
-              statusWrap.appendChild(createMetaChip("状态 " + formatStatusLabel(entry.status)));
+              const statusWrap = createElement(doc, "div", "timeline-meta");
+              statusWrap.appendChild(createMetaChip(doc, "状态 " + formatStatusLabel(entry.status)));
               item.appendChild(statusWrap);
             }
-            item.appendChild(createRefs(entry.evidenceRefs));
+            item.appendChild(createRefs(doc, entry.evidenceRefs));
             return item;
           })
-        : [createElement("li", "empty-state", "暂无时间线。")]
+        : [createElement(doc, "li", "empty-state", "暂无时间线。")]
     );
   }
 
-  function renderPreflight(container, items) {
+  function renderToolCalls(doc, toolCalls) {
+    const calls = toolCalls || normalizeToolCalls([]);
+    const panel = query(doc, "#tool-call-panel");
+    panel.hidden = !calls.visible;
+    setText(doc, "#tool-call-summary", calls.summary);
+    replaceChildren(
+      query(doc, "#tool-call-list"),
+      calls.entries.length
+        ? calls.entries.map(function (entry) {
+            return createToolCallItem(doc, entry);
+          })
+        : [createElement(doc, "li", "empty-state", "本次请求没有调用任何工具。")]
+    );
+  }
+
+  function createToolCallItem(doc, entry) {
+    const node = createElement(doc, "li", "tool-call-item");
+    node.dataset.tone = entry.tone;
+
+    const top = createElement(doc, "div", "timeline-top");
+    top.appendChild(
+      createElement(doc, "h3", "check-title", entry.order + ". " + entry.toolName)
+    );
+    top.appendChild(createOutcomeChip(doc, entry.statusLabel, entry.tone));
+    node.appendChild(top);
+
+    if (entry.command) {
+      node.appendChild(createElement(doc, "code", "tool-call-command", entry.command));
+    }
+    if (entry.args.length) {
+      const argWrap = createElement(doc, "div", "detail-grid");
+      entry.args.forEach(function (arg) {
+        const row = createElement(doc, "div", "detail-row");
+        row.appendChild(createElement(doc, "span", "detail-label", arg.label));
+        row.appendChild(createElement(doc, "span", "detail-value", arg.value));
+        argWrap.appendChild(row);
+      });
+      node.appendChild(argWrap);
+    }
+    if (entry.error) {
+      node.appendChild(createElement(doc, "p", "check-summary", "错误：" + entry.error));
+    }
+    if (entry.outputExcerpt) {
+      node.appendChild(createElement(doc, "code", "tool-call-output", entry.outputExcerpt));
+    }
+    node.appendChild(createRefs(doc, entry.evidenceRefs));
+    return node;
+  }
+
+  function renderPreflight(doc, container, items) {
     replaceChildren(
       container,
       items.length
         ? items.map(function (item) {
-            const node = createElement("li", "check-item");
+            const node = createElement(doc, "li", "check-item");
             node.dataset.status = item.status;
 
-            const head = createElement("div", "check-head");
-            head.appendChild(createElement("span", "check-mark"));
+            const head = createElement(doc, "div", "check-head");
+            head.appendChild(createElement(doc, "span", "check-mark"));
 
-            const labelWrap = createElement("div");
-            labelWrap.appendChild(createElement("h3", "check-title", item.label));
-            labelWrap.appendChild(createElement("p", "meta-text", item.statusLabel));
+            const labelWrap = createElement(doc, "div");
+            labelWrap.appendChild(createElement(doc, "h3", "check-title", item.label));
+            labelWrap.appendChild(createElement(doc, "p", "meta-text", item.statusLabel));
             head.appendChild(labelWrap);
 
             node.appendChild(head);
-            node.appendChild(createElement("p", "check-summary", item.summary));
-            node.appendChild(createRefs(item.evidenceRefs));
+            node.appendChild(createElement(doc, "p", "check-summary", item.summary));
+            node.appendChild(createRefs(doc, item.evidenceRefs));
             return node;
           })
-        : [createElement("li", "empty-state", "暂无预检项。")]
+        : [createElement(doc, "li", "empty-state", "暂无预检项。")]
     );
   }
 
@@ -993,22 +1328,26 @@
     panel.hidden = !blastRadius.visible;
     setText(doc, "#blast-radius-summary", blastRadius.summary);
     renderDetailGrid(
+      doc,
       query(doc, "#blast-radius-facts"),
       blastRadius.facts,
       "暂无范围内事实。"
     );
     renderImpactList(
+      doc,
       query(doc, "#blast-radius-impacts"),
       blastRadius.impacts,
       "暂无影响项。"
     );
     renderTags(
+      doc,
       query(doc, "#blast-radius-paths"),
       blastRadius.protectedPaths,
       "critical",
       "未标记受保护路径"
     );
     renderCompactList(
+      doc,
       query(doc, "#blast-radius-notes"),
       blastRadius.notes,
       "暂无额外预览说明。"
@@ -1032,16 +1371,19 @@
     );
     setText(doc, "#policy-fingerprint", policySimulator.targetFingerprint);
     renderRuleList(
+      doc,
       query(doc, "#policy-rules"),
       policySimulator.matchedRules,
       "暂无命中规则记录。"
     );
     renderCompactList(
+      doc,
       query(doc, "#policy-denied"),
       policySimulator.deniedBecause,
       "暂无拒绝原因。"
     );
     renderCompactList(
+      doc,
       query(doc, "#policy-confirmation-reasons"),
       policySimulator.confirmationBecause,
       "暂无确认原因。"
@@ -1096,120 +1438,122 @@
         ? "失败类型：" + recovery.failureType + "。" + recovery.why
         : recovery.why
     );
-    renderCompactList(query(doc, "#recovery-steps"), recovery.safeNextSteps, "暂无安全下一步。");
+    renderCompactList(doc, query(doc, "#recovery-steps"), recovery.safeNextSteps, "暂无安全下一步。");
     renderCompactList(
+      doc,
       query(doc, "#recovery-diagnostics"),
       recovery.diagnostics,
       "暂无只读诊断。"
     );
-    renderTags(query(doc, "#recovery-flags"), recovery.flags, "warning");
+    renderTags(doc, query(doc, "#recovery-flags"), recovery.flags, "warning");
   }
 
   function renderResidual(doc, residualNextStep) {
     setText(doc, "#residual-summary", residualNextStep.summary || "-");
-    renderRefsInto(query(doc, "#residual-refs"), residualNextStep.evidenceRefs);
+    renderRefsInto(doc, query(doc, "#residual-refs"), residualNextStep.evidenceRefs);
   }
 
-  function renderDetailGrid(container, rows, fallbackText) {
+  function renderDetailGrid(doc, container, rows, fallbackText) {
     replaceChildren(
       container,
       rows.length
         ? rows.map(function (row) {
-          const item = createElement("div", "detail-row");
-          item.appendChild(createElement("span", "detail-label", localizeLabel(row.label)));
-          item.appendChild(createElement("span", "detail-value", localizeText(row.value)));
+          const item = createElement(doc, "div", "detail-row");
+          item.appendChild(createElement(doc, "span", "detail-label", localizeLabel(row.label)));
+          item.appendChild(createElement(doc, "span", "detail-value", localizeText(row.value)));
           return item;
         })
-        : [createElement("p", "empty-state", localizeText(fallbackText))]
+        : [createElement(doc, "p", "empty-state", localizeText(fallbackText))]
     );
   }
 
-  function renderImpactList(container, items, fallbackText) {
+  function renderImpactList(doc, container, items, fallbackText) {
     replaceChildren(
       container,
       items.length
         ? items.map(function (item) {
-            const node = createElement("li", "impact-item");
-            const top = createElement("div", "timeline-top");
-            top.appendChild(createElement("h3", "check-title", localizeLabel(item.label)));
-            top.appendChild(createPrecisionChip(item.precision));
+            const node = createElement(doc, "li", "impact-item");
+            const top = createElement(doc, "div", "timeline-top");
+            top.appendChild(createElement(doc, "h3", "check-title", localizeLabel(item.label)));
+            top.appendChild(createPrecisionChip(doc, item.precision));
             node.appendChild(top);
-            node.appendChild(createElement("p", "check-summary", localizeText(item.value)));
+            node.appendChild(createElement(doc, "p", "check-summary", localizeText(item.value)));
             return node;
           })
-        : [createElement("li", "", localizeText(fallbackText))]
+        : [createElement(doc, "li", "", localizeText(fallbackText))]
     );
   }
 
-  function renderRuleList(container, items, fallbackText) {
+  function renderRuleList(doc, container, items, fallbackText) {
     replaceChildren(
       container,
       items.length
         ? items.map(function (item) {
-            const node = createElement("li", "rule-item");
-            const top = createElement("div", "timeline-top");
-            top.appendChild(createElement("h3", "check-title", item.ruleId));
-            top.appendChild(createOutcomeChip(item.outcome, item.tone));
+            const node = createElement(doc, "li", "rule-item");
+            const top = createElement(doc, "div", "timeline-top");
+            top.appendChild(createElement(doc, "h3", "check-title", item.ruleId));
+            top.appendChild(createOutcomeChip(doc, item.outcome, item.tone));
             node.appendChild(top);
-            node.appendChild(createElement("p", "check-summary", localizeText(item.summary)));
+            node.appendChild(createElement(doc, "p", "check-summary", localizeText(item.summary)));
             return node;
           })
-        : [createElement("li", "", localizeText(fallbackText))]
+        : [createElement(doc, "li", "", localizeText(fallbackText))]
     );
   }
 
-  function renderCompactList(container, values, fallbackText) {
+  function renderCompactList(doc, container, values, fallbackText) {
     replaceChildren(
       container,
       values.length
         ? values.map(function (value) {
-            return createElement("li", "", localizeText(value));
+            return createElement(doc, "li", "", localizeText(value));
           })
-        : [createElement("li", "", localizeText(fallbackText))]
+        : [createElement(doc, "li", "", localizeText(fallbackText))]
     );
   }
 
-  function renderTags(container, values, tone, fallbackText) {
+  function renderTags(doc, container, values, tone, fallbackText) {
     replaceChildren(
       container,
       values.length
         ? values.map(function (value) {
-            const tag = createElement("span", "tag", localizeText(value));
+            const tag = createElement(doc, "span", "tag", localizeText(value));
             if (tone) {
               tag.dataset.tone = tone;
             }
             return tag;
           })
-        : [createElement("span", "tag", localizeText(fallbackText || "No flagged reasons"))]
+        : [createElement(doc, "span", "tag", localizeText(fallbackText || "No flagged reasons"))]
     );
   }
 
-  function renderRefsInto(container, refs) {
-    replaceChildren(container, createRefs(refs).childNodes);
+  function renderRefsInto(doc, container, refs) {
+    replaceChildren(container, createRefs(doc, refs).childNodes);
   }
 
-  function createRefs(refs) {
-    const wrapper = createElement("div", "refs");
+  function createRefs(doc, refs) {
+    const wrapper = createElement(doc, "div", "refs");
     uniqueStrings(refs).forEach(function (ref) {
-      wrapper.appendChild(createElement("span", "ref-chip", localizeText(ref)));
+      wrapper.appendChild(createElement(doc, "span", "ref-chip", localizeText(ref)));
     });
     return wrapper;
   }
 
-  function createMetaList(values) {
-    const wrapper = createElement("div", "timeline-meta");
+  function createMetaList(doc, values) {
+    const wrapper = createElement(doc, "div", "timeline-meta");
     values.forEach(function (value) {
-      wrapper.appendChild(createMetaChip(value));
+      wrapper.appendChild(createMetaChip(doc, value));
     });
     return wrapper;
   }
 
-  function createMetaChip(value) {
-    return createElement("span", "meta-chip", localizeText(value));
+  function createMetaChip(doc, value) {
+    return createElement(doc, "span", "meta-chip", localizeText(value));
   }
 
-  function createPrecisionChip(value) {
+  function createPrecisionChip(doc, value) {
     const chip = createElement(
+      doc,
       "span",
       "meta-chip precision-chip",
       localizeText(firstText(value, "conservative"))
@@ -1218,8 +1562,13 @@
     return chip;
   }
 
-  function createOutcomeChip(label, tone) {
-    const chip = createElement("span", "meta-chip precision-chip", localizeText(firstText(label, "deny")));
+  function createOutcomeChip(doc, label, tone) {
+    const chip = createElement(
+      doc,
+      "span",
+      "meta-chip precision-chip",
+      localizeText(firstText(label, "deny"))
+    );
     chip.dataset.tone = tone || "neutral";
     return chip;
   }
@@ -1244,6 +1593,19 @@
   function setBusy(input, button, busy) {
     input.disabled = busy;
     button.disabled = busy;
+    if (typeof input.setAttribute === "function") {
+      input.setAttribute("aria-busy", busy ? "true" : "false");
+    }
+    if (!busy && typeof input.focus === "function") {
+      input.focus();
+    }
+  }
+
+  function setPanelBusy(doc, busy) {
+    const panel = doc.querySelector("#operator-panel");
+    if (panel && typeof panel.setAttribute === "function") {
+      panel.setAttribute("aria-busy", busy ? "true" : "false");
+    }
   }
 
   function localizeLabel(value) {
@@ -1446,8 +1808,8 @@
     return node;
   }
 
-  function createElement(tagName, className, text) {
-    const element = document.createElement(tagName);
+  function createElement(doc, tagName, className, text) {
+    const element = doc.createElement(tagName);
     if (className) {
       element.className = className;
     }
@@ -1459,9 +1821,15 @@
 
   return {
     SECTION_DEFINITIONS: SECTION_DEFINITIONS,
+    REQUEST_TIMEOUT_MS: REQUEST_TIMEOUT_MS,
     boot: boot,
     createFailureViewModel: createFailureViewModel,
     createViewModel: createViewModel,
     buildFallbackPanel: buildFallbackPanel,
+    describeResponseFailure: describeResponseFailure,
+    normalizeDetail: normalizeDetail,
+    normalizeToolCalls: normalizeToolCalls,
+    renderViewModel: renderViewModel,
+    resolveSessionId: resolveSessionId,
   };
 });

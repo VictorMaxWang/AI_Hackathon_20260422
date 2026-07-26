@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+import threading
+from collections import OrderedDict
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +21,43 @@ CANCEL_PENDING_TEXTS = frozenset(
     {"\u53d6\u6d88", "\u653e\u5f03", "cancel"}
 )
 DEFAULT_CONFIRMATION_TOKEN_TTL = timedelta(minutes=5)
+MAX_TRACKED_CONSUMED_TOKEN_IDS = 4096
+
+_CONSUMED_TOKEN_IDS: OrderedDict[str, None] = OrderedDict()
+_CONSUMED_TOKEN_LOCK = threading.Lock()
+
+
+def new_confirmation_token_id() -> str:
+    return uuid4().hex
+
+
+def claim_confirmation_token_id(token_id: str) -> bool:
+    """Claim a confirmation token id exactly once.
+
+    Returns False when the id was already consumed, so a replayed confirmation
+    is rejected even when it reaches a different orchestrator instance.
+    """
+
+    key = str(token_id or "").strip()
+    if not key:
+        return False
+    with _CONSUMED_TOKEN_LOCK:
+        if key in _CONSUMED_TOKEN_IDS:
+            return False
+        _CONSUMED_TOKEN_IDS[key] = None
+        while len(_CONSUMED_TOKEN_IDS) > MAX_TRACKED_CONSUMED_TOKEN_IDS:
+            _CONSUMED_TOKEN_IDS.popitem(last=False)
+        return True
+
+
+def confirmation_token_id_is_consumed(token_id: str) -> bool:
+    with _CONSUMED_TOKEN_LOCK:
+        return str(token_id or "").strip() in _CONSUMED_TOKEN_IDS
+
+
+def reset_consumed_confirmation_token_ids() -> None:
+    with _CONSUMED_TOKEN_LOCK:
+        _CONSUMED_TOKEN_IDS.clear()
 
 
 def _utc_now() -> datetime:
@@ -84,6 +124,7 @@ class ConfirmationToken(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    token_id: str = Field(default_factory=new_confirmation_token_id)
     plan_hash: str
     host_id: str
     target_fingerprint: str
@@ -186,3 +227,41 @@ def confirmation_text_for(intent: str, target: dict[str, Any]) -> str | None:
 
 def is_cancel_pending_text(raw_user_input: str) -> bool:
     return str(raw_user_input or "").strip().lower() in CANCEL_PENDING_TEXTS
+
+
+def confirmation_status_from_parts(
+    *,
+    risk: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    result: Mapping[str, Any],
+    timeline: Iterable[Mapping[str, Any]],
+) -> str:
+    """Single source of truth for how a turn's confirmation state is labelled.
+
+    The evidence chain and the operator-facing explanation must never disagree
+    about whether a write was confirmed, so both read this function.
+    """
+
+    plan_status = str(plan.get("status") or "").lower()
+    result_status = str(result.get("status") or "").lower()
+    result_error = str(result.get("error") or "").lower()
+    execution_results = execution.get("results") or []
+
+    if (
+        result_error == "confirmation_text_mismatch"
+        or result_error == "missing_confirmation_token"
+        or result_error.startswith("confirmation_token_")
+    ):
+        return "mismatch"
+    if result_status == "cancelled" or plan_status == "cancelled":
+        return "cancelled"
+    if result_status == "pending_confirmation" or plan_status == "pending_confirmation":
+        return "pending"
+    if plan_status == "confirmed":
+        return "confirmed"
+    if any(str(item.get("status") or "").lower() == "pending_confirmation" for item in timeline):
+        return "pending"
+    if bool(risk.get("requires_confirmation")) and execution_results:
+        return "confirmed"
+    return "not_required"

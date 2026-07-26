@@ -16,7 +16,7 @@ from app.models.evolution import (
 )
 
 
-DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "workflows" / "templates"
+DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 __all__ = [
     "BANNED_RAW_COMMAND_FIELDS",

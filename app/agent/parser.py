@@ -3,6 +3,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.agent.extraction import (
+    PATH_CONTEXT_REFS,
+    PORT_CONTEXT_REFS,
+    USER_CONTEXT_REFS,
+    clean_text as _clean_text,
+    contains_any as _contains_any,
+    extract_path as _extract_path,
+    extract_port as _extract_port,
+    find_context_ref as _find_context_ref,
+    looks_like_privilege_escalation,
+)
 from app.models import IntentTarget, ParsedIntent
 
 
@@ -19,10 +30,6 @@ MODIFY_SUDOERS_INTENT = "modify_sudoers"
 GRANT_SUDO_INTENT = "grant_sudo"
 MODIFY_SSHD_CONFIG_INTENT = "modify_sshd_config"
 BULK_PERMISSION_INTENT = "bulk_permission_change"
-
-USER_CONTEXT_REFS = ("刚才那个用户", "上一个用户", "刚刚创建的用户")
-PORT_CONTEXT_REFS = ("刚才那个端口", "上一个端口")
-PATH_CONTEXT_REFS = ("刚才那个目录", "上一个目录")
 
 
 class ReadonlyParser:
@@ -162,10 +169,6 @@ def parse_readonly_intent(raw_user_input: str, memory: Any | None = None) -> Par
     return ReadonlyParser().parse(raw_user_input, memory=memory)
 
 
-def _clean_text(value: str) -> str:
-    return str(value or "").strip()
-
-
 def _unknown(raw_user_input: str, reason: str) -> ParsedIntent:
     return ParsedIntent(
         intent=UNKNOWN_INTENT,
@@ -186,7 +189,7 @@ def _parse_contextual_reference(
         username = _resolve_memory(memory, "username")
         if not username:
             return _unresolved_context_ref(raw_user_input, user_ref, "username", text)
-        if _looks_like_privilege_escalation(text):
+        if looks_like_privilege_escalation(text):
             return ParsedIntent(
                 intent=GRANT_SUDO_INTENT,
                 target=IntentTarget(username=username),
@@ -289,13 +292,6 @@ def _parse_contextual_reference(
     return None
 
 
-def _find_context_ref(text: str, refs: tuple[str, ...]) -> str | None:
-    for ref in refs:
-        if ref in text:
-            return ref
-    return None
-
-
 def _resolve_memory(memory: Any | None, slot: str) -> Any:
     if memory is None:
         return None
@@ -354,7 +350,7 @@ def _parse_dangerous_intent(text: str, raw_user_input: str) -> ParsedIntent | No
             confidence=0.93,
         )
 
-    if _looks_like_privilege_escalation(text):
+    if looks_like_privilege_escalation(text):
         return ParsedIntent(
             intent=GRANT_SUDO_INTENT,
             target=IntentTarget(username=_extract_username_for_sudo(text)),
@@ -442,26 +438,6 @@ def _looks_like_sshd_config_change(text: str) -> bool:
     )
 
 
-def _looks_like_privilege_escalation(text: str) -> bool:
-    scan_text = _strip_negated_privilege_constraints(text)
-    lower_text = scan_text.lower()
-    return bool(
-        (
-            "sudo" in lower_text
-            and _contains_any(scan_text, ["加", "加入", "添加", "给", "权限", "所有用户", "全部用户"])
-        )
-        or (
-            _contains_any(scan_text, ["管理员权限", "root 权限", "root权限"])
-            and _contains_any(scan_text, ["给", "授予", "提升", "加", "加入", "添加", "设为", "设置"])
-        )
-        or (
-            re.search(r"\b(?:admin|administrator|wheel)\b", lower_text) is not None
-            and _contains_any(scan_text, ["给", "授予", "提升", "加", "加入", "添加", "设为", "设置", "权限"])
-        )
-        or ("提升" in scan_text and "权限" in scan_text)
-    )
-
-
 def _looks_like_bulk_permission_change(text: str) -> bool:
     lower_text = text.lower()
     if "chmod" in lower_text or "chown" in lower_text:
@@ -526,17 +502,6 @@ def _extract_username_for_sudo(text: str) -> str | None:
     return None
 
 
-def _strip_negated_privilege_constraints(text: str) -> str:
-    cleaned = str(text or "")
-    patterns = [
-        r"(?:不要|不用|无需|不需要|别|不能|不可|不给|无|没有)\s*(?:给\s*)?(?:[a-z_][a-z0-9_-]{2,31}\s*)?(?:sudo|管理员|admin|administrator|wheel|root)\s*(?:权限|访问)?",
-        r"不\s*(?:加入|加到|添加到|加进)\s*(?:sudo|wheel|admin|administrator|管理员)",
-    ]
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-    return cleaned
-
-
 def _write_scan_text(text: str) -> str:
     return text.replace("修改过", "")
 
@@ -570,19 +535,7 @@ def _looks_like_memory_usage_query(text: str) -> bool:
 
 
 def _looks_like_port_query(text: str) -> bool:
-    return "端口" in text
-
-
-def _contains_any(text: str, needles: list[str]) -> bool:
-    lower_text = text.lower()
-    return any(needle.lower() in lower_text for needle in needles)
-
-
-def _extract_path(text: str) -> str | None:
-    match = re.search(r"(/[^\s，,。；;、]+)", text)
-    if not match:
-        return None
-    return match.group(1).rstrip("，,。；;、")
+    return bool("端口" in text or re.search(r"\bport\b", text, flags=re.IGNORECASE))
 
 
 def _extract_modified_days(text: str) -> int | None:
@@ -655,13 +608,3 @@ def _extract_top_limit(text: str, default: int) -> int:
     if match:
         return int(match.group(1))
     return _extract_max_results(text, default)
-
-
-def _extract_port(text: str) -> int | None:
-    match = re.search(r"(\d{1,5})\s*端口", text)
-    if not match:
-        return None
-    port = int(match.group(1))
-    if port < 0 or port > 65535:
-        return None
-    return port

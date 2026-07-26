@@ -118,7 +118,7 @@ def test_unknown_write_like_request_does_not_execute_any_command(
     exit_code = cli.main(["帮我创建一个用户 demo"])
     captured = capsys.readouterr()
 
-    assert exit_code == 1
+    assert exit_code == cli.EXIT_REFUSED_BY_POLICY
     assert "当前只支持只读基础能力" in captured.out
     assert captured.err == ""
 

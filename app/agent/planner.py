@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.evolution.workflows import match_workflow_template
+from app.evolution.workflows import try_match_workflow_template
 from app.models import ParsedIntent
-from app.models.evolution import WorkflowStep, WorkflowTemplate
+from app.models.evolution import WORKFLOW_TOOL_INTENTS, WorkflowStep, WorkflowTemplate
 from app.models.intent import ExecutionPlan, PlanStep
 
+from app.agent.extraction import (
+    USER_CONTEXT_REFS,
+    clean_text as _clean_text,
+    contains_any as _contains_any,
+    extract_all_usernames,
+    extract_path as _extract_path,
+    extract_port as _extract_port,
+    extract_username as _extract_username,
+    split_clauses,
+)
 from app.agent.parser import (
     DISK_INTENT,
     FILE_INTENT,
@@ -22,16 +33,9 @@ ENV_PROBE_INTENT = "env_probe"
 CREATE_USER_INTENT = "create_user"
 DELETE_USER_INTENT = "delete_user"
 WORKFLOW_TEMPLATE_SOURCE = "workflow_template"
-WORKFLOW_TOOL_INTENTS = {
-    "create_user_tool": CREATE_USER_INTENT,
-    "delete_user_tool": DELETE_USER_INTENT,
-    "disk_usage_tool": DISK_INTENT,
-    "env_probe_tool": ENV_PROBE_INTENT,
-    "file_search_tool": FILE_INTENT,
-    "memory_usage_tool": MEMORY_INTENT,
-    "port_query_tool": PORT_INTENT,
-    "process_query_tool": PROCESS_INTENT,
-}
+CREATE_USER_CONDITION = "env.sudo_available or env.is_root"
+DELETE_USER_CONDITION = "target_user_exists and target_user_uid >= 1000"
+RECOGNIZED_STEP_CONDITIONS = frozenset({CREATE_USER_CONDITION, DELETE_USER_CONDITION})
 
 ENV_FINGERPRINT_KEYS = [
     "host.hostname",
@@ -179,7 +183,7 @@ class MultistepPlanner:
         if _has_unsupported_action(text):
             return _unsupported(raw_user_input, "unsupported or unsafe multi-step request")
 
-        workflow_template = match_workflow_template(text)
+        workflow_template = try_match_workflow_template(text)
         if workflow_template is not None:
             return _workflow_plan(raw_user_input, text, workflow_template)
 
@@ -323,23 +327,56 @@ def _unsupported(raw_user_input: str, reason: str) -> ExecutionPlan:
     )
 
 
+class UnsupportedWorkflowError(ValueError):
+    """Raised when a workflow template cannot be bound to a safe concrete plan."""
+
+
 def _workflow_plan(
     raw_user_input: str,
     text: str,
     template: WorkflowTemplate,
 ) -> ExecutionPlan:
-    workflow_steps = _workflow_steps_for_request(text, template)
-    step_id_map = {
-        workflow_step.step_id: f"step_{index}"
-        for index, workflow_step in enumerate(workflow_steps, start=1)
-    }
-    return _supported(
-        raw_user_input,
-        [
+    try:
+        workflow_steps = _workflow_steps_for_request(text, template)
+        step_id_map = {
+            workflow_step.step_id: f"step_{index}"
+            for index, workflow_step in enumerate(workflow_steps, start=1)
+        }
+        steps = [
             _workflow_plan_step(index, text, template, workflow_step, step_id_map)
             for index, workflow_step in enumerate(workflow_steps, start=1)
-        ],
-    )
+        ]
+        _assert_workflow_targets_are_bound(steps)
+    except UnsupportedWorkflowError as exc:
+        return _unsupported(raw_user_input, str(exc))
+    return _supported(raw_user_input, steps)
+
+
+def _assert_workflow_targets_are_bound(steps: list[PlanStep]) -> None:
+    """Refuse a generated workflow plan whose targets are missing or ambiguous.
+
+    A user-lifecycle plan may only ever act on one account: two write steps that
+    resolve two different usernames means the request was misread, and the
+    destructive half of a misread request is not something to guess at.
+    """
+
+    usernames: list[str] = []
+    for step in steps:
+        if step.intent in {CREATE_USER_INTENT, DELETE_USER_INTENT}:
+            username = step.target.get("username")
+            if not username:
+                raise UnsupportedWorkflowError(f"missing username for {step.intent} step")
+            if username not in usernames:
+                usernames.append(str(username))
+        if step.intent == FILE_INTENT and not step.target.get("base_path"):
+            raise UnsupportedWorkflowError("missing base_path for search_files step")
+        if step.intent == PORT_INTENT and step.target.get("port") is None:
+            raise UnsupportedWorkflowError("missing port for query_port step")
+
+    if len(usernames) > 1:
+        raise UnsupportedWorkflowError(
+            "workflow write steps resolve more than one username: " + ", ".join(usernames)
+        )
 
 
 def _workflow_steps_for_request(
@@ -352,7 +389,9 @@ def _workflow_steps_for_request(
     has_create = _looks_like_create_user(text)
     has_delete = _looks_like_delete_user(text)
     if not has_create and not has_delete:
-        return list(template.steps)
+        raise UnsupportedWorkflowError(
+            "user lifecycle workflow needs an explicit create or delete request"
+        )
 
     selected_steps: list[WorkflowStep] = []
     for workflow_step in template.steps:
@@ -364,7 +403,11 @@ def _workflow_steps_for_request(
         elif intent == DELETE_USER_INTENT and has_delete:
             selected_steps.append(workflow_step)
 
-    return selected_steps or list(template.steps)
+    if not selected_steps:
+        raise UnsupportedWorkflowError(
+            "user lifecycle workflow could not be narrowed to a requested action"
+        )
+    return selected_steps
 
 
 def _workflow_plan_step(
@@ -396,7 +439,12 @@ def _workflow_plan_step(
 
 
 def _workflow_intent(workflow_step: WorkflowStep) -> str:
-    return WORKFLOW_TOOL_INTENTS.get(workflow_step.tool_name, workflow_step.intent)
+    intent = WORKFLOW_TOOL_INTENTS.get(workflow_step.tool_name)
+    if intent is None:
+        raise UnsupportedWorkflowError(
+            f"workflow step tool is not registered: {workflow_step.tool_name}"
+        )
+    return intent
 
 
 def _workflow_step_target(
@@ -455,7 +503,7 @@ def _workflow_step_target(
         return target
 
     if intent == CREATE_USER_INTENT:
-        username = _extract_username(text)
+        username = _workflow_username(text, _looks_like_create_user, CREATE_USER_INTENT)
         if username is not None:
             target["username"] = username
         target["create_home"] = bool(
@@ -465,7 +513,7 @@ def _workflow_step_target(
         return target
 
     if intent == DELETE_USER_INTENT:
-        username = _extract_username(text)
+        username = _workflow_username(text, _looks_like_delete_user, DELETE_USER_INTENT)
         if username is not None:
             target["username"] = username
         target["remove_home"] = bool(
@@ -485,7 +533,40 @@ def _workflow_condition(
         source_step = _first_mapped_dependency(workflow_step, step_id_map)
         if source_step is not None:
             return f"{source_step}.listener_found"
+    if intent == CREATE_USER_INTENT:
+        return CREATE_USER_CONDITION
+    if intent == DELETE_USER_INTENT:
+        return DELETE_USER_CONDITION
     return _map_workflow_condition(workflow_step.condition, step_id_map)
+
+
+def _workflow_username(
+    text: str,
+    clause_predicate: Callable[[str], bool],
+    intent: str,
+) -> str | None:
+    """Bind a username from the clause that owns this step, not from the whole request.
+
+    A workflow resolving several distinct usernames is ambiguous, and an ambiguous
+    destructive target is refused instead of guessed.
+    """
+
+    all_usernames = extract_all_usernames(text)
+    if len(all_usernames) <= 1:
+        return _extract_username(text)
+
+    clause_usernames: list[str] = []
+    for clause in split_clauses(text):
+        if not clause_predicate(clause):
+            continue
+        for username in extract_all_usernames(clause):
+            if username not in clause_usernames:
+                clause_usernames.append(username)
+    if len(clause_usernames) == 1:
+        return clause_usernames[0]
+    raise UnsupportedWorkflowError(
+        f"ambiguous username for {intent} step: {', '.join(all_usernames)}"
+    )
 
 
 def _map_workflow_condition(
@@ -680,15 +761,6 @@ def _port_process_steps(port: int) -> list[PlanStep]:
     ]
 
 
-def _clean_text(value: str) -> str:
-    return str(value or "").strip()
-
-
-def _contains_any(text: str, needles: list[str]) -> bool:
-    lower_text = text.lower()
-    return any(needle.lower() in lower_text for needle in needles)
-
-
 def _has_unsupported_action(text: str) -> bool:
     lower_text = text.lower()
     if _contains_any(
@@ -758,6 +830,10 @@ def _looks_like_create_user(text: str) -> bool:
     )
 
 
+def _has_user_context_ref(text: str) -> bool:
+    return _contains_any(text, list(USER_CONTEXT_REFS))
+
+
 def _looks_like_delete_user(text: str) -> bool:
     return bool(
         _contains_any(text, ["删除", "删掉", "移除", "remove", "delete"])
@@ -774,30 +850,6 @@ def _looks_like_port_query(text: str) -> bool:
 
 def _looks_like_process_query(text: str) -> bool:
     return _contains_any(text, ["进程", "process", "pid", "对应"])
-
-
-def _has_user_context_ref(text: str) -> bool:
-    return _contains_any(text, ["刚才那个用户", "上一个用户", "刚刚创建的用户", "刚才创建的用户"])
-
-
-def _extract_username(text: str) -> str | None:
-    patterns = [
-        r"普通用户\s*([a-z_][a-z0-9_-]{2,31})",
-        r"测试用户\s*([a-z_][a-z0-9_-]{2,31})",
-        r"用户\s*([a-z_][a-z0-9_-]{2,31})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return None
-
-
-def _extract_path(text: str) -> str | None:
-    match = re.search(r"(/[^\s，,。；;、]+)", text)
-    if not match:
-        return None
-    return match.group(1).rstrip("，,。；;、")
 
 
 def _default_file_search_base_path(text: str) -> str | None:
@@ -818,22 +870,6 @@ def _extract_file_search_keyword(text: str) -> str | None:
     if log_match:
         return log_match.group(1)
 
-    return None
-
-
-def _extract_port(text: str) -> int | None:
-    patterns = [
-        r"(\d{1,5})\s*端口",
-        r"端口\s*(\d{1,5})",
-        r"\bport\s*(\d{1,5})\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        port = int(match.group(1))
-        if 0 <= port <= 65535:
-            return port
     return None
 
 
